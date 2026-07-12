@@ -14,9 +14,11 @@ public sealed class VoicePlayback : IDisposable
     private readonly VoiceReceiver _receiver;
     private readonly Timer _playbackTimer;
     private readonly Dictionary<string, double> _peerVolumes;
+    private readonly object _stateGate = new();
     private double _masterVolume;
     private bool _deafened;
     private bool _isDisposed;
+    private bool _isStarted;
 
     public event Action<string, bool>? SpeakingStateChanged;
 
@@ -47,36 +49,61 @@ public sealed class VoicePlayback : IDisposable
 
     public void Start()
     {
-        if (_isDisposed) return;
-        _receiver.Reset();
-        _playbackTimer.Start();
+        lock (_stateGate)
+        {
+            if (_isDisposed || _isStarted) return;
+            _isStarted = true;
+            _playbackTimer.Start();
+        }
     }
 
     public void Stop()
     {
-        _playbackTimer.Stop();
-        _provider.ClearBuffer();
+        lock (_stateGate)
+        {
+            _isStarted = false;
+            _playbackTimer.Stop();
+            _provider.ClearBuffer();
+        }
     }
 
     public void SetPeerVolume(string peerId, double volume)
     {
-        _peerVolumes[peerId] = Math.Clamp(volume, 0d, 2d);
+        lock (_stateGate)
+        {
+            _peerVolumes[peerId] = Math.Clamp(volume, 0d, 2d);
+        }
     }
 
     public void SetMasterVolume(double volume)
     {
-        _masterVolume = Math.Clamp(volume, 0d, 2d);
+        lock (_stateGate)
+        {
+            _masterVolume = Math.Clamp(volume, 0d, 2d);
+        }
     }
 
     public void SetDeafened(bool deafened)
     {
-        _deafened = deafened;
+        lock (_stateGate)
+        {
+            _deafened = deafened;
+        }
     }
 
     private void Render()
     {
-        if (_isDisposed) return;
-        if (_deafened)
+        Dictionary<string, double> peerVolumes;
+        double masterVolume;
+        bool deafened;
+        lock (_stateGate)
+        {
+            if (_isDisposed || !_isStarted) return;
+            deafened = _deafened;
+            masterVolume = _masterVolume;
+            peerVolumes = new Dictionary<string, double>(_peerVolumes, StringComparer.OrdinalIgnoreCase);
+        }
+        if (deafened)
         {
             _provider.ClearBuffer();
             return;
@@ -95,11 +122,11 @@ public sealed class VoicePlayback : IDisposable
         {
             var peerId = pair.Key;
             var frame = pair.Value;
-            var volume = _peerVolumes.TryGetValue(peerId, out var value) ? value : 1d;
+            var volume = peerVolumes.TryGetValue(peerId, out var value) ? value : 1d;
             var isSpeaking = frame.Any(sample => sample != 0);
             speakers[peerId] = isSpeaking;
 
-            var scale = (float)(volume * _masterVolume);
+            var scale = (float)(volume * masterVolume);
             for (var i = 0; i < VoiceEncoder.FrameSamples && i < frame.Length; i++)
             {
                 var mixedValue = (float)mixed[i] + (frame[i] * scale);
@@ -119,11 +146,15 @@ public sealed class VoicePlayback : IDisposable
 
     public void Dispose()
     {
-        if (_isDisposed) return;
-        _isDisposed = true;
-        _playbackTimer.Stop();
-        _playbackTimer.Dispose();
-        _waveOut.Stop();
-        _waveOut.Dispose();
+        lock (_stateGate)
+        {
+            if (_isDisposed) return;
+            _isDisposed = true;
+            _isStarted = false;
+            _playbackTimer.Stop();
+            _playbackTimer.Dispose();
+            _waveOut.Stop();
+            _waveOut.Dispose();
+        }
     }
 }

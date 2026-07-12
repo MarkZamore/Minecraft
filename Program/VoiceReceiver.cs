@@ -5,6 +5,8 @@ namespace Minecraft;
 
 public sealed class VoiceReceiver
 {
+    private const int MaxBufferedFrames = 5;
+
     private sealed class JitterBuffer
     {
         public int ExpectedSequence;
@@ -33,6 +35,7 @@ public sealed class VoiceReceiver
                 _buffers[peerId] = buffer;
             }
 
+            if (sequence < buffer.ExpectedSequence) return;
             if (!buffer.Frames.ContainsKey(sequence))
             {
                 buffer.Frames[sequence] = samples;
@@ -42,7 +45,15 @@ public sealed class VoiceReceiver
             if (samples.Length > 0) buffer.IsSpeaking = true;
             if (sequence >= buffer.ExpectedSequence + 200)
             {
+                buffer.Frames.Clear();
+                buffer.Frames[sequence] = samples;
                 buffer.ExpectedSequence = sequence;
+            }
+            while (buffer.Frames.Count > MaxBufferedFrames)
+            {
+                var oldest = buffer.Frames.Keys.First();
+                buffer.Frames.Remove(oldest);
+                if (oldest >= buffer.ExpectedSequence) buffer.ExpectedSequence = oldest + 1;
             }
         }
     }
@@ -77,9 +88,14 @@ public sealed class VoiceReceiver
                         output = frame.Length == _frameSamples ? frame : PadFrame(frame);
                         buffer.ExpectedSequence++;
                     }
-                    else
+                    else if (buffer.Frames.Count > 0)
                     {
                         output = new short[_frameSamples];
+                        buffer.ExpectedSequence++;
+                    }
+                    else
+                    {
+                        output = Array.Empty<short>();
                     }
                 }
 
@@ -99,6 +115,14 @@ public sealed class VoiceReceiver
         lock (_lock)
         {
             _buffers.Clear();
+        }
+    }
+
+    public void RemovePeer(string peerId)
+    {
+        lock (_lock)
+        {
+            _buffers.Remove(peerId);
         }
     }
 

@@ -14,7 +14,25 @@ public sealed class VirtualNetworkService
             if (nic.OperationalStatus != OperationalStatus.Up) continue;
             if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
 
-            var props = nic.GetIPProperties();
+            IPInterfaceProperties props;
+            try
+            {
+                props = nic.GetIPProperties();
+            }
+            catch (NetworkInformationException)
+            {
+                continue;
+            }
+
+            var interfaceIndex = 0;
+            try
+            {
+                interfaceIndex = props.GetIPv4Properties()?.Index ?? 0;
+            }
+            catch (NetworkInformationException)
+            {
+                // Some virtual adapters expose IPv4 addresses but no IPv4 properties.
+            }
             foreach (var address in props.UnicastAddresses)
             {
                 if (address.Address.AddressFamily != AddressFamily.InterNetwork) continue;
@@ -26,6 +44,7 @@ public sealed class VirtualNetworkService
                 adapters.Add(new NetworkAdapterInfo
                 {
                     Id = nic.Id,
+                    InterfaceIndex = interfaceIndex,
                     Name = nic.Name,
                     Description = nic.Description,
                     IPv4 = ip.ToString(),
@@ -92,7 +111,7 @@ public sealed class VirtualNetworkService
         return true;
     }
 
-    public static IReadOnlyList<IPAddress> EnumerateProbeAddresses(NetworkAdapterInfo adapter, int maxSubnetSize, int largeSubnetLocalPrefixSize)
+    public static IReadOnlyList<IPAddress> EnumerateProbeAddresses(NetworkAdapterInfo adapter, int maxSubnetSize)
     {
         if (!IPAddress.TryParse(adapter.IPv4, out var adapterIp) ||
             !IPAddress.TryParse(adapter.Mask, out var mask))
@@ -111,10 +130,7 @@ public sealed class VirtualNetworkService
             return EnumerateRange(network + 1, broadcast - 1, adapterValue, maxSubnetSize);
         }
 
-        var localMask = uint.MaxValue << (32 - largeSubnetLocalPrefixSize);
-        network = adapterValue & localMask;
-        broadcast = network | ~localMask;
-        return EnumerateRange(network + 1, broadcast - 1, adapterValue, 512);
+        return Array.Empty<IPAddress>();
     }
 
     private static List<IPAddress> EnumerateRange(uint first, uint last, uint excluded, int limit)

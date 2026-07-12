@@ -162,5 +162,4 @@ public sealed class LocalIdentityContext
     public string IdentityName { get; set; } = "";
     public string MinecraftUuid { get; set; } = "";
     public string SessionAccessToken { get; set; } = "";
-    public List<string> LegacyIdentityIds { get; set; } = [];
 }

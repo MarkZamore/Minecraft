@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
@@ -12,7 +13,7 @@ namespace Minecraft;
 public sealed class WorldTransferService : IAsyncDisposable
 {
     public const int TransferPort = 35656;
-    private const string TransferProtocol = "MinecraftPortableWorldV2";
+    public const string TransferProtocol = "MinecraftPortableWorldV3";
     private const string PingProtocol = "MinecraftPortablePingV1";
 
     private readonly AppPaths _paths;
@@ -21,11 +22,16 @@ public sealed class WorldTransferService : IAsyncDisposable
     private readonly SettingsService _settingsService;
     private readonly WorldMetadataService _worldMetadata;
     private readonly LocalIdentityService _identityService;
-    private readonly PortableIdentityAdapterService _identityAdapter;
     private readonly WorldPlayerProfileService _playerProfiles;
     private readonly WorldTransferRuntimeOptions _runtimeOptions;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly JsonSerializerOptions _indentedJsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
+    private readonly SemaphoreSlim _listenerGate = new(1, 1);
+    private readonly SemaphoreSlim _transferGate = new(1, 1);
+    private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly ConcurrentDictionary<int, Task> _receiveTasks = new();
+    private int _nextReceiveTaskId;
+    private int _disposeState;
     private CancellationTokenSource? _listenerCts;
     private Task? _listenerTask;
 
@@ -36,7 +42,6 @@ public sealed class WorldTransferService : IAsyncDisposable
         SettingsService settingsService,
         WorldMetadataService worldMetadata,
         LocalIdentityService identityService,
-        PortableIdentityAdapterService identityAdapter,
         WorldPlayerProfileService playerProfiles,
         WorldTransferRuntimeOptions? runtimeOptions = null)
     {
@@ -46,7 +51,6 @@ public sealed class WorldTransferService : IAsyncDisposable
         _settingsService = settingsService;
         _worldMetadata = worldMetadata;
         _identityService = identityService;
-        _identityAdapter = identityAdapter;
         _playerProfiles = playerProfiles;
         _runtimeOptions = runtimeOptions ?? new WorldTransferRuntimeOptions();
         _runtimeOptions.Validate();
@@ -55,172 +59,254 @@ public sealed class WorldTransferService : IAsyncDisposable
 
     public event Action<string>? StatusChanged;
     public event Action? BecameHost;
-    public event Action<long, long>? ProgressChanged;
+    public event Action<WorldTransferProgress>? ProgressChanged;
+    public bool IsOperationActive => _transferGate.CurrentCount == 0;
 
-    public void StartListener(AppSettings settings)
+    public async Task StartListenerAsync(AppSettings settings, CancellationToken token = default)
     {
-        StopListener();
-        _listenerCts = new CancellationTokenSource();
-        _listenerTask = Task.Run(() => ListenAsync(settings, _listenerCts.Token));
-        _logger.Info("World transfer listener started.");
-    }
-
-    public void StopListener()
-    {
-        _listenerCts?.Cancel();
-        _listenerCts?.Dispose();
-        _listenerCts = null;
-    }
-
-    public async Task SendWorldAsync(PeerViewModel peer, AppSettings settings, string worldPath, CancellationToken token)
-    {
-        if (_minecraft.IsClientRunning)
-        {
-            throw new InvalidOperationException("Close Minecraft before transferring a world.");
-        }
-        RaiseProgress(0, 0);
-        var identity = ResolveIdentityContext(settings);
-        if (peer.PackStatus != "OK")
-        {
-            _logger.Warn($"Pack hash mismatch ({peer.PackStatus}); world transfer is allowed by local settings.");
-        }
-
-        await VerifyPeerTransferReadyAsync(peer, settings, token);
-
-        var worldDir = ResolveWorldToSend(worldPath);
-        WorldAccessGuard.EnsureClosed(worldDir);
-        var worldName = Path.GetFileName(worldDir);
-        var worldMetadata = _worldMetadata.Read(worldDir);
-        var ownerId = ResolveOwnerIdentity(worldMetadata?.OwnerIdentityId, worldMetadata?.OwnerIdentityName, settings, identity.IdentityId, identity.IdentityName);
-        var transferId = Guid.NewGuid().ToString("N");
-        var transactionRoot = CreateTransactionDirectory(transferId);
-        var stagingWorld = Path.Combine(transactionRoot, "staging-world");
-        var archivePath = Path.Combine(transactionRoot, "world.zip");
-        var escrowPath = Path.Combine(transactionRoot, "escrow", worldName);
-        var journal = new WorldTransferJournal
-        {
-            TransferId = transferId,
-            Role = "Sender",
-            State = "Preparing",
-            SourceWorldPath = worldDir,
-            EscrowPath = escrowPath
-        };
-        WriteJournal(transactionRoot, journal);
-        var completed = false;
-
+        _shutdownCts.Token.ThrowIfCancellationRequested();
+        await _listenerGate.WaitAsync(token).ConfigureAwait(false);
         try
         {
-            StatusChanged?.Invoke("Creating safe world snapshot...");
-            CopyWorldDirectory(worldDir, stagingWorld, token);
-            StatusChanged?.Invoke("Preparing player profiles...");
-            _playerProfiles.PrepareWorldForOutgoingTransfer(stagingWorld, identity);
-            var playerManifestSha = _playerProfiles.GetPlayerManifestHash(stagingWorld);
-
-            StatusChanged?.Invoke("Hashing world...");
-            var worldSha = HashDirectory(stagingWorld);
-
-            ZipFile.CreateFromDirectory(stagingWorld, archivePath, CompressionLevel.Optimal, includeBaseDirectory: false);
-
-            var fileInfo = new FileInfo(archivePath);
-            if (fileInfo.Length > settings.MaxArchiveBytes)
-            {
-                throw new InvalidOperationException("World archive exceeds configured size limit.");
-            }
-            RaiseProgress(0, fileInfo.Length);
-
-            var header = new WorldTransferHeader
-            {
-                TransferId = transferId,
-                SenderName = identity.IdentityName,
-                SenderIdentityId = identity.IdentityId,
-                SenderIdentityName = identity.IdentityName,
-                OwnerIdentityId = ownerId.id,
-                OwnerIdentityName = ownerId.name,
-                Size = fileInfo.Length,
-                WorldSha256 = worldSha,
-                PlayerManifestSha256 = playerManifestSha,
-                FileName = Path.GetFileName(archivePath),
-                WorldName = worldName
-            };
-
-            StatusChanged?.Invoke("Sending world archive...");
-            using var client = new TcpClient();
-            await client.ConnectAsync(IPAddress.Parse(peer.VpnIp), _runtimeOptions.Port, token);
-            await using var stream = client.GetStream();
-            await WriteJsonAsync(stream, header, token);
-            await using (var file = File.OpenRead(archivePath))
-            {
-                await CopyWithProgressAsync(file, stream, fileInfo.Length, progress =>
-                {
-                    RaiseProgress(progress, fileInfo.Length);
-                }, token);
-            }
-
-            var ready = await ReadJsonAsync<WorldTransferAck>(stream, token);
-            if (ready is null || !ready.Ok || ready.Stage != "Ready" || ready.TransferId != transferId ||
-                !string.Equals(ready.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(ready.PlayerManifestSha256, playerManifestSha, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException($"Receiver rejected world archive: {ready?.Message ?? "no ready acknowledgement"}");
-            }
-
-            Directory.CreateDirectory(Path.GetDirectoryName(escrowPath)!);
-            Directory.Move(worldDir, escrowPath);
-            journal.State = "Escrowed";
-            WriteJournal(transactionRoot, journal);
-            journal.State = "CommitSent";
-            WriteJournal(transactionRoot, journal);
-            await WriteJsonAsync(stream, new WorldTransferControl
-            {
-                TransferId = transferId,
-                Command = "Commit"
-            }, token);
-
-            var committed = await ReadJsonAsync<WorldTransferAck>(stream, token);
-            if (committed is null || !committed.Ok || committed.Stage != "Committed" || committed.TransferId != transferId ||
-                !string.Equals(committed.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
-                string.IsNullOrWhiteSpace(committed.PlayerManifestSha256))
-            {
-                throw new InvalidOperationException(
-                    "Transfer commit was not confirmed. The source world remains safely quarantined in Personal\\Transfers.");
-            }
-
-            journal.State = "Committed";
-            WriteJournal(transactionRoot, journal);
-            completed = true;
-            var selectedRelativePath = Path.GetRelativePath(_paths.Worlds, worldDir);
-            if (string.Equals(settings.SelectedWorldRelativePath, selectedRelativePath, StringComparison.OrdinalIgnoreCase))
-            {
-                settings.SelectedWorldRelativePath = "";
-            }
-
-            _logger.Info("World archive transferred successfully; local source world removed.");
+            await StopListenerCoreAsync().ConfigureAwait(false);
+            var cts = new CancellationTokenSource();
+            var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _listenerCts = cts;
+            _listenerTask = ListenAsync(settings, ready, cts.Token);
+            await ready.Task.WaitAsync(token).ConfigureAwait(false);
+            _logger.Info("World transfer listener started.");
         }
         catch
         {
-            if (journal.State != "CommitSent" && Directory.Exists(escrowPath) && !Directory.Exists(worldDir))
-            {
-                Directory.Move(escrowPath, worldDir);
-            }
+            await StopListenerCoreAsync().ConfigureAwait(false);
             throw;
         }
         finally
         {
-            RaiseProgress(0, 0);
-            if (completed || journal.State != "CommitSent") DeleteDirectoryIfExists(transactionRoot);
+            _listenerGate.Release();
         }
     }
 
-    private async Task ListenAsync(AppSettings settings, CancellationToken token)
+    public async Task StopListenerAsync()
     {
-        var listener = new TcpListener(_runtimeOptions.ListenAddress, _runtimeOptions.Port);
-        listener.Start();
+        await _listenerGate.WaitAsync().ConfigureAwait(false);
         try
         {
+            await StopListenerCoreAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _listenerGate.Release();
+        }
+    }
+
+    private async Task StopListenerCoreAsync()
+    {
+        var cts = _listenerCts;
+        var task = _listenerTask;
+        _listenerCts = null;
+        _listenerTask = null;
+        cts?.Cancel();
+        if (task is not null)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException)
+            {
+            }
+        }
+        var receiveTasks = _receiveTasks.Values.ToArray();
+        if (receiveTasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(receiveTasks).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException or IOException)
+            {
+            }
+        }
+        cts?.Dispose();
+    }
+
+    public async Task SendWorldAsync(PeerViewModel peer, AppSettings settings, string worldPath, CancellationToken token)
+    {
+        using var operationCts = CancellationTokenSource.CreateLinkedTokenSource(token, _shutdownCts.Token);
+        token = operationCts.Token;
+        if (_minecraft.IsClientRunning)
+        {
+            throw new InvalidOperationException("Close Minecraft before transferring a world.");
+        }
+        await _transferGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            BeginProgress();
+            try
+            {
+                var identity = ResolveIdentityContext(settings);
+                if (peer.PackStatus != "OK")
+                {
+                    _logger.Warn($"Pack hash mismatch ({peer.PackStatus}); world transfer is allowed by local settings.");
+                }
+
+                var peerAddress = await VerifyPeerTransferReadyAsync(peer, settings, token);
+
+                var worldDir = ResolveWorldToSend(worldPath);
+                WorldAccessGuard.EnsureClosed(worldDir);
+                var worldName = Path.GetFileName(worldDir);
+                var worldMetadata = _worldMetadata.Read(worldDir);
+                var ownerId = ResolveOwnerIdentity(worldMetadata?.OwnerIdentityId, worldMetadata?.OwnerIdentityName, settings, identity.IdentityId, identity.IdentityName);
+                var transferId = Guid.NewGuid().ToString("N");
+                var transactionRoot = CreateTransactionDirectory(transferId);
+                var stagingWorld = Path.Combine(transactionRoot, "staging-world");
+                var archivePath = Path.Combine(transactionRoot, "world.zip");
+                var escrowPath = Path.Combine(transactionRoot, "escrow", worldName);
+                var journal = new WorldTransferJournal
+                {
+                    TransferId = transferId,
+                    Role = "Sender",
+                    State = "Preparing",
+                    SourceWorldPath = worldDir,
+                    EscrowPath = escrowPath
+                };
+                WriteJournal(transactionRoot, journal);
+                var completed = false;
+
+                try
+                {
+                    StatusChanged?.Invoke("Creating safe world snapshot...");
+                    CopyWorldDirectory(worldDir, stagingWorld, token);
+                    StatusChanged?.Invoke("Preparing player profiles...");
+                    _playerProfiles.PrepareWorldForOutgoingTransfer(stagingWorld, identity);
+                    var playerManifestSha = _playerProfiles.GetPlayerManifestHash(stagingWorld);
+
+                    StatusChanged?.Invoke("Hashing world...");
+                    var worldSha = HashDirectory(stagingWorld);
+
+                    ZipFile.CreateFromDirectory(stagingWorld, archivePath, CompressionLevel.Optimal, includeBaseDirectory: false);
+
+                    var fileInfo = new FileInfo(archivePath);
+                    if (fileInfo.Length > settings.MaxArchiveBytes)
+                    {
+                        throw new InvalidOperationException("World archive exceeds configured size limit.");
+                    }
+                    RaiseProgress(0, fileInfo.Length);
+
+                    var header = new WorldTransferHeader
+                    {
+                        TransferId = transferId,
+                        SenderName = identity.IdentityName,
+                        SenderIdentityId = identity.IdentityId,
+                        SenderIdentityName = identity.IdentityName,
+                        OwnerIdentityId = ownerId.id,
+                        OwnerIdentityName = ownerId.name,
+                        Size = fileInfo.Length,
+                        WorldSha256 = worldSha,
+                        PlayerManifestSha256 = playerManifestSha,
+                        FileName = Path.GetFileName(archivePath),
+                        WorldName = worldName
+                    };
+
+                    StatusChanged?.Invoke("Sending world archive...");
+                    using var client = new TcpClient();
+                    await client.ConnectAsync(peerAddress, _runtimeOptions.Port, token);
+                    await using var stream = client.GetStream();
+                    await WriteJsonAsync(stream, header, token);
+                    await using (var file = File.OpenRead(archivePath))
+                    {
+                        await CopyWithProgressAsync(file, stream, fileInfo.Length, progress =>
+                        {
+                            RaiseProgress(progress, fileInfo.Length);
+                        }, token);
+                    }
+
+                    var ready = await ReadJsonAsync<WorldTransferAck>(stream, token);
+                    if (ready is null || !ready.Ok || ready.Stage != "Ready" || ready.TransferId != transferId ||
+                        !string.Equals(ready.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(ready.PlayerManifestSha256, playerManifestSha, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException($"Receiver rejected world archive: {ready?.Message ?? "no ready acknowledgement"}");
+                    }
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(escrowPath)!);
+                    Directory.Move(worldDir, escrowPath);
+                    journal.State = "Escrowed";
+                    WriteJournal(transactionRoot, journal);
+                    journal.State = "CommitSent";
+                    WriteJournal(transactionRoot, journal);
+                    await WriteJsonAsync(stream, new WorldTransferControl
+                    {
+                        TransferId = transferId,
+                        Command = "Commit"
+                    }, token);
+
+                    var committed = await ReadJsonAsync<WorldTransferAck>(stream, token);
+                    if (committed is null || !committed.Ok || committed.Stage != "Committed" || committed.TransferId != transferId ||
+                        !string.Equals(committed.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
+                        string.IsNullOrWhiteSpace(committed.PlayerManifestSha256))
+                    {
+                        throw new InvalidOperationException(
+                            "Transfer commit was not confirmed. The source world remains safely quarantined in Personal\\Transfers.");
+                    }
+
+                    journal.State = "Committed";
+                    WriteJournal(transactionRoot, journal);
+                    completed = true;
+                    var selectedRelativePath = Path.GetRelativePath(_paths.Worlds, worldDir);
+                    if (string.Equals(settings.SelectedWorldRelativePath, selectedRelativePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        settings.SelectedWorldRelativePath = "";
+                    }
+
+                    _logger.Info("World archive transferred successfully; local source world removed.");
+                }
+                catch
+                {
+                    if (journal.State != "CommitSent" && Directory.Exists(escrowPath) && !Directory.Exists(worldDir))
+                    {
+                        Directory.Move(escrowPath, worldDir);
+                    }
+                    throw;
+                }
+                finally
+                {
+                    if (completed || journal.State != "CommitSent") DeleteDirectoryIfExists(transactionRoot);
+                }
+            }
+            finally
+            {
+                EndProgress();
+            }
+        }
+        finally
+        {
+            _transferGate.Release();
+        }
+    }
+
+    private async Task ListenAsync(
+        AppSettings settings,
+        TaskCompletionSource ready,
+        CancellationToken token)
+    {
+        var listener = new TcpListener(_runtimeOptions.ListenAddress, _runtimeOptions.Port);
+        try
+        {
+            listener.Start();
+            ready.TrySetResult();
             while (!token.IsCancellationRequested)
             {
                 var client = await listener.AcceptTcpClientAsync(token);
-                _ = Task.Run(() => ReceiveWorldAsync(client, settings, token), token);
+                var id = Interlocked.Increment(ref _nextReceiveTaskId);
+                var receiveTask = ReceiveWorldAsync(client, settings, token);
+                _receiveTasks[id] = receiveTask;
+                _ = receiveTask.ContinueWith(
+                    completedTask => _receiveTasks.TryRemove(id, out _),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
             }
         }
         catch (OperationCanceledException)
@@ -228,6 +314,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            ready.TrySetException(ex);
             _logger.Warn($"World transfer listener failed: {ex.Message}");
         }
         finally
@@ -246,18 +333,31 @@ public sealed class WorldTransferService : IAsyncDisposable
         string? receivedPath = null;
         string? tempWorldPath = null;
         WorldTransferJournal? journal = null;
+        var operationAcquired = false;
+        var progressStarted = false;
         try
         {
             header = await ReadJsonAsync<WorldTransferHeader>(stream, token)
                 ?? throw new InvalidOperationException("Invalid transfer header.");
             if (header.Protocol == PingProtocol)
             {
-                await WriteJsonAsync(stream, new WorldTransferAck { Ok = true, Stage = "Ping", Message = "ready" }, token);
+                var available = _transferGate.CurrentCount > 0;
+                await WriteJsonAsync(stream, new WorldTransferAck
+                {
+                    Ok = available,
+                    Stage = "Ping",
+                    Message = available ? "ready" : "another world transfer is active"
+                }, token);
                 return;
             }
             if (header.Protocol != TransferProtocol || !Guid.TryParseExact(header.TransferId, "N", out var parsedTransferId))
             {
                 throw new InvalidOperationException("The sender uses an incompatible world transfer protocol.");
+            }
+            operationAcquired = await _transferGate.WaitAsync(0, token).ConfigureAwait(false);
+            if (!operationAcquired)
+            {
+                throw new InvalidOperationException("Another world transfer is already active.");
             }
             if (_minecraft.IsClientRunning)
             {
@@ -279,7 +379,8 @@ public sealed class WorldTransferService : IAsyncDisposable
             };
             WriteJournal(transactionRoot, journal);
             receivedPath = Path.Combine(transactionRoot, "received.zip");
-            RaiseProgress(0, header.Size);
+            BeginProgress(header.Size);
+            progressStarted = true;
             await using (var file = new FileStream(receivedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 await CopyExactlyWithLimitWithProgressAsync(stream, file, header.Size, settings.MaxArchiveBytes, progress =>
@@ -386,10 +487,11 @@ public sealed class WorldTransferService : IAsyncDisposable
         }
         finally
         {
-            RaiseProgress(0, 0);
+            if (progressStarted) EndProgress();
             DeleteFileIfExists(receivedPath);
             DeleteDirectoryIfExists(tempWorldPath);
             if (transactionRoot is not null) DeleteDirectoryIfExists(transactionRoot);
+            if (operationAcquired) _transferGate.Release();
         }
     }
 
@@ -404,50 +506,78 @@ public sealed class WorldTransferService : IAsyncDisposable
         return worldDir;
     }
 
-    private async Task VerifyPeerTransferReadyAsync(PeerViewModel peer, AppSettings settings, CancellationToken token)
+    private async Task<IPAddress> VerifyPeerTransferReadyAsync(PeerViewModel peer, AppSettings settings, CancellationToken token)
     {
         var identity = _identityService.ResolveContext(settings);
-        if (string.IsNullOrWhiteSpace(peer.VpnIp) || !IPAddress.TryParse(peer.VpnIp, out var ip))
+        var candidateAddresses = peer.GetCandidateIps()
+            .Select(value => IPAddress.TryParse(value, out var address) ? address : null)
+            .Where(address => address is not null)
+            .Cast<IPAddress>()
+            .Distinct()
+            .ToArray();
+        if (candidateAddresses.Length == 0)
         {
             throw new InvalidOperationException("Selected player does not have a valid network IP address.");
         }
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(8));
-
-        try
+        var failures = new List<string>();
+        foreach (var ip in candidateAddresses)
         {
-            using var client = new TcpClient();
-            await client.ConnectAsync(ip, _runtimeOptions.Port, timeoutCts.Token);
-            await using var stream = client.GetStream();
-            await WriteJsonAsync(stream, new WorldTransferHeader
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(4));
+            try
             {
-                Protocol = PingProtocol,
-                SenderName = identity.IdentityName,
-                SenderIdentityId = identity.IdentityId,
-                SenderIdentityName = identity.IdentityName,
-                Size = 0,
-                FileName = "ping",
-                WorldName = ""
-            }, timeoutCts.Token);
+                using var client = new TcpClient();
+                await client.ConnectAsync(ip, _runtimeOptions.Port, timeoutCts.Token);
+                await using var stream = client.GetStream();
+                await WriteJsonAsync(stream, new WorldTransferHeader
+                {
+                    Protocol = PingProtocol,
+                    SenderName = identity.IdentityName,
+                    SenderIdentityId = identity.IdentityId,
+                    SenderIdentityName = identity.IdentityName,
+                    Size = 0,
+                    FileName = "ping",
+                    WorldName = ""
+                }, timeoutCts.Token);
 
-            var ack = await ReadJsonAsync<WorldTransferAck>(stream, timeoutCts.Token);
-            if (ack is null || !ack.Ok)
+                var ack = await ReadJsonAsync<WorldTransferAck>(stream, timeoutCts.Token);
+                if (ack is null || !ack.Ok)
+                {
+                    throw new InvalidOperationException(ack?.Message ?? "receiver did not accept transfer ping");
+                }
+                return ip;
+            }
+            catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException or TimeoutException or InvalidOperationException)
             {
-                throw new InvalidOperationException(ack?.Message ?? "receiver did not accept transfer ping");
+                token.ThrowIfCancellationRequested();
+                failures.Add($"{ip}: {ex.Message}");
             }
         }
-        catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException or TimeoutException)
-        {
-            throw new InvalidOperationException(BuildPeerConnectionMessage(peer.VpnIp), ex);
-        }
+
+        throw new InvalidOperationException(
+            BuildPeerConnectionMessage(string.Join(", ", candidateAddresses.Select(address => address.ToString()))) +
+            Environment.NewLine + string.Join(Environment.NewLine, failures.Take(3)));
     }
 
     private void RaiseProgress(long current, long total)
     {
         try
         {
-            ProgressChanged?.Invoke(current, total);
+            ProgressChanged?.Invoke(new WorldTransferProgress(true, current, total));
+        }
+        catch
+        {
+        }
+    }
+
+    private void BeginProgress(long total = 0) => RaiseProgress(0, total);
+
+    private void EndProgress()
+    {
+        try
+        {
+            ProgressChanged?.Invoke(new WorldTransferProgress(false, 0, 0));
         }
         catch
         {
@@ -464,10 +594,7 @@ public sealed class WorldTransferService : IAsyncDisposable
 
     private LocalIdentityContext ResolveIdentityContext(AppSettings settings)
     {
-        var identity = _identityService.ResolveContext(settings);
-        var descriptor = PackManifestService.Load(_paths.CombineUnderPacks(settings.ClientRelativePath));
-        identity.MinecraftUuid = _identityAdapter.ResolveMinecraftUuid(identity, descriptor).ToString("D");
-        return identity;
+        return _identityService.ResolveContext(settings);
     }
 
     private string CreateTransactionDirectory(string transferId)
@@ -815,19 +942,18 @@ public sealed class WorldTransferService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        StopListener();
-        if (_listenerTask is not null)
-        {
-            try
-            {
-                await _listenerTask;
-            }
-            catch
-            {
-            }
-        }
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0) return;
+        _shutdownCts.Cancel();
+        await StopListenerAsync().ConfigureAwait(false);
+        await _transferGate.WaitAsync().ConfigureAwait(false);
+        _transferGate.Release();
+        _listenerGate.Dispose();
+        _transferGate.Dispose();
+        _shutdownCts.Dispose();
     }
 }
+
+public sealed record WorldTransferProgress(bool IsActive, long Current, long Total);
 
 public sealed class WorldTransferRuntimeOptions
 {

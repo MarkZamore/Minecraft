@@ -13,13 +13,11 @@ public sealed class VoiceEncoder : IDisposable
     public const int MaxPacketSize = 4000;
 
     private readonly IOpusEncoder _encoder;
-    private readonly IOpusDecoder _decoder;
 
     public VoiceEncoder()
     {
         OpusCodecFactory.AttemptToUseNativeLibrary = false;
         _encoder = OpusCodecFactory.CreateEncoder(SampleRate, Channels, OpusApplication.OPUS_APPLICATION_VOIP, TextWriter.Null);
-        _decoder = OpusCodecFactory.CreateDecoder(SampleRate, Channels, TextWriter.Null);
     }
 
     public byte[] Encode(short[] frame)
@@ -39,6 +37,25 @@ public sealed class VoiceEncoder : IDisposable
         return payload;
     }
 
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
+    }
+}
+
+public sealed class VoiceDecoder : IDisposable
+{
+    private readonly IOpusDecoder _decoder;
+
+    public VoiceDecoder()
+    {
+        OpusCodecFactory.AttemptToUseNativeLibrary = false;
+        _decoder = OpusCodecFactory.CreateDecoder(
+            VoiceEncoder.SampleRate,
+            VoiceEncoder.Channels,
+            TextWriter.Null);
+    }
+
     public short[] Decode(byte[] encoded)
     {
         if (encoded is null || encoded.Length == 0)
@@ -46,9 +63,9 @@ public sealed class VoiceEncoder : IDisposable
             return Array.Empty<short>();
         }
 
-        var decoded = new short[FrameSamples * Channels];
-        var decodedSamples = _decoder.Decode(encoded, decoded, FrameSamples, false);
-        var outputSamples = Math.Max(0, decodedSamples) * Channels;
+        var decoded = new short[VoiceEncoder.FrameSamples * VoiceEncoder.Channels];
+        var decodedSamples = _decoder.Decode(encoded, decoded, VoiceEncoder.FrameSamples, false);
+        var outputSamples = Math.Max(0, decodedSamples) * VoiceEncoder.Channels;
         if (outputSamples <= 0 || outputSamples > decoded.Length)
         {
             return Array.Empty<short>();

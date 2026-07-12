@@ -58,20 +58,20 @@ public sealed class MinecraftProcessService
         }
 
         var descriptor = PackManifestService.Load(packDir);
-        var instance = await _packInstances.PrepareAsync(settings.ClientRelativePath, token);
-        var gameDir = instance.GameDirectory;
         var identityContext = _identityService.ResolveContext(settings);
-        identityContext.MinecraftUuid = _identityAdapter.ResolveMinecraftUuid(identityContext, descriptor).ToString("D");
-        EnsureWorldsDirectoryAndSavesLink(gameDir);
-        ValidatePackCompatibility(packDir);
-        EnsureModernFixShutdownWorkaround(gameDir);
-        _playerProfiles.PrepareWorldsForLaunch(_paths.Worlds, identityContext);
-
         var runtime = await _packRuntimes.PrepareAsync(settings.ClientRelativePath, runtimeProgress, token);
         if (!string.Equals(runtime.Descriptor.DescriptorHash, descriptor.DescriptorHash, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("Pack manifest changed while its runtime was being prepared. Start the game again.");
         }
+        var identityJvmArguments = await _identityAdapter.PrepareJvmArgumentsAsync(runtime, token);
+
+        var instance = await _packInstances.PrepareAsync(settings.ClientRelativePath, token);
+        var gameDir = instance.GameDirectory;
+        EnsureWorldsDirectoryAndSavesLink(gameDir);
+        ValidatePackCompatibility(packDir);
+        EnsureModernFixShutdownWorkaround(gameDir);
+        _playerProfiles.PrepareWorldsForLaunch(_paths.Worlds, identityContext);
 
         var launcher = _packRuntimes.CreateLocalLauncher(runtime);
         var profile = await launcher.GetVersionAsync(runtime.ProfileId, token);
@@ -102,7 +102,7 @@ public sealed class MinecraftProcessService
             new("-Djava.net.preferIPv6Addresses=false"),
             new($"-Djava.io.tmpdir={javaTempDir}")
         };
-        extraJvmArguments.AddRange(_identityAdapter.PrepareJvmArguments(descriptor, gameDir).Select(argument => new MArgument(argument)));
+        extraJvmArguments.AddRange(identityJvmArguments.Select(argument => new MArgument(argument)));
         var launchOption = new MLaunchOption
         {
             Path = launchPath,

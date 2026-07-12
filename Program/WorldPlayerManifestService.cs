@@ -8,7 +8,7 @@ namespace Minecraft;
 public sealed class WorldPlayerManifestService
 {
     public const string ManifestFileName = ".minecraft-portable-players.json";
-    private const int CurrentSchemaVersion = 1;
+    private const int CurrentSchemaVersion = 2;
     private static readonly string[] ProfileDirectories = ["playerdata", "stats", "advancements"];
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
 
@@ -33,9 +33,7 @@ public sealed class WorldPlayerManifestService
                 .ToList();
             players.Add(new WorldPlayerManifestEntry
             {
-                PortableUuid = isCurrentHolder && currentHolder is not null
-                    ? NormalizeUuid(currentHolder.IdentityId, minecraftUuid)
-                    : existing?.PortableUuid ?? minecraftUuid,
+                PortableUuid = minecraftUuid,
                 MinecraftUuid = minecraftUuid,
                 LastKnownName = isCurrentHolder && currentHolder is not null
                     ? currentHolder.IdentityName
@@ -47,7 +45,9 @@ public sealed class WorldPlayerManifestService
         var manifest = new WorldPlayersManifest
         {
             SchemaVersion = CurrentSchemaVersion,
-            CurrentHolderUuid = currentHolder is null ? previous?.CurrentHolderUuid ?? string.Empty : currentHolder.IdentityId,
+            CurrentHolderUuid = currentHolder is null
+                ? previous?.CurrentHolderUuid ?? string.Empty
+                : effectiveHolderUuid?.ToString("D").ToLowerInvariant() ?? string.Empty,
             UpdatedAtUtc = DateTimeOffset.UtcNow,
             Players = players
         };
@@ -82,9 +82,14 @@ public sealed class WorldPlayerManifestService
             {
                 throw new InvalidDataException($"Player manifest contains duplicate UUID {minecraftUuid:D}.");
             }
-            if (!Guid.TryParse(player.PortableUuid, out _))
+            if (!Guid.TryParse(player.PortableUuid, out var portableUuid))
             {
                 throw new InvalidDataException("Player manifest contains an invalid portable UUID.");
+            }
+            if (portableUuid != minecraftUuid)
+            {
+                throw new InvalidDataException(
+                    $"Player manifest maps portable UUID {portableUuid:D} to a different Minecraft UUID {minecraftUuid:D}.");
             }
             foreach (var file in player.Files)
             {
@@ -99,6 +104,16 @@ public sealed class WorldPlayerManifestService
                     throw new InvalidDataException($"Player manifest contains a duplicate file: {file.Path}");
                 }
                 if (!File.Exists(path)) throw new InvalidDataException($"Player profile file is missing: {file.Path}");
+                if (IsPrimaryPlayerDataPath(relative, minecraftUuid))
+                {
+                    var embeddedUuid = NbtFile.Read(path).Root.GetUuid();
+                    if (embeddedUuid != minecraftUuid)
+                    {
+                        throw new InvalidDataException(
+                            $"Player profile {file.Path} contains UUID {embeddedUuid?.ToString("D") ?? "missing"} " +
+                            $"instead of {minecraftUuid:D}.");
+                    }
+                }
                 var info = new FileInfo(path);
                 if (info.Length != file.Size || !string.Equals(HashFile(path), file.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
@@ -202,6 +217,14 @@ public sealed class WorldPlayerManifestService
         return fileName.StartsWith(normalizedUuid + ".", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsPrimaryPlayerDataPath(string relativePath, Guid uuid)
+    {
+        return string.Equals(
+            relativePath,
+            $"playerdata/{uuid:D}.dat",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
     private static WorldPlayerFileManifestEntry CreateFileEntry(string worldPath, string path)
     {
         var info = new FileInfo(path);
@@ -235,9 +258,6 @@ public sealed class WorldPlayerManifestService
         return Guid.TryParse(identity.IdentityId, out var identityUuid) ? identityUuid : null;
     }
 
-    private static string NormalizeUuid(string value, string fallback) =>
-        Guid.TryParse(value, out var uuid) ? uuid.ToString("D").ToLowerInvariant() : fallback;
-
     private static string HashFile(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
@@ -251,7 +271,7 @@ public sealed class WorldPlayerManifestService
 
 public sealed class WorldPlayersManifest
 {
-    public int SchemaVersion { get; set; } = 1;
+    public int SchemaVersion { get; set; } = 2;
     public string CurrentHolderUuid { get; set; } = string.Empty;
     public DateTimeOffset UpdatedAtUtc { get; set; }
     public List<WorldPlayerManifestEntry> Players { get; set; } = [];

@@ -1,5 +1,4 @@
 using System.Buffers.Binary;
-using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Compression;
 using System.Security.Cryptography;
@@ -113,133 +112,6 @@ public sealed class WorldPlayerProfileService
         PrepareSingleWorldForIdentity(worldPath, identity, "launch");
     }
 
-    public void EnsureCanonicalProfileForIdentity(string worldPath, LocalIdentityContext identity)
-    {
-        ValidateWorldForIdentityPreparation(worldPath, identity);
-        using var transaction = ProfileFileTransaction.Begin(_paths, "Migrate canonical player profile");
-        var canonicalUuid = GetCanonicalIdentityUuid(identity);
-        try
-        {
-            foreach (var legacyProfile in FindPlayerDataProfilesByFreshness(
-                         worldPath,
-                         GetIdentityCandidateUuids(identity).Where(uuid => uuid != canonicalUuid)))
-            {
-                MigrateProfileFiles(worldPath, legacyProfile.Uuid, canonicalUuid, transaction);
-            }
-            WriteManifest(worldPath, identity, transaction);
-            transaction.Commit();
-        }
-        catch
-        {
-            transaction.Rollback();
-            throw;
-        }
-    }
-
-    public void MigrateOfflineNicknameProfiles(
-        string worldsRoot,
-        string previousName,
-        string newName,
-        string portableIdentityId)
-    {
-        if (!Directory.Exists(worldsRoot)) return;
-        var sourceUuid = CreateOfflinePlayerUuid(previousName);
-        var targetUuid = CreateOfflinePlayerUuid(newName);
-        if (sourceUuid == targetUuid) return;
-        var worlds = Directory.EnumerateDirectories(worldsRoot)
-            .Where(path => File.Exists(GetLevelPath(path)))
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var conflicts = new List<string>();
-        var validationFailures = new List<string>();
-        foreach (var world in worlds)
-        {
-            try
-            {
-                WorldAccessGuard.EnsureClosed(world);
-                var level = NbtFile.Read(GetLevelPath(world));
-                var levelPlayer = level.Root.GetCompound("Data")?.GetCompound("Player");
-                if (levelPlayer?.GetUuid() == sourceUuid)
-                {
-                    ValidatePlayerCompound(levelPlayer, Path.GetFileName(world));
-                }
-                foreach (var sourcePath in EnumerateUuidFiles(world, sourceUuid))
-                {
-                    if (IsPrimaryPlayerDataFile(world, sourcePath, sourceUuid))
-                    {
-                        ValidatePlayerDataFile(sourcePath, sourceUuid);
-                    }
-                }
-                var hasSourceProfile = EnumerateUuidFiles(world, sourceUuid).Any();
-                var levelUsesSource = levelPlayer?.GetUuid() == sourceUuid;
-                if ((hasSourceProfile || levelUsesSource) && EnumerateUuidFiles(world, targetUuid).Any())
-                {
-                    conflicts.Add(Path.GetFileName(world));
-                }
-            }
-            catch (Exception ex)
-            {
-                validationFailures.Add($"{Path.GetFileName(world)}: {ex.Message}");
-            }
-        }
-        if (validationFailures.Count > 0)
-        {
-            throw new InvalidOperationException(
-                "Nickname profile migration could not be validated:\n" + string.Join("\n", validationFailures));
-        }
-        if (conflicts.Count > 0)
-        {
-            throw new InvalidOperationException(
-                "The new nickname already has a separate profile in these worlds:\n" + string.Join("\n", conflicts));
-        }
-
-        using var transaction = ProfileFileTransaction.Begin(_paths, "Migrate offline nickname profiles");
-        try
-        {
-            foreach (var world in worlds)
-            {
-                var levelPath = GetLevelPath(world);
-                var level = NbtFile.Read(levelPath);
-                var data = level.Root.GetCompound("Data");
-                var levelPlayer = data?.GetCompound("Player");
-                var hasSourceProfile = EnumerateUuidFiles(world, sourceUuid).Any();
-                var levelUsesSource = levelPlayer?.GetUuid() == sourceUuid;
-                if (!hasSourceProfile && !levelUsesSource) continue;
-
-                if (levelUsesSource) ExportPlayerToPlayerData(world, levelPlayer!, transaction);
-                MoveUuidFiles(world, sourceUuid, targetUuid, transaction);
-                if (levelUsesSource)
-                {
-                    levelPlayer!.SetUuid(targetUuid);
-                    WriteLevel(level, levelPath, transaction);
-                }
-                WriteManifest(world, new LocalIdentityContext
-                {
-                    IdentityId = portableIdentityId,
-                    IdentityName = newName,
-                    MinecraftUuid = targetUuid.ToString("D")
-                }, transaction);
-            }
-            transaction.Commit();
-        }
-        catch
-        {
-            transaction.Rollback();
-            throw;
-        }
-    }
-
-    [SuppressMessage("Security", "CA5351", Justification = "Minecraft's OfflinePlayer UUID protocol explicitly requires MD5.")]
-    public static Guid CreateOfflinePlayerUuid(string playerName)
-    {
-        var normalizedName = string.IsNullOrWhiteSpace(playerName) ? "Player" : playerName.Trim();
-        var seed = Encoding.UTF8.GetBytes("OfflinePlayer:" + normalizedName);
-        var bytes = MD5.HashData(seed).AsSpan(0, 16).ToArray();
-        bytes[6] = (byte)((bytes[6] & 0x0f) | 0x30);
-        bytes[8] = (byte)((bytes[8] & 0x3f) | 0x80);
-        return Guid.ParseExact(Convert.ToHexString(bytes).ToLowerInvariant(), "N");
-    }
-
     private void PrepareSingleWorldForIdentity(string worldPath, LocalIdentityContext identity, string reason)
     {
         ValidateWorldForIdentityPreparation(worldPath, identity);
@@ -270,20 +142,12 @@ public sealed class WorldPlayerProfileService
         }
 
         var canonicalUuid = GetCanonicalIdentityUuid(identity);
-        var candidateUuids = GetIdentityCandidateUuids(identity);
         var level = NbtFile.Read(levelPath);
         var data = level.Root.GetCompound("Data");
         var currentPlayer = data?.GetCompound("Player");
         if (currentPlayer is not null)
         {
             ExportPlayerToPlayerData(worldPath, currentPlayer, transaction);
-        }
-
-        foreach (var legacyProfile in FindPlayerDataProfilesByFreshness(
-                     worldPath,
-                     candidateUuids.Where(uuid => uuid != canonicalUuid)))
-        {
-            MigrateProfileFiles(worldPath, legacyProfile.Uuid, canonicalUuid, transaction);
         }
 
         var selectedProfile = FindPlayerDataProfile(worldPath, new[] { canonicalUuid });
@@ -297,7 +161,7 @@ public sealed class WorldPlayerProfileService
             data.Set("Player", player);
             WriteLevel(level, levelPath, transaction);
             WriteManifest(worldPath, identity, transaction);
-            _logger?.Info($"World {Path.GetFileName(worldPath)} prepared for {reason} with nickname profile {FormatUuid(canonicalUuid)}.");
+            _logger?.Info($"World {Path.GetFileName(worldPath)} prepared for {reason} with portable UUID {FormatUuid(canonicalUuid)}.");
             return;
         }
 
@@ -374,11 +238,9 @@ public sealed class WorldPlayerProfileService
             ValidatePlayerCompound(currentPlayer, Path.GetFileName(worldPath));
         }
 
-        foreach (var uuid in GetIdentityCandidateUuids(identity))
-        {
-            var profilePath = GetPlayerDataPath(worldPath, uuid);
-            if (File.Exists(profilePath)) ValidatePlayerDataFile(profilePath, uuid);
-        }
+        var uuid = GetCanonicalIdentityUuid(identity);
+        var profilePath = GetPlayerDataPath(worldPath, uuid);
+        if (File.Exists(profilePath)) ValidatePlayerDataFile(profilePath, uuid);
 
         var manifestPath = Path.Combine(worldPath, WorldPlayerManifestService.ManifestFileName);
         if (File.Exists(manifestPath)) _ = _manifests.Read(worldPath);
@@ -440,172 +302,17 @@ public sealed class WorldPlayerProfileService
         return Path.Combine(worldPath, "playerdata", $"{FormatUuid(uuid)}.dat");
     }
 
-    private static List<Guid> GetIdentityCandidateUuids(LocalIdentityContext identity)
-    {
-        var candidates = new List<Guid> { GetCanonicalIdentityUuid(identity) };
-
-        foreach (var legacyIdentityId in identity.LegacyIdentityIds)
-        {
-            if (Guid.TryParse(legacyIdentityId, out var legacyUuid))
-            {
-                candidates.Add(legacyUuid);
-            }
-        }
-
-        return candidates.Distinct().ToList();
-    }
-
     private static Guid GetCanonicalIdentityUuid(LocalIdentityContext identity)
     {
-        if (Guid.TryParse(identity.MinecraftUuid, out var minecraftUuid))
+        if (!Guid.TryParse(identity.IdentityId, out var identityUuid) || identityUuid == Guid.Empty)
         {
-            return minecraftUuid;
+            throw new InvalidDataException("Portable identity UUID is missing or invalid.");
         }
-
-        if (Guid.TryParse(identity.IdentityId, out var identityUuid))
+        if (!Guid.TryParse(identity.MinecraftUuid, out var minecraftUuid) || minecraftUuid != identityUuid)
         {
-            return identityUuid;
+            throw new InvalidDataException("Minecraft UUID does not match Minecraft\\Personal\\UUID.json.");
         }
-
-        return CreateOfflinePlayerUuid(identity.IdentityName);
-    }
-
-    private void MigrateProfileFiles(
-        string worldPath,
-        Guid sourceUuid,
-        Guid targetUuid,
-        ProfileFileTransaction transaction)
-    {
-        if (sourceUuid == targetUuid)
-        {
-            return;
-        }
-
-        var sourceProfilePath = GetPlayerDataPath(worldPath, sourceUuid);
-        var targetProfilePath = GetPlayerDataPath(worldPath, targetUuid);
-        if (!File.Exists(sourceProfilePath))
-        {
-            return;
-        }
-
-        var createdCanonicalProfile = false;
-        if (!File.Exists(targetProfilePath))
-        {
-            var sourceProfile = NbtFile.Read(sourceProfilePath).Root.Clone();
-            sourceProfile.SetUuid(targetUuid);
-            Directory.CreateDirectory(Path.GetDirectoryName(targetProfilePath)!);
-            transaction.Track(targetProfilePath);
-            new NbtFile(string.Empty, sourceProfile).Write(targetProfilePath);
-            createdCanonicalProfile = true;
-        }
-
-        foreach (var directoryName in new[] { "playerdata", "stats", "advancements" })
-        {
-            CopyUuidSidecarFiles(worldPath, directoryName, sourceUuid, targetUuid, targetProfilePath, transaction);
-        }
-
-        if (createdCanonicalProfile)
-        {
-            _logger?.Info($"Migrated player profile {FormatUuid(sourceUuid)} to nickname UUID {FormatUuid(targetUuid)}.");
-        }
-    }
-
-    private static void CopyUuidSidecarFiles(
-        string worldPath,
-        string directoryName,
-        Guid sourceUuid,
-        Guid targetUuid,
-        string canonicalProfilePath,
-        ProfileFileTransaction transaction)
-    {
-        var directory = Path.Combine(worldPath, directoryName);
-        if (!Directory.Exists(directory))
-        {
-            return;
-        }
-
-        var sourcePrefix = FormatUuid(sourceUuid);
-        var targetPrefix = FormatUuid(targetUuid);
-        foreach (var sourcePath in Directory.EnumerateFiles(directory, sourcePrefix + ".*", SearchOption.TopDirectoryOnly))
-        {
-            if (string.Equals(sourcePath, GetPlayerDataPath(worldPath, sourceUuid), StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var sourceName = Path.GetFileName(sourcePath);
-            var suffix = sourceName[sourcePrefix.Length..];
-            var targetPath = Path.Combine(directory, targetPrefix + suffix);
-            if (string.Equals(targetPath, canonicalProfilePath, StringComparison.OrdinalIgnoreCase) || File.Exists(targetPath))
-            {
-                continue;
-            }
-
-            transaction.Track(targetPath);
-            File.Copy(sourcePath, targetPath, overwrite: false);
-        }
-    }
-
-    private static bool IsPrimaryPlayerDataFile(string worldPath, string path, Guid uuid)
-    {
-        return string.Equals(path, GetPlayerDataPath(worldPath, uuid), StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static IEnumerable<string> EnumerateUuidFiles(string worldPath, Guid uuid)
-    {
-        var prefix = FormatUuid(uuid);
-        foreach (var directoryName in new[] { "playerdata", "stats", "advancements" })
-        {
-            var directory = Path.Combine(worldPath, directoryName);
-            if (!Directory.Exists(directory)) continue;
-            foreach (var path in Directory.EnumerateFiles(directory, prefix + ".*", SearchOption.TopDirectoryOnly))
-            {
-                yield return path;
-            }
-        }
-    }
-
-    private static void MoveUuidFiles(
-        string worldPath,
-        Guid sourceUuid,
-        Guid targetUuid,
-        ProfileFileTransaction transaction)
-    {
-        var sourcePrefix = FormatUuid(sourceUuid);
-        var targetPrefix = FormatUuid(targetUuid);
-        var createdTargets = new List<string>();
-        try
-        {
-            foreach (var sourcePath in EnumerateUuidFiles(worldPath, sourceUuid).ToArray())
-            {
-                var sourceName = Path.GetFileName(sourcePath);
-                var targetPath = Path.Combine(Path.GetDirectoryName(sourcePath)!, targetPrefix + sourceName[sourcePrefix.Length..]);
-                if (File.Exists(targetPath)) throw new IOException($"Target profile file already exists: {targetPath}");
-                transaction.Track(sourcePath);
-                transaction.Track(targetPath);
-                if (sourcePath.EndsWith(".dat", StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(Path.GetDirectoryName(sourcePath), Path.Combine(worldPath, "playerdata"), StringComparison.OrdinalIgnoreCase))
-                {
-                    var profile = NbtFile.Read(sourcePath);
-                    profile.Root.SetUuid(targetUuid);
-                    profile.Write(targetPath);
-                }
-                else
-                {
-                    File.Copy(sourcePath, targetPath, overwrite: false);
-                }
-                createdTargets.Add(targetPath);
-            }
-            foreach (var sourcePath in EnumerateUuidFiles(worldPath, sourceUuid).ToArray()) File.Delete(sourcePath);
-        }
-        catch
-        {
-            foreach (var target in createdTargets)
-            {
-                if (File.Exists(target)) File.Delete(target);
-            }
-            throw;
-        }
+        return identityUuid;
     }
 
     private static PlayerDataProfile? FindPlayerDataProfile(string worldPath, IEnumerable<Guid> candidateUuids)
@@ -620,14 +327,6 @@ public sealed class WorldPlayerProfileService
         }
 
         return null;
-    }
-
-    private static IEnumerable<PlayerDataProfile> FindPlayerDataProfilesByFreshness(string worldPath, IEnumerable<Guid> candidateUuids)
-    {
-        return candidateUuids
-            .Select(uuid => new PlayerDataProfile(uuid, GetPlayerDataPath(worldPath, uuid)))
-            .Where(profile => File.Exists(profile.Path))
-            .OrderByDescending(profile => File.GetLastWriteTimeUtc(profile.Path));
     }
 
     private static string FormatUuid(Guid uuid) => uuid.ToString("D").ToLowerInvariant();

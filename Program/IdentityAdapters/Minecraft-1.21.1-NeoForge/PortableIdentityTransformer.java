@@ -18,12 +18,38 @@ import jdk.internal.org.objectweb.asm.tree.VarInsnNode;
 public final class PortableIdentityTransformer implements ClassFileTransformer {
     private static final String LOGIN_LISTENER =
         "net/minecraft/server/network/ServerLoginPacketListenerImpl";
+    private static final String OBFUSCATED_LOGIN_LISTENER = "arw";
     private static final String HELLO_DESCRIPTOR =
         "(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V";
+    private static final String OBFUSCATED_HELLO_DESCRIPTOR = "(Laiy;)V";
     private static final String VERIFY_DESCRIPTOR =
         "(Lcom/mojang/authlib/GameProfile;)V";
     private static final String HOOKS =
         "minecraft/portable/identity/PortableIdentityHooks";
+
+    private static String property(String name, String fallback) {
+        String value = System.getProperty("minecraft.portable.identity." + name);
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private static boolean contains(String csv, String value) {
+        for (String candidate : csv.split(",")) {
+            if (candidate.trim().equals(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean matchesMethod(
+        MethodNode method,
+        String namesProperty,
+        String defaultNames,
+        String descriptorsProperty,
+        String defaultDescriptors) {
+        return contains(property(namesProperty, defaultNames), method.name)
+            && contains(property(descriptorsProperty, defaultDescriptors), method.desc);
+    }
 
     @Override
     public byte[] transform(
@@ -33,7 +59,10 @@ public final class PortableIdentityTransformer implements ClassFileTransformer {
         Class<?> classBeingRedefined,
         ProtectionDomain protectionDomain,
         byte[] classfileBuffer) {
-        if (!LOGIN_LISTENER.equals(className)) {
+        String listeners = property(
+            "loginClasses",
+            LOGIN_LISTENER + "," + OBFUSCATED_LOGIN_LISTENER);
+        if (!contains(listeners, className)) {
             return null;
         }
 
@@ -42,11 +71,20 @@ public final class PortableIdentityTransformer implements ClassFileTransformer {
         boolean helloPatched = false;
         boolean duplicatePatched = false;
         for (MethodNode method : node.methods) {
-            if ("handleHello".equals(method.name) && HELLO_DESCRIPTOR.equals(method.desc)) {
+            if (matchesMethod(
+                method,
+                "helloMethods",
+                "handleHello,a",
+                "helloDescriptors",
+                HELLO_DESCRIPTOR + "," + OBFUSCATED_HELLO_DESCRIPTOR)) {
                 prependGuard(method, "handleHello");
                 helloPatched = true;
-            } else if ("verifyLoginAndFinishConnectionSetup".equals(method.name)
-                && VERIFY_DESCRIPTOR.equals(method.desc)) {
+            } else if (matchesMethod(
+                method,
+                "verifyMethods",
+                "verifyLoginAndFinishConnectionSetup,c",
+                "verifyDescriptors",
+                VERIFY_DESCRIPTOR)) {
                 prependGuard(method, "rejectDuplicateUuid");
                 duplicatePatched = true;
             }
@@ -59,6 +97,7 @@ public final class PortableIdentityTransformer implements ClassFileTransformer {
 
         ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         node.accept(writer);
+        System.out.println("[PortableIdentity] Patched login class " + className + ".");
         return writer.toByteArray();
     }
 

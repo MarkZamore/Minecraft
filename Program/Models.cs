@@ -52,6 +52,7 @@ public sealed class AppSettings
 public sealed class NetworkAdapterInfo
 {
     public required string Id { get; init; }
+    public int InterfaceIndex { get; init; }
     public required string Name { get; init; }
     public string Description { get; init; } = "";
     public required string IPv4 { get; init; }
@@ -63,6 +64,15 @@ public sealed class NetworkAdapterInfo
 
     [JsonIgnore]
     public string DisplayName => $"{Name} - {IPv4}";
+}
+
+public sealed class PeerEndpointInfo
+{
+    public required string Address { get; init; }
+    public string NetworkType { get; set; } = "Unknown";
+    public bool IsHost { get; set; }
+    public int ServerPort { get; set; }
+    public DateTimeOffset LastSeen { get; set; }
 }
 
 public sealed class PeerAnnouncement
@@ -83,6 +93,7 @@ public sealed class PeerAnnouncement
 
 public sealed class PeerViewModel : INotifyPropertyChanged
 {
+    private readonly Dictionary<string, PeerEndpointInfo> _endpoints = new(StringComparer.OrdinalIgnoreCase);
     private string _playerName = "";
     private string _vpnIp = "";
     private string _networkType = "";
@@ -99,6 +110,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private string _localPackHash = "";
     private int? _lastRttMs;
     private DateTimeOffset _lastRttAt;
+    private bool _isLocalVoicePeer;
 
     public string PlayerName
     {
@@ -108,6 +120,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
             if (Set(ref _playerName, value))
             {
                 OnPropertyChanged(nameof(DisplayName));
+                OnPropertyChanged(nameof(VoiceDisplayName));
                 OnPropertyChanged(nameof(HostDisplayName));
             }
         }
@@ -121,6 +134,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
             if (Set(ref _vpnIp, value))
             {
                 OnPropertyChanged(nameof(DisplayName));
+                OnPropertyChanged(nameof(VoiceDisplayName));
                 OnPropertyChanged(nameof(HostDisplayName));
                 OnPropertyChanged(nameof(NetworkType));
             }
@@ -171,6 +185,19 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     {
         get => _isInVoiceChannel;
         set => Set(ref _isInVoiceChannel, value);
+    }
+
+    public bool IsLocalVoicePeer
+    {
+        get => _isLocalVoicePeer;
+        set
+        {
+            if (Set(ref _isLocalVoicePeer, value))
+            {
+                OnPropertyChanged(nameof(DisplayName));
+                OnPropertyChanged(nameof(VoiceDisplayName));
+            }
+        }
     }
 
     public bool IsSpeaking
@@ -237,7 +264,21 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
     }
 
-    public string VoiceDisplayName => IsSpeaking ? $"{DisplayName} (говорит)" : DisplayName;
+    public string VoiceDisplayName
+    {
+        get
+        {
+            var displayName = IsLocalVoicePeer ? $"{DisplayName} (Вы)" : DisplayName;
+            return IsSpeaking ? $"{displayName} (говорит)" : displayName;
+        }
+    }
+
+    [JsonIgnore]
+    public IReadOnlyList<PeerEndpointInfo> NetworkEndpoints => _endpoints.Values
+        .OrderByDescending(endpoint => endpoint.IsHost)
+        .ThenByDescending(endpoint => endpoint.LastSeen)
+        .ThenBy(endpoint => endpoint.Address, StringComparer.OrdinalIgnoreCase)
+        .ToArray();
 
     public string HostDisplayName
     {
@@ -272,17 +313,77 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     public void Apply(PeerAnnouncement announcement, string localPackHash)
     {
         PlayerName = announcement.PlayerName;
-        VpnIp = announcement.VpnIp;
-        NetworkType = announcement.NetworkType;
         IdentityId = announcement.IdentityId;
         IdentityName = announcement.IdentityName;
-        IsHost = announcement.IsHost;
         IsInVoiceChannel = announcement.IsVoiceChannelActive;
         PackHash = announcement.PackHash;
-        ServerPort = announcement.ServerPort;
         State = announcement.State;
         LocalPackHash = localPackHash;
-        LastSeen = DateTimeOffset.Now;
+        var now = DateTimeOffset.Now;
+        LastSeen = now;
+
+        if (!string.IsNullOrWhiteSpace(announcement.VpnIp))
+        {
+            if (!_endpoints.TryGetValue(announcement.VpnIp, out var endpoint))
+            {
+                endpoint = new PeerEndpointInfo { Address = announcement.VpnIp };
+                _endpoints[announcement.VpnIp] = endpoint;
+            }
+
+            endpoint.NetworkType = NormalizeNetworkType(announcement.NetworkType);
+            endpoint.IsHost = announcement.IsHost;
+            endpoint.ServerPort = announcement.ServerPort;
+            endpoint.LastSeen = now;
+        }
+
+        SelectPrimaryEndpoint();
+    }
+
+    public bool PruneEndpoints(DateTimeOffset cutoff)
+    {
+        foreach (var endpoint in _endpoints.Values.Where(endpoint => endpoint.LastSeen < cutoff).ToArray())
+        {
+            _endpoints.Remove(endpoint.Address);
+        }
+
+        SelectPrimaryEndpoint();
+        return _endpoints.Count > 0;
+    }
+
+    public IReadOnlyList<string> GetCandidateIps(bool requireHost = false)
+    {
+        return _endpoints.Values
+            .Where(endpoint => !requireHost || endpoint.IsHost)
+            .OrderByDescending(endpoint => endpoint.Address.Equals(VpnIp, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(endpoint => endpoint.LastSeen)
+            .Select(endpoint => endpoint.Address)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private void SelectPrimaryEndpoint()
+    {
+        var primary = _endpoints.Values
+            .OrderByDescending(endpoint => endpoint.IsHost)
+            .ThenByDescending(endpoint => endpoint.LastSeen)
+            .FirstOrDefault();
+        if (primary is null)
+        {
+            VpnIp = "";
+            NetworkType = "";
+            IsHost = false;
+            ServerPort = 0;
+            return;
+        }
+
+        VpnIp = primary.Address;
+        NetworkType = primary.NetworkType;
+        IsHost = _endpoints.Values.Any(endpoint => endpoint.IsHost);
+        ServerPort = _endpoints.Values
+            .Where(endpoint => endpoint.IsHost && endpoint.ServerPort is > 0 and <= 65535)
+            .OrderByDescending(endpoint => endpoint.LastSeen)
+            .Select(endpoint => endpoint.ServerPort)
+            .FirstOrDefault();
     }
 
     private static string NormalizeNetworkType(string? networkType)
@@ -362,7 +463,7 @@ public sealed class ClientBuildViewModel
 
 public sealed class WorldTransferHeader
 {
-    public string Protocol { get; set; } = "MinecraftPortableWorldV2";
+    public string Protocol { get; set; } = WorldTransferService.TransferProtocol;
     public string TransferId { get; set; } = "";
     public string SenderName { get; set; } = "";
     public string SenderIdentityId { get; set; } = "";
@@ -388,7 +489,7 @@ public sealed class WorldTransferAck
 
 public sealed class WorldTransferControl
 {
-    public string Protocol { get; set; } = "MinecraftPortableWorldV2";
+    public string Protocol { get; set; } = WorldTransferService.TransferProtocol;
     public string TransferId { get; set; } = "";
     public string Command { get; set; } = "Commit";
 }

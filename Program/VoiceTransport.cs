@@ -1,79 +1,166 @@
-using System.Buffers.Binary;
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 
 namespace Minecraft;
 
-public sealed class VoiceTransport : IDisposable
+public sealed class VoiceTransport : IAsyncDisposable, IDisposable
 {
     public const int VoicePort = 35657;
+    private readonly Logger _logger;
+    private readonly object _gate = new();
     private UdpClient? _udp;
     private CancellationTokenSource? _cts;
+    private Task? _receiveTask;
+    private DateTimeOffset _lastWarningAt = DateTimeOffset.MinValue;
 
-    public event Action<IPEndPoint, byte[]>? PacketReceived;
-
-    public void StartListening(int port, Func<IPEndPoint, byte[], Task> onPacketReceived)
+    public VoiceTransport(Logger logger)
     {
-        Stop();
+        _logger = logger;
+    }
 
-        _cts = new CancellationTokenSource();
-        _udp = new UdpClient(new IPEndPoint(IPAddress.Any, port))
+    public void StartListening(
+        IPAddress listenAddress,
+        int port,
+        Func<IPEndPoint, byte[], Task> onPacketReceived)
+    {
+        StopAsync().AsTask().GetAwaiter().GetResult();
+        var cts = new CancellationTokenSource();
+        var udp = new UdpClient(new IPEndPoint(listenAddress, port));
+        lock (_gate)
         {
-            EnableBroadcast = true
-        };
+            _cts = cts;
+            _udp = udp;
+            _receiveTask = ReceiveLoopAsync(udp, onPacketReceived, cts.Token);
+        }
+    }
 
-        _ = Task.Run(async () =>
+    private async Task ReceiveLoopAsync(
+        UdpClient udp,
+        Func<IPEndPoint, byte[], Task> onPacketReceived,
+        CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
         {
-            while (!_cts.IsCancellationRequested)
+            try
             {
+                var result = await udp.ReceiveAsync(token).ConfigureAwait(false);
+                await onPacketReceived(result.RemoteEndPoint, result.Buffer).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (ObjectDisposedException) when (token.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (SocketException ex) when (token.IsCancellationRequested || ex.SocketErrorCode == SocketError.OperationAborted)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                WarnThrottled("Voice receive failed: " + ex.Message);
                 try
                 {
-                    var result = await _udp.ReceiveAsync(_cts.Token);
-                    PacketReceived?.Invoke(result.RemoteEndPoint, result.Buffer);
-                    await onPacketReceived(result.RemoteEndPoint, result.Buffer);
+                    await Task.Delay(100, token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
                     break;
                 }
-                catch
-                {
-                    await Task.Delay(50, _cts.Token);
-                }
-            }
-        }, _cts.Token);
-    }
-
-    public async Task SendAsync(IEnumerable<IPEndPoint> targets, byte[] payload, CancellationToken token)
-    {
-        if (_udp is null || payload.Length == 0) return;
-        foreach (var target in targets)
-        {
-            try
-            {
-                if (target.Address.Equals(IPAddress.Loopback)) continue;
-                await _udp.SendAsync(payload, payload.Length, target);
-            }
-            catch
-            {
             }
         }
     }
 
-    public void Stop()
+    public async Task SendAsync(IEnumerable<IPEndPoint> targets, byte[] payload, CancellationToken token)
     {
-        _cts?.Cancel();
-        _cts?.Dispose();
-        _cts = null;
-        _udp?.Dispose();
-        _udp = null;
+        UdpClient? udp;
+        lock (_gate)
+        {
+            udp = _udp;
+        }
+        if (udp is null || payload.Length == 0) return;
+
+        foreach (var target in targets.Distinct())
+        {
+            try
+            {
+                await udp.SendAsync(payload, target, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                WarnThrottled($"Voice send to {target.Address} failed: {ex.Message}");
+            }
+        }
+    }
+
+    public async ValueTask StopAsync()
+    {
+        CancellationTokenSource? cts;
+        UdpClient? udp;
+        Task? task;
+        lock (_gate)
+        {
+            cts = _cts;
+            udp = _udp;
+            task = _receiveTask;
+            _cts = null;
+            _udp = null;
+            _receiveTask = null;
+        }
+
+        cts?.Cancel();
+        udp?.Dispose();
+        if (task is not null)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException)
+            {
+            }
+        }
+        cts?.Dispose();
+    }
+
+    private void WarnThrottled(string message)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now - _lastWarningAt < TimeSpan.FromSeconds(15)) return;
+        _lastWarningAt = now;
+        _logger.Warn(message);
     }
 
     public void Dispose()
     {
-        Stop();
+        StopAsync().AsTask().GetAwaiter().GetResult();
         GC.SuppressFinalize(this);
     }
 
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync().ConfigureAwait(false);
+        GC.SuppressFinalize(this);
+    }
+}
+
+public sealed class VoiceRuntimeOptions
+{
+    public int Port { get; init; } = VoiceTransport.VoicePort;
+    public IPAddress ListenAddress { get; init; } = IPAddress.Any;
+
+    public void Validate()
+    {
+        if (Port is <= 0 or > 65535) throw new ArgumentOutOfRangeException(nameof(Port));
+        if (ListenAddress.AddressFamily != AddressFamily.InterNetwork)
+        {
+            throw new ArgumentException("Voice listen address must be IPv4.", nameof(ListenAddress));
+        }
+    }
 }
