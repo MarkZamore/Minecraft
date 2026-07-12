@@ -41,11 +41,12 @@
   </ItemGroup>
 
   <PropertyGroup>
-    <PortableIdentityAdapterJar>$(MSBuildProjectDirectory)\Build\IdentityAdapter\portable-identity-adapter.jar</PortableIdentityAdapterJar>
+    <PortableIdentityAdapterName>Minecraft-1.21.1-NeoForge</PortableIdentityAdapterName>
+    <PortableIdentityAdapterJar>$(MSBuildProjectDirectory)\Build\IdentityAdapters\$(PortableIdentityAdapterName)\portable-identity-adapter.jar</PortableIdentityAdapterJar>
   </PropertyGroup>
 
   <Target Name="BuildPortableIdentityAdapter" BeforeTargets="PrepareForBuild">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\IdentityAdapter\Build-IdentityAdapter.ps1&quot; -OutputPath &quot;$(PortableIdentityAdapterJar)&quot;" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\IdentityAdapters\Common\Build-IdentityAdapter.ps1&quot; -AdapterName &quot;$(PortableIdentityAdapterName)&quot; -OutputPath &quot;$(PortableIdentityAdapterJar)&quot;" />
     <ItemGroup>
       <EmbeddedResource Include="$(PortableIdentityAdapterJar)" LogicalName="Minecraft.PortableIdentityAdapter.jar" />
     </ItemGroup>

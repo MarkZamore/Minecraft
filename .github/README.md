@@ -86,6 +86,22 @@ Client jar приложение не скачивает и не заменяет
 
 Для самостоятельной сборки нужны .NET SDK 10 и Java Development Kit 21 для Windows x64. Java используется для компиляции встроенного identity-adapter.
 
+Исходники identity-adapter разделены на общий код и реализацию конкретной версии:
+
+```text
+Program\IdentityAdapters\
+  Common\
+    Build-IdentityAdapter.ps1
+    MANIFEST.MF
+    PortableIdentityAgent.java
+    PortableIdentityReflection.java
+  Minecraft-1.21.1-NeoForge\
+    PortableIdentityHooks.java
+    PortableIdentityTransformer.java
+```
+
+Новый адаптер создаётся отдельной папкой внутри `IdentityAdapters`. Он предоставляет свои классы `PortableIdentityHooks` и `PortableIdentityTransformer` в package `minecraft.portable.identity`; сборщик компилирует их вместе с `Common`, поэтому общий agent и reflection-код не копируются.
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File Program\Publish.ps1
 ```
