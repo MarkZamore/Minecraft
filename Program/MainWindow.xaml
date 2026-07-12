@@ -225,6 +225,11 @@
                             IsEnabled="False"/>
                 </Grid>
 
+                <TextBlock Grid.Row="8"
+                           Text="Лучше TLauncher"
+                           HorizontalAlignment="Left"
+                           FontSize="11"/>
+
                 <TextBlock Grid.Row="8" x:Name="VersionTextBlock"
                            HorizontalAlignment="Right"
                            FontSize="11"/>
