@@ -8,7 +8,9 @@
     <UserControl.Resources>
         <Style x:Key="DropDownToggleStyle" TargetType="ToggleButton">
             <Setter Property="Background" Value="{DynamicResource ControlSurfaceBrush}"/>
-            <Setter Property="BorderBrush" Value="{DynamicResource {x:Static SystemColors.ActiveBorderBrushKey}}"/>
+            <Setter Property="Foreground"
+                    Value="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Template">
                 <Setter.Value>
@@ -29,7 +31,10 @@
                                 <Setter TargetName="Surface" Property="Opacity" Value="0.85"/>
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
-                                <Setter TargetName="Surface" Property="Opacity" Value="0.55"/>
+                                <Setter TargetName="Surface" Property="BorderBrush"
+                                        Value="{DynamicResource ControlDisabledBorderBrush}"/>
+                                <Setter Property="Foreground"
+                                        Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -71,7 +76,7 @@
             <Border Width="{Binding ActualWidth, ElementName=ControlRoot}"
                     MaxHeight="260"
                     Background="{DynamicResource ControlSurfaceBrush}"
-                    BorderBrush="{DynamicResource {x:Static SystemColors.ActiveBorderBrushKey}}"
+                    BorderBrush="{DynamicResource ControlBorderBrush}"
                     BorderThickness="1">
                 <ListBox x:Name="ItemsList"
                          ItemsSource="{Binding ItemsSource, ElementName=ControlRoot}"

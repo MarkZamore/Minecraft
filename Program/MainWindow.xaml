@@ -16,6 +16,22 @@
             <Setter Property="Padding" Value="8,3"/>
             <Setter Property="HorizontalAlignment" Value="Stretch"/>
             <Setter Property="Background" Value="{DynamicResource ControlSurfaceBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Style.Triggers>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="BorderBrush" Value="{DynamicResource ControlDisabledBorderBrush}"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="ListBox">
+            <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Style.Triggers>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="BorderBrush" Value="{DynamicResource ControlDisabledBorderBrush}"/>
+                </Trigger>
+            </Style.Triggers>
         </Style>
         <Style TargetType="TextBox">
             <Setter Property="MinHeight" Value="28"/>
@@ -26,6 +42,18 @@
         <Style TargetType="ProgressBar">
             <Setter Property="Background" Value="{DynamicResource ControlSurfaceBrush}"/>
             <Setter Property="Foreground" Value="{DynamicResource ProgressIdleBrush}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style x:Key="ProgressFrameStyle" TargetType="Border">
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="Background" Value="{DynamicResource ControlSurfaceBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Style.Triggers>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="BorderBrush" Value="{DynamicResource ControlDisabledBorderBrush}"/>
+                </Trigger>
+            </Style.Triggers>
         </Style>
         <Style x:Key="SectionTitleStyle" TargetType="TextBlock">
             <Setter Property="FontSize" Value="13"/>
@@ -190,6 +218,7 @@
                                                 SelectionChanged="WorldComboBox_SelectionChanged"/>
                         <TextBlock x:Name="WorldPlaceholderText"
                                    Text="Нет миров для передачи"
+                                   Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
                                    HorizontalAlignment="Center"
                                    IsHitTestVisible="False"
                                    Visibility="Collapsed"/>
@@ -207,6 +236,7 @@
                                                 SelectionChanged="TransferSelectionChanged"/>
                         <TextBlock x:Name="OnlinePlayerPlaceholderText"
                                    Text="Нет игроков в сети"
+                                   Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
                                    HorizontalAlignment="Center"
                                    IsHitTestVisible="False"
                                    Visibility="Collapsed"/>
@@ -220,8 +250,10 @@
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid Grid.Column="0" MinHeight="28">
-                    <ProgressBar x:Name="TransferProgressBar" Minimum="0" Maximum="100" Height="28"
-                                 Foreground="{StaticResource ProgressIdleBrush}"/>
+                    <Border Style="{StaticResource ProgressFrameStyle}">
+                        <ProgressBar x:Name="TransferProgressBar" Minimum="0" Maximum="100"
+                                     Foreground="{StaticResource ProgressIdleBrush}"/>
+                    </Border>
                     <TextBlock x:Name="TransferProgressText" Text="В ожидании мира"
                                HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold"/>
                 </Grid>
@@ -235,8 +267,10 @@
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Grid Grid.Column="0" MinHeight="28">
-                    <ProgressBar x:Name="UpdateProgressBar" Minimum="0" Maximum="100" Height="28"
-                                 Foreground="{StaticResource ProgressIdleBrush}"/>
+                    <Border Style="{StaticResource ProgressFrameStyle}">
+                        <ProgressBar x:Name="UpdateProgressBar" Minimum="0" Maximum="100"
+                                     Foreground="{StaticResource ProgressIdleBrush}"/>
+                    </Border>
                     <TextBlock x:Name="UpdateProgressText" Text="Вы на последней версии"
                                HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold"/>
                 </Grid>
@@ -250,11 +284,14 @@
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
-                <ProgressBar Grid.Column="0" x:Name="SecretProgressBar" Minimum="0" Maximum="100" Height="28"
-                             Foreground="{StaticResource ProgressIdleBrush}"/>
+                <Border Grid.Column="0" Style="{StaticResource ProgressFrameStyle}">
+                    <ProgressBar x:Name="SecretProgressBar" Minimum="0" Maximum="100"
+                                 Foreground="{StaticResource ProgressIdleBrush}"/>
+                </Border>
                 <Button Grid.Column="1" x:Name="SecretOpenButton" Content="Открыть"
                         Click="SecretOpenButton_Click" Margin="8,0,0,0" MinWidth="88" IsEnabled="False"/>
-                <ProgressBar Grid.Column="0" Grid.ColumnSpan="2" x:Name="SecretExtendedProgressBar"
+                <ProgressBar Grid.Column="0" Grid.ColumnSpan="2"
+                             x:Name="SecretExtendedProgressBar"
                              Minimum="0" Maximum="600" Height="28"
                              Background="Transparent" BorderThickness="0"
                              Foreground="{StaticResource ProgressActiveBrush}"
@@ -265,9 +302,11 @@
             </Grid>
 
             <Grid Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,8">
-                <ProgressBar x:Name="RuntimeProgressBar" Minimum="0" Maximum="100" Height="28"
-                             Foreground="{StaticResource ProgressIdleBrush}"/>
-                <TextBlock x:Name="RuntimeProgressText" Text="В ожидании сборки"
+                <Border Style="{StaticResource ProgressFrameStyle}">
+                    <ProgressBar x:Name="RuntimeProgressBar" Minimum="0" Maximum="100"
+                                 Foreground="{StaticResource ProgressIdleBrush}"/>
+                </Border>
+                <TextBlock x:Name="RuntimeProgressText" Text="В ожидании игры"
                            HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold"/>
             </Grid>
 
@@ -277,7 +316,8 @@
                            HorizontalAlignment="Center" VerticalAlignment="Center"
                            FontSize="15" FontWeight="SemiBold" Margin="10,10,10,46"/>
             </Grid>
-            <Grid Grid.Column="2" Grid.Row="8" Height="28">
+            <Grid Grid.Column="2" Grid.Row="8" Height="28"
+                  Margin="0,0,0,8" VerticalAlignment="Top">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="82"/>

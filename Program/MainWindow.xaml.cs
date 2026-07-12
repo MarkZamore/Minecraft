@@ -1976,7 +1976,7 @@ public partial class MainWindow : Window
         RuntimeProgressBar.Value = 0;
         RuntimeProgressBar.IsIndeterminate = false;
         SetProgressActivity(RuntimeProgressBar, active: false);
-        RuntimeProgressText.Text = "В ожидании сборки";
+        RuntimeProgressText.Text = "В ожидании игры";
     }
 
     private void ApplyRuntimeProgress(RuntimePreparationProgress progress)

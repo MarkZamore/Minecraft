@@ -21,6 +21,13 @@
             <Setter Property="MinHeight" Value="28"/>
             <Setter Property="Padding" Value="8,3"/>
             <Setter Property="Background" Value="{DynamicResource ControlSurfaceBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Style.Triggers>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="BorderBrush" Value="{DynamicResource ControlDisabledBorderBrush}"/>
+                </Trigger>
+            </Style.Triggers>
         </Style>
         <Style x:Key="SectionTitleStyle" TargetType="TextBlock">
             <Setter Property="FontSize" Value="13"/>
@@ -77,7 +84,7 @@
                 <TextBlock Text="Режим рации" Style="{StaticResource SectionTitleStyle}"/>
                 <Grid Margin="0,0,0,6">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="92"/>
+                        <ColumnDefinition Width="64"/>
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Text="Режим"/>
@@ -87,7 +94,7 @@
                 </Grid>
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="92"/>
+                        <ColumnDefinition Width="64"/>
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Text="Кнопка"/>
