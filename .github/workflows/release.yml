@@ -1,0 +1,91 @@
+name: Build Minecraft.exe
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Restore
+        run: dotnet restore Program\Minecraft.csproj -r win-x64 -p:Configuration=Release
+
+      - name: Audit dependencies
+        run: dotnet list Program\Minecraft.csproj package --vulnerable --include-transitive
+
+      - name: Publish
+        shell: pwsh
+        run: >
+          .\Program\Publish.ps1
+          -SourceRevisionId "${{ github.sha }}"
+          -PublishDir "${{ github.workspace }}\artifacts"
+          -NoRestore
+
+      - name: Create update manifest
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'artifacts\Minecraft.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "Published Minecraft.exe was not found: $exe"
+          }
+
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item -LiteralPath $exe).Length
+          $manifest = [ordered]@{
+            commitSha = '${{ github.sha }}'
+            version = '1.0.0'
+            publishedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            assetName = 'Minecraft.exe'
+            sha256 = $hash
+            sizeBytes = $size
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts\update.json') -Encoding UTF8
+
+      - name: Verify release contents
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts') -File
+          $expected = @('Minecraft.exe', 'update.json')
+          $unexpected = $files.Name | Where-Object { $_ -notin $expected }
+          $missing = $expected | Where-Object { $_ -notin $files.Name }
+          if ($unexpected -or $missing -or $files.Count -ne 2) {
+            throw "Release must contain only Minecraft.exe and update.json. Missing: $missing; unexpected: $unexpected"
+          }
+
+      - name: Publish latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (gh release view latest 2>$null) {
+            gh release delete latest --cleanup-tag --yes
+          } elseif (git ls-remote --exit-code --tags origin refs/tags/latest 2>$null) {
+            git push origin --delete latest
+          }
+          gh release create latest `
+            "$env:GITHUB_WORKSPACE\artifacts\Minecraft.exe" `
+            "$env:GITHUB_WORKSPACE\artifacts\update.json" `
+            --target "${{ github.sha }}" `
+            --latest `
+            --title "Latest Minecraft.exe" `
+            --notes "Automated build for commit ${{ github.sha }}"

@@ -1,0 +1,56 @@
+# Published app binary
+/Minecraft.exe
+
+# Portable runtime data: packs, worlds, personal files, generated server/runtime
+/Minecraft/
+
+# Program build output
+/Program/bin/
+/Program/obj/
+/Program/Build/
+/Program/**/bin/
+/Program/**/obj/
+/Program/publish/
+
+# IDE/user files
+/.vs/
+/.vscode/
+/Program/.vs/
+*.user
+*.suo
+
+# Local binaries/installers and archives
+*.exe
+*.msi
+*.7z
+*.zip
+
+# Logs and local settings outside the ignored portable runtime
+*.log
+*.log.gz
+settings.json
+
+# Account/session/credential material
+*.token
+*.session
+*.credential
+*.auth
+*.account
+*.key
+*.pem
+*.pfx
+*token*.json
+*session*.json
+*credential*.json
+*auth*.json
+*account*.json
+*login*.json
+**/launcher_profiles.json
+**/usercache.json
+**/usernamecache.json
+
+# Mojang-distributed Minecraft jars
+**/libraries/com/mojang/minecraft/
+**/*minecraft*client*.jar
+**/*minecraft*server*.jar
+**/server.jar

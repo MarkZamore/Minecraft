@@ -1,0 +1,82 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Minecraft</AssemblyName>
+    <RootNamespace>Minecraft</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Minecraft.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1902;NU1903;NU1904</WarningsAsErrors>
+    <NoWarn>$(NoWarn);CA1822</NoWarn>
+    <InformationalVersion Condition="'$(SourceRevisionId)' != ''">$(Version)+$(SourceRevisionId)</InformationalVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <PublishDir>..\</PublishDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Minecraft.ico" />
+    <EmbeddedResource Include="MinecraftWindowIconAssets.jar"
+                      LogicalName="Minecraft.WindowIconAssets.jar" />
+    <PackageReference Include="NAudio" Version="2.3.0" />
+    <PackageReference Include="Concentus" Version="2.2.2" />
+    <PackageReference Include="CmlLib.Core" Version="4.0.6" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <PortableIdentityAdapterJar>$(MSBuildProjectDirectory)\Build\IdentityAdapter\portable-identity-adapter.jar</PortableIdentityAdapterJar>
+  </PropertyGroup>
+
+  <Target Name="BuildPortableIdentityAdapter" BeforeTargets="PrepareForBuild">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\IdentityAdapter\Build-IdentityAdapter.ps1&quot; -OutputPath &quot;$(PortableIdentityAdapterJar)&quot;" />
+    <ItemGroup>
+      <EmbeddedResource Include="$(PortableIdentityAdapterJar)" LogicalName="Minecraft.PortableIdentityAdapter.jar" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="UseFinalWpfAssemblyForPublish"
+          BeforeTargets="ComputeResolvedFilesToPublishList"
+          Condition="'$(PublishSingleFile)' == 'true'">
+    <PropertyGroup>
+      <_FinalWpfAssembly>$(IntermediateOutputPath)$(TargetFileName)</_FinalWpfAssembly>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_FinalWpfAssembly)')"
+           Text="The final WPF assembly was not built: $(_FinalWpfAssembly)" />
+    <ItemGroup>
+      <IntermediateAssembly Remove="@(IntermediateAssembly)" />
+      <IntermediateAssembly Include="$(_FinalWpfAssembly)" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup Condition="'$(SourceRevisionId)' != ''">
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>SourceRevisionId</_Parameter1>
+      <_Parameter2>$(SourceRevisionId)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Build\**" />
+    <EmbeddedResource Remove="Build\**" />
+    <None Remove="Build\**" />
+    <Page Remove="Build\**" />
+  </ItemGroup>
+
+</Project>
