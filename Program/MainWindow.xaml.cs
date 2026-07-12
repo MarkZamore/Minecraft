@@ -10,6 +10,7 @@ using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 
 namespace Minecraft;
@@ -18,7 +19,6 @@ namespace Minecraft;
 public partial class MainWindow : Window
 {
     private const int MinMemoryGb = MemorySizingService.MinMemoryGb;
-    private const string LauncherVersion = "ver. 1";
     private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan SecretLoadingDuration = TimeSpan.FromMinutes(10);
     private const int HostReachabilityAttempts = 3;
@@ -85,13 +85,17 @@ public partial class MainWindow : Window
     private bool _updateBusy;
     private bool _isEditingPlayerName;
     private bool _startupComplete;
+    private bool _minecraftRunning;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
     private PreparedUpdate? _preparedUpdate;
+    private readonly WindowPlacementService _windowPlacement;
 
     public MainWindow()
     {
         InitializeComponent();
+        _windowPlacement = new WindowPlacementService(new AppPaths(AppPaths.ResolveApplicationRoot()));
+        _windowPlacement.Apply(this);
         BuildComboBox.ItemsSource = _builds;
         OnlinePlayerComboBox.ItemsSource = _peers;
         HostComboBox.ItemsSource = _hostPeers;
@@ -135,6 +139,7 @@ public partial class MainWindow : Window
             _packInstances = new PackInstanceService(_paths, _logger);
             _packRuntimes = new PackRuntimeService(_paths, _logger);
             _minecraft = new MinecraftProcessService(_paths, _logger, _identityService, _identityAdapter, _worldPlayerProfiles, _packInstances, _packRuntimes);
+            _minecraft.ClientRunningChanged += OnMinecraftClientRunningChanged;
             _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles);
             _updateService = new UpdateService(_paths, _logger);
             _transfer.StatusChanged += message => Dispatcher.Invoke(() => SetState(message));
@@ -162,6 +167,7 @@ public partial class MainWindow : Window
             RefreshBuilds();
             RefreshAdapters();
             RefreshRadminSetupStatus();
+            _ = AutoLaunchInstalledRadminAsync();
             RefreshHostPeers();
             RefreshMemoryText(saveIfChanged: true);
             RefreshWorlds();
@@ -172,11 +178,9 @@ public partial class MainWindow : Window
             _uiTimer.Start();
             SetState("Ready");
             _logger.Info("Minecraft portable launcher started.");
-            EnsureWindowFitsUi();
             await RefreshPackHashAsync(_lifetimeCts.Token);
             await StartNetworkingAsync();
             _startupComplete = true;
-            _ = AutoLaunchInstalledRadminAsync();
         }
         catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
         {
@@ -194,6 +198,7 @@ public partial class MainWindow : Window
         e.Cancel = true;
         if (_shutdownStarted) return;
         _shutdownStarted = true;
+        _windowPlacement.Save(this);
 
         // Always leave the original Closing event before issuing the final Close().
         // Several services can complete synchronously when networking was never started.
@@ -234,8 +239,7 @@ public partial class MainWindow : Window
         try
         {
             PlayerNameTextBox.Text = RequireSettings().PlayerName;
-            RadminNetworkNameTextBox.Text = settings.RadminNetworkName;
-            RadminNetworkPasswordTextBox.Text = settings.RadminNetworkPassword;
+            RefreshRadminTicketText();
             VoiceMasterVolumeSlider.Value = settings.VoiceOutputVolume;
             VoiceMuteButton.Content = "Микрофон";
             VoiceDeafenButton.Content = "Звук";
@@ -337,7 +341,7 @@ public partial class MainWindow : Window
         }
         if (selectedBuild is null)
         {
-            BuildComboBox.SelectedIndex = -1;
+            BuildComboBox.SelectedItem = null;
         }
 
         if (selectedBuild is not null &&
@@ -421,19 +425,31 @@ public partial class MainWindow : Window
             string.Equals(device.Id, _settings.VoiceInputDeviceId, StringComparison.OrdinalIgnoreCase));
         var selectedOutput = outputDevices.FirstOrDefault(device =>
             string.Equals(device.Id, _settings.VoiceOutputDeviceId, StringComparison.OrdinalIgnoreCase));
+        var actualInput = selectedInput ?? (inputDevices.Count > 0 ? inputDevices[0] : null);
+        var actualOutput = selectedOutput ?? (outputDevices.Count > 0 ? outputDevices[0] : null);
+        var inputId = actualInput?.Id ?? "";
+        var outputId = actualOutput?.Id ?? "";
+        var settingsChanged =
+            !string.Equals(_settings.VoiceInputDeviceId, inputId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(_settings.VoiceOutputDeviceId, outputId, StringComparison.OrdinalIgnoreCase);
 
         _suppressVoicePersistence = true;
         try
         {
-            VoiceInputComboBox.SelectedItem = selectedInput ?? (inputDevices.Count > 0 ? inputDevices[0] : null);
-            VoiceOutputComboBox.SelectedItem = selectedOutput ?? (outputDevices.Count > 0 ? outputDevices[0] : null);
-            _voiceChannel.SetDeviceIds(
-                (VoiceInputComboBox.SelectedItem as VoiceAudioDevice)?.Id ?? _settings.VoiceInputDeviceId,
-                (VoiceOutputComboBox.SelectedItem as VoiceAudioDevice)?.Id ?? _settings.VoiceOutputDeviceId);
+            VoiceInputComboBox.SelectedItem = actualInput;
+            VoiceOutputComboBox.SelectedItem = actualOutput;
+            _settings.VoiceInputDeviceId = inputId;
+            _settings.VoiceOutputDeviceId = outputId;
+            _voiceChannel.SetDeviceIds(inputId, outputId);
         }
         finally
         {
             _suppressVoicePersistence = false;
+        }
+
+        if (settingsChanged)
+        {
+            _settingsService.Save(_settings);
         }
 
         RefreshVoiceSettingsWindow();
@@ -533,9 +549,14 @@ public partial class MainWindow : Window
     {
         if (_settings is null || _settingsService is null || _voiceChannel is null) return;
 
-        _settings.VoiceMuted = !_settings.VoiceMuted;
+        _settings.VoiceMuted = !_voiceChannel.IsMuted;
         _settingsService.Save(_settings);
         _voiceChannel.SetMuted(_settings.VoiceMuted);
+        if (_localVoicePeer is not null)
+        {
+            _localVoicePeer.IsVoiceMuted = _settings.VoiceMuted;
+        }
+        RefreshVoicePeers();
         RefreshUi();
     }
 
@@ -710,7 +731,9 @@ public partial class MainWindow : Window
             _localVoicePeer.PlayerName = identity.name;
             _localVoicePeer.IdentityName = identity.name;
             _localVoicePeer.IdentityId = identity.id;
+            _localVoicePeer.VpnIp = _adapter?.IPv4 ?? _discoveryAdapters.FirstOrDefault()?.IPv4 ?? string.Empty;
             _localVoicePeer.IsInVoiceChannel = true;
+            _localVoicePeer.IsVoiceMuted = _voiceChannel.IsMuted;
             _localVoicePeer.LastSeen = DateTimeOffset.Now;
             peers.Insert(0, _localVoicePeer);
         }
@@ -882,7 +905,7 @@ public partial class MainWindow : Window
         var openToLanPort = _openToLanPort;
         return new PeerAnnouncement
         {
-            Version = 2,
+            ProtocolVersion = PeerDiscoveryService.ProtocolVersion,
             PlayerName = identity.name,
             IdentityId = identity.id,
             IdentityName = identity.name,
@@ -892,7 +915,8 @@ public partial class MainWindow : Window
             PackHash = _localPackHash,
             ServerPort = openToLanPort ?? 0,
             State = openToLanPort.HasValue ? "LAN open" : "Minecraft",
-            IsVoiceChannelActive = _voiceChannel?.IsJoined == true
+            IsVoiceChannelActive = _voiceChannel?.IsJoined == true,
+            IsVoiceMuted = _voiceChannel?.IsMuted == true
         };
     }
 
@@ -909,40 +933,6 @@ public partial class MainWindow : Window
 
             peer.IsSpeaking = isSpeaking;
             RefreshVoiceSettingsWindow();
-        });
-    }
-
-    private void EnsureWindowFitsUi()
-    {
-        Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, () =>
-        {
-            if (RootGrid.ActualWidth <= 0 || RootGrid.ActualHeight <= 0)
-            {
-                Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, () => EnsureWindowFitsUi());
-                return;
-            }
-
-            RootGrid.UpdateLayout();
-            RootGrid.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-            var desired = RootGrid.DesiredSize;
-            if (double.IsNaN(desired.Width) || double.IsNaN(desired.Height) || desired.Width <= 0 || desired.Height <= 0)
-            {
-                return;
-            }
-
-            var targetWidth = Math.Ceiling(desired.Width + 24);
-            var targetHeight = Math.Ceiling(desired.Height + 56);
-
-            if (Width < targetWidth)
-            {
-                Width = targetWidth;
-            }
-
-            if (Height < targetHeight)
-            {
-                Height = targetHeight;
-            }
-
         });
     }
 
@@ -1231,10 +1221,27 @@ public partial class MainWindow : Window
     [GeneratedRegex("Stopping (?:singleplayer )?server|Saving and pausing game|disconnect", RegexOptions.IgnoreCase)]
     private static partial Regex LanClosedRegex();
 
+    private void OnMinecraftClientRunningChanged(bool isRunning)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(() =>
+        {
+            _minecraftRunning = isRunning;
+            if (!isRunning)
+            {
+                RefreshWorlds();
+                RefreshOpenToLanState();
+            }
+            RefreshUi();
+        });
+    }
+
     private async void PlayButton_Click(object sender, RoutedEventArgs e)
     {
-        var previousContent = PlayButton.Content;
-        PlayButton.Content = "Запуск...";
         await RunUiActionAsync(async () =>
         {
             if (RequireTransfer().IsOperationActive)
@@ -1278,7 +1285,6 @@ public partial class MainWindow : Window
             }
             SetState("Minecraft");
         });
-        PlayButton.Content = previousContent;
     }
 
     private async Task<(string Ip, int Port)?> GetSelectedHostAddressAsync(PeerViewModel? peer)
@@ -1429,14 +1435,30 @@ public partial class MainWindow : Window
 
     private void PlayerNameTextBox_PreviewTextInput(object sender, TextCompositionEventArgs e)
     {
-        e.Handled = e.Text.Any(ch => !LocalIdentityService.IsNicknameCharacter(ch));
+        if (sender is not TextBox textBox)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        var draft = textBox.Text.Remove(textBox.SelectionStart, textBox.SelectionLength)
+            .Insert(textBox.SelectionStart, e.Text);
+        e.Handled = !LocalIdentityService.IsNicknameDraftValid(draft);
     }
 
     private void PlayerNameTextBox_Pasting(object sender, DataObjectPastingEventArgs e)
     {
-        if (!e.DataObject.GetDataPresent(DataFormats.Text) ||
-            e.DataObject.GetData(DataFormats.Text) is not string text ||
-            text.Any(ch => !LocalIdentityService.IsNicknameCharacter(ch)))
+        if (sender is not TextBox textBox ||
+            !e.DataObject.GetDataPresent(DataFormats.Text) ||
+            e.DataObject.GetData(DataFormats.Text) is not string text)
+        {
+            e.CancelCommand();
+            return;
+        }
+
+        var draft = textBox.Text.Remove(textBox.SelectionStart, textBox.SelectionLength)
+            .Insert(textBox.SelectionStart, text);
+        if (!LocalIdentityService.IsNicknameDraftValid(draft))
         {
             e.CancelCommand();
         }
@@ -1481,10 +1503,14 @@ public partial class MainWindow : Window
 
     private async Task SavePlayerNameAsync()
     {
+        var candidate = PlayerNameTextBox.Text;
         await RunUiActionAsync(() =>
         {
             var settings = RequireSettings();
-            var normalized = LocalIdentityService.NormalizeNickname(PlayerNameTextBox.Text, Environment.UserName);
+            if (!LocalIdentityService.TryNormalizeNickname(candidate, out var normalized, out var error))
+            {
+                throw new InvalidOperationException(error);
+            }
             var previousName = LocalIdentityService.NormalizeNickname(settings.PlayerName, Environment.UserName);
             if (string.Equals(previousName, normalized, StringComparison.Ordinal))
             {
@@ -1559,7 +1585,7 @@ public partial class MainWindow : Window
 
     private void RefreshPlayerIdentityDisplay()
     {
-        if (PlayerNameTextBox.IsKeyboardFocusWithin)
+        if (_isEditingPlayerName || PlayerNameTextBox.IsKeyboardFocusWithin)
         {
             return;
         }
@@ -1747,26 +1773,19 @@ public partial class MainWindow : Window
         });
     }
 
-    private void RadminNetworkTextBox_TextChanged(object sender, TextChangedEventArgs e)
+    private void CopyRadminButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_suppressTextPersistence || _settings is null || _settingsService is null) return;
+        var settings = RequireSettings();
+        if (string.IsNullOrWhiteSpace(settings.RadminNetworkName) ||
+            string.IsNullOrWhiteSpace(settings.RadminNetworkPassword))
+        {
+            return;
+        }
 
-        _settings.RadminNetworkName = RadminNetworkNameTextBox.Text.Trim();
-        _settings.RadminNetworkPassword = RadminNetworkPasswordTextBox.Text.Trim();
-        _settingsService.Save(_settings);
-        RefreshUi();
-    }
-
-    private void CopyRadminNetworkButton_Click(object sender, RoutedEventArgs e)
-    {
-        CopyTextIfPossible(RadminNetworkNameTextBox.Text.Trim());
-        SetState("Network copied");
-    }
-
-    private void CopyRadminPasswordButton_Click(object sender, RoutedEventArgs e)
-    {
-        CopyTextIfPossible(RadminNetworkPasswordTextBox.Text.Trim());
-        SetState("Password copied");
+        CopyTextIfPossible(
+            $"Сеть: {settings.RadminNetworkName.Trim()}{Environment.NewLine}" +
+            $"Пароль: {settings.RadminNetworkPassword.Trim()}");
+        SetState("Network credentials copied");
     }
 
     private async void AdapterComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1821,6 +1840,7 @@ public partial class MainWindow : Window
     {
         var activeChanged = _transferActive != progress.IsActive;
         _transferActive = progress.IsActive;
+        SetProgressActivity(TransferProgressBar, progress.IsActive);
         if (!progress.IsActive)
         {
             _transferBytesCurrent = 0;
@@ -1860,7 +1880,7 @@ public partial class MainWindow : Window
         {
             TransferProgressBar.Value = 0;
             TransferProgressBar.IsIndeterminate = false;
-            TransferProgressText.Text = _transferActive ? "Передача..." : string.Empty;
+            TransferProgressText.Text = _transferActive ? "Передача..." : "В ожидании мира";
             if (!_transferActive)
             {
                 _lastTransferBytesForSpeed = 0;
@@ -1892,9 +1912,12 @@ public partial class MainWindow : Window
 
     private void StartSecretLoading()
     {
-        SecretProgressBar.Maximum = SecretLoadingDuration.TotalSeconds;
+        SecretProgressBar.Maximum = 100;
         SecretProgressBar.Value = 0;
-        SecretProgressBar.Foreground = SystemColors.HighlightBrush;
+        SetProgressActivity(SecretProgressBar, active: false);
+        SecretExtendedProgressBar.Maximum = SecretLoadingDuration.TotalSeconds;
+        SecretExtendedProgressBar.Value = 0;
+        SecretExtendedProgressBar.Visibility = Visibility.Visible;
         SecretProgressText.Text = "Загрузка";
         SecretOpenButton.IsEnabled = false;
         _secretLoadingStartedAt = DateTimeOffset.Now;
@@ -1907,11 +1930,14 @@ public partial class MainWindow : Window
         if (_secretLoadingStartedAt is null) return;
 
         var elapsedSeconds = (DateTimeOffset.Now - _secretLoadingStartedAt.Value).TotalSeconds;
-        SecretProgressBar.Value = Math.Clamp(elapsedSeconds, 0, SecretProgressBar.Maximum);
-        if (SecretProgressBar.Value >= SecretProgressBar.Maximum)
+        SecretExtendedProgressBar.Value = Math.Clamp(elapsedSeconds, 0, SecretExtendedProgressBar.Maximum);
+        if (SecretExtendedProgressBar.Value >= SecretExtendedProgressBar.Maximum)
         {
             _secretTimer.Stop();
-            SecretProgressBar.Foreground = System.Windows.Media.Brushes.DeepSkyBlue;
+            SecretExtendedProgressBar.Visibility = Visibility.Collapsed;
+            SecretExtendedProgressBar.Value = 0;
+            SecretProgressBar.Value = SecretProgressBar.Maximum;
+            SetProgressActivity(SecretProgressBar, active: false);
             SecretProgressText.Text = "Загрузка завершена";
         }
         else
@@ -1924,7 +1950,8 @@ public partial class MainWindow : Window
 
     private void SecretOpenButton_Click(object sender, RoutedEventArgs e)
     {
-        if (SecretProgressBar.Value < SecretProgressBar.Maximum) return;
+        if (SecretExtendedProgressBar.Visibility == Visibility.Visible ||
+            SecretProgressBar.Value < SecretProgressBar.Maximum) return;
 
         var window = new SecretMessageWindow(GetCurrentUiScale()) { Owner = this };
         window.ShowDialog();
@@ -1932,14 +1959,14 @@ public partial class MainWindow : Window
 
     private static string BuildVersionText()
     {
-        var shortSha = UpdateService.CurrentCommitShortSha;
-        return string.IsNullOrWhiteSpace(shortSha) ? LauncherVersion : $"{LauncherVersion} {shortSha}";
+        return $"Версия {UpdateService.CurrentReleaseNumber}";
     }
 
     private void InitializeUpdateUi()
     {
         UpdateProgressBar.Value = 0;
         UpdateProgressBar.IsIndeterminate = false;
+        SetProgressActivity(UpdateProgressBar, active: false);
         UpdateProgressText.Text = "Вы на последней версии";
         UpdateButton.IsEnabled = false;
     }
@@ -1948,11 +1975,18 @@ public partial class MainWindow : Window
     {
         RuntimeProgressBar.Value = 0;
         RuntimeProgressBar.IsIndeterminate = false;
-        RuntimeProgressText.Text = "Подготовка сборки";
+        SetProgressActivity(RuntimeProgressBar, active: false);
+        RuntimeProgressText.Text = "В ожидании сборки";
     }
 
     private void ApplyRuntimeProgress(RuntimePreparationProgress progress)
     {
+        SetProgressActivity(
+            RuntimeProgressBar,
+            progress.Stage is RuntimePreparationStage.Checking or
+                RuntimePreparationStage.Downloading or
+                RuntimePreparationStage.InstallingLoader or
+                RuntimePreparationStage.Verifying);
         RuntimeProgressText.Text = progress.Stage == RuntimePreparationStage.Downloading && progress.TotalBytes > 0
             ? $"Скачивание файлов: {FormatBytes(progress.DownloadedBytes)} / {FormatBytes(progress.TotalBytes)}"
             : progress.Message;
@@ -1986,6 +2020,7 @@ public partial class MainWindow : Window
                     _preparedUpdate = prepared;
                     UpdateProgressBar.IsIndeterminate = false;
                     UpdateProgressBar.Value = 100;
+                    SetProgressActivity(UpdateProgressBar, active: false);
                     UpdateProgressText.Text = "Обновление готово к установке";
                     RefreshUi();
                 });
@@ -2001,6 +2036,7 @@ public partial class MainWindow : Window
                     _preparedUpdate = null;
                     UpdateProgressBar.IsIndeterminate = false;
                     UpdateProgressBar.Value = 0;
+                    SetProgressActivity(UpdateProgressBar, active: false);
                     UpdateProgressText.Text = "Вы на последней версии";
                     RefreshUi();
                 });
@@ -2013,6 +2049,7 @@ public partial class MainWindow : Window
                 _preparedUpdate = null;
                 UpdateProgressBar.IsIndeterminate = false;
                 UpdateProgressBar.Value = 0;
+                SetProgressActivity(UpdateProgressBar, active: true);
                 UpdateProgressText.Text = "Скачивается обновление";
                 RefreshUi();
             });
@@ -2032,6 +2069,7 @@ public partial class MainWindow : Window
                 _preparedUpdate = prepared;
                 UpdateProgressBar.IsIndeterminate = false;
                 UpdateProgressBar.Value = 100;
+                SetProgressActivity(UpdateProgressBar, active: false);
                 UpdateProgressText.Text = "Обновление готово к установке";
             });
         }
@@ -2046,6 +2084,7 @@ public partial class MainWindow : Window
                 _preparedUpdate = null;
                 UpdateProgressBar.IsIndeterminate = false;
                 UpdateProgressBar.Value = 0;
+                SetProgressActivity(UpdateProgressBar, active: false);
                 UpdateProgressText.Text = "Вы на последней версии";
             });
         }
@@ -2076,12 +2115,14 @@ public partial class MainWindow : Window
                 _preparedUpdate = null;
                 UpdateProgressText.Text = "Вы на последней версии";
                 UpdateProgressBar.Value = 0;
+                SetProgressActivity(UpdateProgressBar, active: false);
                 return;
             }
 
             _preparedUpdate = prepared;
             UpdateProgressText.Text = "Обновление готово к установке";
             UpdateProgressBar.Value = 100;
+            SetProgressActivity(UpdateProgressBar, active: false);
             RequireUpdateService().StartInstallAndRestart(prepared.ExecutablePath);
             Application.Current.Shutdown();
         }
@@ -2122,14 +2163,12 @@ public partial class MainWindow : Window
             _voiceChannel.Initialize(_settings);
             _voiceChannel.SetInputVolume(_settings.VoiceInputVolume);
             _voiceChannel.SetOutputVolume(_settings.VoiceOutputVolume);
-            _voiceChannel.SetMuted(false);
-            _voiceChannel.SetDeafened(false);
             _voiceChannel.Join();
             _voicePttInputPressed = false;
             _voicePttToggleActive = false;
-            ApplyVoiceTransmissionState();
             RefreshVoicePeers();
             UpdateVoicePeersFromDiscovery();
+            ApplyVoiceTransmissionState();
             SetState("Voice channel joined");
             await Task.Yield();
         });
@@ -2310,8 +2349,7 @@ public partial class MainWindow : Window
         _suppressTextPersistence = true;
         try
         {
-            RadminNetworkNameTextBox.Text = ticket.NetworkName;
-            RadminNetworkPasswordTextBox.Text = ticket.Password;
+            RefreshRadminTicketText();
         }
         finally
         {
@@ -2319,6 +2357,23 @@ public partial class MainWindow : Window
         }
 
         return ticket;
+    }
+
+    private void RefreshRadminTicketText()
+    {
+        if (_settings is null)
+        {
+            return;
+        }
+
+        var networkName = string.IsNullOrWhiteSpace(_settings.RadminNetworkName)
+            ? "—"
+            : _settings.RadminNetworkName.Trim();
+        var password = string.IsNullOrWhiteSpace(_settings.RadminNetworkPassword)
+            ? "—"
+            : _settings.RadminNetworkPassword.Trim();
+        RadminNetworkNameText.Text = $"Сеть: {networkName}";
+        RadminNetworkPasswordText.Text = $"Пароль: {password}";
     }
 
     private void RefreshRadminSetupStatus()
@@ -2468,55 +2523,69 @@ public partial class MainWindow : Window
         _state = state;
     }
 
+    private void SetProgressActivity(ProgressBar progressBar, bool active)
+    {
+        progressBar.Foreground = (Brush)FindResource(active ? "ProgressActiveBrush" : "ProgressIdleBrush");
+    }
+
     private void RefreshUi()
     {
         if (_settings is null) return;
 
         RefreshPlayerIdentityDisplay();
-        var enabled = !_busy && !_transferActive;
-        var voiceEnabled = enabled && !_voiceBusy && _voiceChannel is not null;
+        var interactiveEnabled = !_busy;
+        var configurationEnabled = interactiveEnabled && !_transferActive && !_minecraftRunning;
+        var voiceEnabled = interactiveEnabled && !_voiceBusy && _voiceChannel is not null;
         var hasBuild = BuildComboBox.SelectedItem is ClientBuildViewModel;
-        PlayerNameTextBox.IsEnabled = enabled;
-        PlayerNameTextBox.IsReadOnly = !_isEditingPlayerName;
-        ChangePlayerNameButton.IsEnabled = enabled;
+        PlayerNameTextBox.IsEnabled = configurationEnabled;
+        PlayerNameTextBox.IsReadOnly = !_isEditingPlayerName || !configurationEnabled;
+        ChangePlayerNameButton.IsEnabled = configurationEnabled;
         ChangePlayerNameButton.Content = _isEditingPlayerName ? "Сохранить" : "Изменить";
-        BuildComboBox.IsEnabled = enabled && _builds.Count > 0;
-        HostComboBox.IsEnabled = enabled && _hostPeers.Count > 0;
-        PlayButton.IsEnabled = enabled && hasBuild && !_isEditingPlayerName && !_transferActive;
-        InstallRadminButton.IsEnabled = enabled && !_radminInstalled;
-        GenerateRadminButton.IsEnabled = enabled;
-        RadminNetworkNameTextBox.IsEnabled = enabled;
-        RadminNetworkPasswordTextBox.IsEnabled = enabled;
-        CopyRadminNetworkButton.IsEnabled = enabled && !string.IsNullOrWhiteSpace(RadminNetworkNameTextBox.Text);
-        CopyRadminPasswordButton.IsEnabled = enabled && !string.IsNullOrWhiteSpace(RadminNetworkPasswordTextBox.Text);
-        WorldComboBox.IsEnabled = enabled && _worlds.Count > 0;
-        OnlinePlayerComboBox.IsEnabled = enabled && _peers.Count > 0;
+        BuildComboBox.IsEnabled = configurationEnabled && _builds.Count > 0;
+        HostComboBox.IsEnabled = configurationEnabled && _hostPeers.Count > 0;
+        PlayButton.Content = "Играть";
+        PlayButton.IsEnabled = configurationEnabled && hasBuild && !_isEditingPlayerName;
+        InstallRadminButton.IsEnabled = interactiveEnabled && !_radminInstalled;
+        GenerateRadminButton.IsEnabled = interactiveEnabled;
+        CopyRadminButton.IsEnabled = interactiveEnabled &&
+                                          !string.IsNullOrWhiteSpace(_settings.RadminNetworkName) &&
+                                          !string.IsNullOrWhiteSpace(_settings.RadminNetworkPassword);
+        WorldComboBox.IsEnabled = configurationEnabled && _worlds.Count > 0;
+        OnlinePlayerComboBox.IsEnabled = configurationEnabled && _peers.Count > 0;
         WorldPlaceholderText.Visibility = _worlds.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         OnlinePlayerPlaceholderText.Visibility = _peers.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        TransferButton.IsEnabled = enabled && WorldComboBox.SelectedItem is WorldViewModel && OnlinePlayerComboBox.SelectedItem is PeerViewModel;
-        MemoryTextBox.IsEnabled = enabled;
-        UpdateButton.IsEnabled = enabled && !_updateBusy && _preparedUpdate is not null;
-        SecretOpenButton.IsEnabled = enabled && SecretProgressBar.Value >= SecretProgressBar.Maximum;
+        TransferButton.IsEnabled = configurationEnabled &&
+                                   WorldComboBox.SelectedItem is WorldViewModel &&
+                                   OnlinePlayerComboBox.SelectedItem is PeerViewModel;
+        MemoryTextBox.IsEnabled = configurationEnabled;
+        UpdateButton.IsEnabled = interactiveEnabled && !_updateBusy && _preparedUpdate is not null;
+        SecretOpenButton.IsEnabled = interactiveEnabled &&
+                                     SecretExtendedProgressBar.Visibility != Visibility.Visible &&
+                                     SecretProgressBar.Value >= SecretProgressBar.Maximum;
 
-        VoiceJoinButton.IsEnabled = enabled;
+        VoiceJoinButton.IsEnabled = interactiveEnabled && !_voiceBusy && _voiceChannel is not null;
         VoiceSettingsButton.IsEnabled = voiceEnabled;
-        VoicePttButton.IsEnabled = _voiceChannel is { IsJoined: true } && enabled;
+        VoicePttButton.IsEnabled = _voiceChannel is { IsJoined: true } && interactiveEnabled;
         VoiceInputComboBox.IsEnabled = voiceEnabled;
         VoiceOutputComboBox.IsEnabled = voiceEnabled;
         VoiceMasterVolumeSlider.IsEnabled = voiceEnabled;
-        VoiceMuteButton.IsEnabled = _voiceChannel is not null && enabled;
-        VoiceDeafenButton.IsEnabled = _voiceChannel is not null && enabled;
-        VoicePeersListBox.IsEnabled = enabled && _voiceChannel is { IsJoined: true };
+        VoiceMuteButton.IsEnabled = _voiceChannel is { IsJoined: true } && interactiveEnabled && !_voiceBusy;
+        VoiceDeafenButton.IsEnabled = _voiceChannel is not null && interactiveEnabled;
+        VoicePeersListBox.IsEnabled = interactiveEnabled;
         if (_voiceChannel is not null)
         {
-            VoiceJoinButton.Content = _voiceChannel.IsJoined ? "Выйти" : "Войти";
-            VoiceMuteButton.Content = "Микрофон";
+            VoiceJoinButton.Content = _voiceChannel.IsJoined ? "−" : "+";
+            VoiceJoinButton.ToolTip = _voiceChannel.IsJoined
+                ? "Выйти из голосового канала"
+                : "Войти в голосовой канал";
+            VoiceMuteButton.Content = _voiceChannel.IsMuted ? "⊘" : "🎙";
+            VoiceMuteButton.ToolTip = _voiceChannel.IsMuted ? "Включить микрофон" : "Выключить микрофон";
             VoiceDeafenButton.Content = "Звук";
         }
         else
         {
-            VoiceJoinButton.Content = "Войти";
-            VoiceMuteButton.Content = "Микрофон";
+            VoiceJoinButton.Content = "+";
+            VoiceMuteButton.Content = "🎙";
             VoiceDeafenButton.Content = "Звук";
         }
         VoiceStatusText.Text = string.Empty;

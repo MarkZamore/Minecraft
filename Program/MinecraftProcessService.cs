@@ -21,6 +21,7 @@ public sealed class MinecraftProcessService
     private readonly ConcurrentDictionary<int, byte> _activeClientProcesses = new();
 
     public bool IsClientRunning => !_activeClientProcesses.IsEmpty;
+    public event Action<bool>? ClientRunningChanged;
 
     public MinecraftProcessService(
         AppPaths paths,
@@ -135,7 +136,10 @@ public sealed class MinecraftProcessService
         }
 
         var processId = minecraftProcess.Id;
-        _activeClientProcesses.TryAdd(processId, 0);
+        if (_activeClientProcesses.TryAdd(processId, 0) && _activeClientProcesses.Count == 1)
+        {
+            NotifyClientRunningChanged(true);
+        }
         _ = MonitorClientExitAsync(processId, settings.ClientRelativePath);
 
         await Task.Delay(TimeSpan.FromSeconds(2), token);
@@ -168,7 +172,22 @@ public sealed class MinecraftProcessService
         }
         finally
         {
-            _activeClientProcesses.TryRemove(processId, out _);
+            if (_activeClientProcesses.TryRemove(processId, out _) && _activeClientProcesses.IsEmpty)
+            {
+                NotifyClientRunningChanged(false);
+            }
+        }
+    }
+
+    private void NotifyClientRunningChanged(bool isRunning)
+    {
+        try
+        {
+            ClientRunningChanged?.Invoke(isRunning);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Minecraft process state listener failed: {ex.Message}");
         }
     }
 

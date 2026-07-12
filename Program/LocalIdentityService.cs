@@ -2,6 +2,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
 
 namespace Minecraft;
 
@@ -114,31 +115,78 @@ public sealed class LocalIdentityService
 
     public static string NormalizeNickname(string? value, string? fallback = null)
     {
-        var normalized = FilterNickname(value);
+        if (TryNormalizeNickname(value, out var normalized, out _))
+        {
+            return normalized;
+        }
+
+        return TryNormalizeNickname(fallback, out normalized, out _) ? normalized : "Player";
+    }
+
+    public static bool IsNicknameDraftValid(string? value)
+    {
+        if (value is null || value.Length > MaxNicknameLength)
+        {
+            return false;
+        }
+
+        return HasOnlyAllowedUnicode(value);
+    }
+
+    public static bool TryNormalizeNickname(string? value, out string normalized, out string error)
+    {
+        normalized = value?.Trim() ?? string.Empty;
         if (normalized.Length == 0)
         {
-            normalized = FilterNickname(fallback);
+            error = "Ник не может быть пустым.";
+            return false;
         }
-
-        return normalized.Length == 0 ? "Player" : normalized;
-    }
-
-    public static bool IsNicknameCharacter(char value)
-    {
-        return value == '_' || char.IsAsciiLetterOrDigit(value);
-    }
-
-    private static string FilterNickname(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
+        if (normalized.Length > MaxNicknameLength)
         {
-            return string.Empty;
+            error = $"Ник не может быть длиннее {MaxNicknameLength} символов UTF-16.";
+            return false;
+        }
+        if (!HasOnlyAllowedUnicode(normalized))
+        {
+            error = "Ник содержит управляющий символ или перенос строки.";
+            return false;
         }
 
-        return new string(value.Trim()
-            .Where(IsNicknameCharacter)
-            .Take(MaxNicknameLength)
-            .ToArray());
+        error = string.Empty;
+        return true;
+    }
+
+    private static bool HasOnlyAllowedUnicode(string value)
+    {
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (char.IsHighSurrogate(character))
+            {
+                if (index + 1 >= value.Length || !char.IsLowSurrogate(value[index + 1]))
+                {
+                    return false;
+                }
+                index++;
+                continue;
+            }
+            if (char.IsLowSurrogate(character) || char.IsControl(character))
+            {
+                return false;
+            }
+
+            var category = char.GetUnicodeCategory(character);
+            if (category is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+            {
+                return false;
+            }
+            if (category == UnicodeCategory.Format && character is not ('\u200C' or '\u200D'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string CreateLocalSessionToken(string identityId, string nickname)

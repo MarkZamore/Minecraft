@@ -13,8 +13,10 @@ namespace Minecraft;
 public sealed class WorldTransferService : IAsyncDisposable
 {
     public const int TransferPort = 35656;
-    public const string TransferProtocol = "MinecraftPortableWorldV3";
-    private const string PingProtocol = "MinecraftPortablePingV1";
+    public const string ProtocolName = "MinecraftPortableWorld";
+    public const int ProtocolVersion = 3;
+    public const string TransferMessageType = "Transfer";
+    public const string ProbeMessageType = "Probe";
 
     private readonly AppPaths _paths;
     private readonly Logger _logger;
@@ -196,6 +198,9 @@ public sealed class WorldTransferService : IAsyncDisposable
 
                     var header = new WorldTransferHeader
                     {
+                        Protocol = ProtocolName,
+                        ProtocolVersion = ProtocolVersion,
+                        MessageType = TransferMessageType,
                         TransferId = transferId,
                         SenderName = identity.IdentityName,
                         SenderIdentityId = identity.IdentityId,
@@ -223,7 +228,8 @@ public sealed class WorldTransferService : IAsyncDisposable
                     }
 
                     var ready = await ReadJsonAsync<WorldTransferAck>(stream, token);
-                    if (ready is null || !ready.Ok || ready.Stage != "Ready" || ready.TransferId != transferId ||
+                    if (ready is null || !HasExpectedProtocol(ready.Protocol, ready.ProtocolVersion) ||
+                        !ready.Ok || ready.Stage != "Ready" || ready.TransferId != transferId ||
                         !string.Equals(ready.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
                         !string.Equals(ready.PlayerManifestSha256, playerManifestSha, StringComparison.OrdinalIgnoreCase))
                     {
@@ -238,12 +244,15 @@ public sealed class WorldTransferService : IAsyncDisposable
                     WriteJournal(transactionRoot, journal);
                     await WriteJsonAsync(stream, new WorldTransferControl
                     {
+                        Protocol = ProtocolName,
+                        ProtocolVersion = ProtocolVersion,
                         TransferId = transferId,
                         Command = "Commit"
                     }, token);
 
                     var committed = await ReadJsonAsync<WorldTransferAck>(stream, token);
-                    if (committed is null || !committed.Ok || committed.Stage != "Committed" || committed.TransferId != transferId ||
+                    if (committed is null || !HasExpectedProtocol(committed.Protocol, committed.ProtocolVersion) ||
+                        !committed.Ok || committed.Stage != "Committed" || committed.TransferId != transferId ||
                         !string.Equals(committed.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
                         string.IsNullOrWhiteSpace(committed.PlayerManifestSha256))
                     {
@@ -339,18 +348,25 @@ public sealed class WorldTransferService : IAsyncDisposable
         {
             header = await ReadJsonAsync<WorldTransferHeader>(stream, token)
                 ?? throw new InvalidOperationException("Invalid transfer header.");
-            if (header.Protocol == PingProtocol)
+            if (!HasExpectedProtocol(header.Protocol, header.ProtocolVersion))
+            {
+                throw new InvalidOperationException("The sender uses an incompatible world transfer protocol.");
+            }
+            if (header.MessageType == ProbeMessageType)
             {
                 var available = _transferGate.CurrentCount > 0;
                 await WriteJsonAsync(stream, new WorldTransferAck
                 {
+                    Protocol = ProtocolName,
+                    ProtocolVersion = ProtocolVersion,
                     Ok = available,
-                    Stage = "Ping",
+                    Stage = "Probe",
                     Message = available ? "ready" : "another world transfer is active"
                 }, token);
                 return;
             }
-            if (header.Protocol != TransferProtocol || !Guid.TryParseExact(header.TransferId, "N", out var parsedTransferId))
+            if (header.MessageType != TransferMessageType ||
+                !Guid.TryParseExact(header.TransferId, "N", out var parsedTransferId))
             {
                 throw new InvalidOperationException("The sender uses an incompatible world transfer protocol.");
             }
@@ -427,6 +443,8 @@ public sealed class WorldTransferService : IAsyncDisposable
             WriteJournal(transactionRoot, journal);
             await WriteJsonAsync(stream, new WorldTransferAck
             {
+                Protocol = ProtocolName,
+                ProtocolVersion = ProtocolVersion,
                 Ok = true,
                 Stage = "Ready",
                 TransferId = header.TransferId,
@@ -435,7 +453,7 @@ public sealed class WorldTransferService : IAsyncDisposable
                 PlayerManifestSha256 = sourceManifestSha
             }, token);
             var control = await ReadJsonAsync<WorldTransferControl>(stream, token);
-            if (control is null || control.Protocol != TransferProtocol ||
+            if (control is null || !HasExpectedProtocol(control.Protocol, control.ProtocolVersion) ||
                 control.TransferId != header.TransferId || control.Command != "Commit")
             {
                 throw new InvalidOperationException("World transfer commit command is invalid.");
@@ -450,6 +468,8 @@ public sealed class WorldTransferService : IAsyncDisposable
             WriteJournal(transactionRoot, journal);
             await WriteJsonAsync(stream, new WorldTransferAck
             {
+                Protocol = ProtocolName,
+                ProtocolVersion = ProtocolVersion,
                 Ok = true,
                 Stage = "Committed",
                 TransferId = header.TransferId,
@@ -474,6 +494,8 @@ public sealed class WorldTransferService : IAsyncDisposable
             {
                 await WriteJsonAsync(stream, new WorldTransferAck
                 {
+                    Protocol = ProtocolName,
+                    ProtocolVersion = ProtocolVersion,
                     Ok = false,
                     Stage = "Rejected",
                     TransferId = header?.TransferId ?? string.Empty,
@@ -532,19 +554,22 @@ public sealed class WorldTransferService : IAsyncDisposable
                 await using var stream = client.GetStream();
                 await WriteJsonAsync(stream, new WorldTransferHeader
                 {
-                    Protocol = PingProtocol,
+                    Protocol = ProtocolName,
+                    ProtocolVersion = ProtocolVersion,
+                    MessageType = ProbeMessageType,
                     SenderName = identity.IdentityName,
                     SenderIdentityId = identity.IdentityId,
                     SenderIdentityName = identity.IdentityName,
                     Size = 0,
-                    FileName = "ping",
+                    FileName = "probe",
                     WorldName = ""
                 }, timeoutCts.Token);
 
                 var ack = await ReadJsonAsync<WorldTransferAck>(stream, timeoutCts.Token);
-                if (ack is null || !ack.Ok)
+                if (ack is null || !HasExpectedProtocol(ack.Protocol, ack.ProtocolVersion) ||
+                    !ack.Ok || ack.Stage != "Probe")
                 {
-                    throw new InvalidOperationException(ack?.Message ?? "receiver did not accept transfer ping");
+                    throw new InvalidOperationException(ack?.Message ?? "receiver did not accept transfer probe");
                 }
                 return ip;
             }
@@ -570,6 +595,9 @@ public sealed class WorldTransferService : IAsyncDisposable
         {
         }
     }
+
+    private static bool HasExpectedProtocol(string? protocol, int version) =>
+        string.Equals(protocol, ProtocolName, StringComparison.Ordinal) && version == ProtocolVersion;
 
     private void BeginProgress(long total = 0) => RaiseProgress(0, total);
 

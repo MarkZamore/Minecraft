@@ -1,6 +1,6 @@
 using BsDiff;
 
-namespace Minecraft.BuildTools.DeltaPatch;
+namespace Minecraft.Patch;
 
 internal static class Program
 {

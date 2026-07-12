@@ -37,6 +37,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           "HAS_PREVIOUS=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_NUMBER=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           gh release view latest --json tagName *> $null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "No previous latest release is available; a full-only release will be created."
@@ -72,26 +73,41 @@ jobs:
             throw "Previous Minecraft.exe does not match its update manifest."
           }
 
+          $previousReleaseNumber = 0
+          if ($null -ne $manifest.releaseNumber) {
+            [int]::TryParse([string]$manifest.releaseNumber, [ref]$previousReleaseNumber) | Out-Null
+          }
+          $currentCommit = '${{ github.sha }}'.ToLowerInvariant()
+          $releaseNumber = if ($commit.ToLowerInvariant() -eq $currentCommit) {
+            if ($previousReleaseNumber -gt 0) { $previousReleaseNumber } else { 1 }
+          } elseif ($previousReleaseNumber -gt 0) {
+            $previousReleaseNumber + 1
+          } else {
+            1
+          }
+
           "HAS_PREVIOUS=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PREVIOUS_EXE=$previousExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PREVIOUS_COMMIT=$($commit.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PREVIOUS_SHA256=$expectedSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_NUMBER=$releaseNumber" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Restore
         run: |
           dotnet restore Program\Minecraft.csproj -r win-x64 -p:Configuration=Release
-          dotnet restore Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj -p:Configuration=Release
+          dotnet restore Program\Patch\DeltaPatchTool.csproj -p:Configuration=Release
 
       - name: Audit dependencies
         run: |
           dotnet list Program\Minecraft.csproj package --vulnerable --include-transitive
-          dotnet list Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj package --vulnerable --include-transitive
+          dotnet list Program\Patch\DeltaPatchTool.csproj package --vulnerable --include-transitive
 
       - name: Publish
         shell: pwsh
         run: >
           .\Program\Publish.ps1
           -SourceRevisionId "${{ github.sha }}"
+          -ReleaseNumber "$env:RELEASE_NUMBER"
           -PublishDir "${{ github.workspace }}\artifacts"
           -NoRestore
 
@@ -112,14 +128,14 @@ jobs:
             $patch = Join-Path $artifactDir 'Minecraft.bsdiff'
             $roundTrip = Join-Path $env:RUNNER_TEMP 'Minecraft.delta-roundtrip.exe'
             dotnet run `
-              --project Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj `
+              --project Program\Patch\DeltaPatchTool.csproj `
               -c Release `
               --no-restore `
               -- create $env:PREVIOUS_EXE $exe $patch
             if ($LASTEXITCODE -ne 0) { throw "Delta patch generation failed." }
 
             dotnet run `
-              --project Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj `
+              --project Program\Patch\DeltaPatchTool.csproj `
               -c Release `
               --no-restore `
               -- apply $env:PREVIOUS_EXE $patch $roundTrip
@@ -135,7 +151,8 @@ jobs:
             $patchHash = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
             $patchSize = (Get-Item -LiteralPath $patch).Length
             $deltaManifest = [ordered]@{
-              algorithm = 'bsdiff-v1'
+              algorithm = 'bsdiff'
+              algorithmVersion = 1
               baseCommitSha = $env:PREVIOUS_COMMIT
               baseSha256 = $env:PREVIOUS_SHA256
               assetName = 'Minecraft.bsdiff'
@@ -147,7 +164,8 @@ jobs:
           $manifest = [ordered]@{
             schemaVersion = 2
             commitSha = '${{ github.sha }}'
-            version = '1.0.0'
+            releaseNumber = [int]$env:RELEASE_NUMBER
+            version = [string]$env:RELEASE_NUMBER
             publishedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
             assetName = 'Minecraft.exe'
             sha256 = $hash
@@ -172,11 +190,15 @@ jobs:
           }
 
           $manifest = Get-Content -LiteralPath (Join-Path $artifactDir 'update.json') -Raw | ConvertFrom-Json
-          if ($manifest.schemaVersion -ne 2 -or $manifest.assetName -ne 'Minecraft.exe') {
-            throw "Update manifest v2 is invalid."
+          if ($manifest.schemaVersion -ne 2 -or $manifest.releaseNumber -lt 1 -or $manifest.assetName -ne 'Minecraft.exe') {
+            throw "Update manifest is invalid."
           }
           if ($manifest.deltaPatch -and -not (Test-Path -LiteralPath (Join-Path $artifactDir $manifest.deltaPatch.assetName))) {
             throw "Delta manifest references a missing patch asset."
+          }
+          if ($manifest.deltaPatch -and
+              ($manifest.deltaPatch.algorithm -ne 'bsdiff' -or $manifest.deltaPatch.algorithmVersion -ne 1)) {
+            throw "Delta manifest algorithm is invalid."
           }
 
       - name: Publish latest release

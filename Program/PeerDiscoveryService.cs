@@ -8,6 +8,7 @@ namespace Minecraft;
 
 public sealed class PeerDiscoveryService : IAsyncDisposable
 {
+    public const int ProtocolVersion = 2;
     private const int DiscoveryPort = 35655;
     private const int MaxKnownPeers = 64;
     private const int MaxFullSubnetProbeSize = 512;
@@ -191,7 +192,8 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
                 var result = await listener.ReceiveAsync(token);
                 var json = Encoding.UTF8.GetString(result.Buffer);
                 var announcement = JsonSerializer.Deserialize<PeerAnnouncement>(json, _jsonOptions);
-                if (announcement?.App == "MinecraftPortable")
+                if (announcement?.App == "MinecraftPortable" &&
+                    announcement.ProtocolVersion == ProtocolVersion)
                 {
                     var peerIp = ResolvePeerIp(announcement, result.RemoteEndPoint);
                     if (!string.IsNullOrWhiteSpace(peerIp))

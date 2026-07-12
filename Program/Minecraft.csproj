@@ -12,6 +12,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Minecraft.ico</ApplicationIcon>
     <Version>1.0.0</Version>
+    <ReleaseNumber Condition="'$(ReleaseNumber)' == ''">1</ReleaseNumber>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest-recommended</AnalysisLevel>
     <NuGetAudit>true</NuGetAudit>
@@ -46,7 +47,9 @@
     <PortableIdentityAdapterJar>$(MSBuildProjectDirectory)\Build\IdentityAdapters\$(PortableIdentityAdapterName)\portable-identity-adapter.jar</PortableIdentityAdapterJar>
   </PropertyGroup>
 
-  <Target Name="BuildPortableIdentityAdapter" BeforeTargets="PrepareForBuild">
+  <Target Name="BuildPortableIdentityAdapter"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(DesignTimeBuild)' != 'true'">
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\IdentityAdapters\Common\Build-IdentityAdapter.ps1&quot; -AdapterName &quot;$(PortableIdentityAdapterName)&quot; -OutputPath &quot;$(PortableIdentityAdapterJar)&quot;" />
     <ItemGroup>
       <EmbeddedResource Include="$(PortableIdentityAdapterJar)" LogicalName="Minecraft.PortableIdentityAdapter.jar" />
@@ -75,17 +78,24 @@
   </ItemGroup>
 
   <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>ReleaseNumber</_Parameter1>
+      <_Parameter2>$(ReleaseNumber)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Remove="Build\**" />
-    <Compile Remove="BuildTools\**" />
+    <Compile Remove="Patch\**" />
     <Compile Remove="publish\**" />
     <EmbeddedResource Remove="Build\**" />
-    <EmbeddedResource Remove="BuildTools\**" />
+    <EmbeddedResource Remove="Patch\**" />
     <EmbeddedResource Remove="publish\**" />
     <None Remove="Build\**" />
-    <None Remove="BuildTools\**" />
+    <None Remove="Patch\**" />
     <None Remove="publish\**" />
     <Page Remove="Build\**" />
-    <Page Remove="BuildTools\**" />
+    <Page Remove="Patch\**" />
     <Page Remove="publish\**" />
   </ItemGroup>
 

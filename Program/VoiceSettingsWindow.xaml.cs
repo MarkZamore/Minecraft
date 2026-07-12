@@ -6,7 +6,13 @@ namespace Minecraft;
 
 public partial class VoiceSettingsWindow : Window
 {
-    private const double BaseWidth = 430;
+    private static readonly IReadOnlyList<VoicePttModeOption> PttModes =
+    [
+        new("Off", "Выключен"),
+        new("Hold", "Удержание"),
+        new("Toggle", "По нажатию")
+    ];
+    private const double BaseWidth = 680;
     private const double BaseHeight = 390;
     private readonly MainWindow _owner;
     private bool _isApplyingState;
@@ -16,6 +22,7 @@ public partial class VoiceSettingsWindow : Window
     {
         _owner = owner;
         InitializeComponent();
+        PttModeComboBox.ItemsSource = PttModes;
         Owner = owner;
         ApplyOwnerScale(ownerScale);
     }
@@ -60,25 +67,17 @@ public partial class VoiceSettingsWindow : Window
 
     private void ApplyOwnerScale(double ownerScale)
     {
-        var scale = Math.Clamp(ownerScale, 0.7, 1.8);
+        var scale = Math.Clamp(ownerScale, 0.5, 2.5);
         Width = BaseWidth * scale;
         Height = BaseHeight * scale;
-        MinWidth = 330 * scale;
+        MinWidth = 520 * scale;
         MinHeight = 300 * scale;
     }
 
     private void SelectPttMode(string pttMode)
     {
-        foreach (var item in PttModeComboBox.Items.OfType<ComboBoxItem>())
-        {
-            if (string.Equals(item.Tag as string, pttMode, StringComparison.OrdinalIgnoreCase))
-            {
-                PttModeComboBox.SelectedItem = item;
-                return;
-            }
-        }
-
-        PttModeComboBox.SelectedIndex = 0;
+        PttModeComboBox.SelectedItem = PttModes.FirstOrDefault(item =>
+            string.Equals(item.Value, pttMode, StringComparison.OrdinalIgnoreCase)) ?? PttModes[0];
     }
 
     private static string FormatPercent(double value) => $"{Math.Round(value * 100d)}%";
@@ -115,12 +114,12 @@ public partial class VoiceSettingsWindow : Window
 
     private void PttModeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_isApplyingState || PttModeComboBox.SelectedItem is not ComboBoxItem item)
+        if (_isApplyingState || PttModeComboBox.SelectedItem is not VoicePttModeOption item)
         {
             return;
         }
 
-        _owner.SetVoicePttMode((item.Tag as string) ?? "Off");
+        _owner.SetVoicePttMode(item.Value);
     }
 
     private void PttBindingButton_Click(object sender, RoutedEventArgs e)
@@ -188,3 +187,5 @@ public partial class VoiceSettingsWindow : Window
         _owner.SetVoiceOutputVolume(e.NewValue);
     }
 }
+
+public sealed record VoicePttModeOption(string Value, string DisplayName);

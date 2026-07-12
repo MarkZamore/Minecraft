@@ -1,16 +1,16 @@
 using System.Timers;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
-using System;
-using System.Linq;
-using System.Collections.Generic;
 using Timer = System.Timers.Timer;
 
 namespace Minecraft;
 
 public sealed class VoicePlayback : IDisposable
 {
+    private const int SpeakingThreshold = 300;
     private readonly BufferedWaveProvider _provider;
-    private readonly WaveOutEvent _waveOut;
+    private readonly WasapiOut _waveOut;
+    private readonly MMDevice _device;
     private readonly VoiceReceiver _receiver;
     private readonly Timer _playbackTimer;
     private readonly Dictionary<string, double> _peerVolumes;
@@ -22,23 +22,29 @@ public sealed class VoicePlayback : IDisposable
 
     public event Action<string, bool>? SpeakingStateChanged;
 
-    public VoicePlayback(VoiceReceiver receiver, int outputDeviceNumber, double masterVolume)
+    public VoicePlayback(VoiceReceiver receiver, MMDevice outputDevice, double masterVolume)
     {
         _receiver = receiver;
+        _device = outputDevice ?? throw new ArgumentNullException(nameof(outputDevice));
         _peerVolumes = new(StringComparer.OrdinalIgnoreCase);
         _provider = new BufferedWaveProvider(new WaveFormat(VoiceEncoder.SampleRate, 16, VoiceEncoder.Channels))
         {
             DiscardOnBufferOverflow = true,
             BufferLength = VoiceEncoder.SampleRate * 4
         };
-        _waveOut = new WaveOutEvent
+        var waveOut = new WasapiOut(_device, AudioClientShareMode.Shared, useEventSync: true, latency: 40);
+        try
         {
-            DeviceNumber = outputDeviceNumber
-        };
-        _waveOut.Init(_provider);
-        _waveOut.Volume = 1f;
+            waveOut.Init(_provider);
+        }
+        catch
+        {
+            waveOut.Dispose();
+            _device.Dispose();
+            throw;
+        }
+        _waveOut = waveOut;
         _masterVolume = Math.Clamp(masterVolume, 0d, 2d);
-        _waveOut.Play();
 
         _playbackTimer = new Timer(20)
         {
@@ -53,6 +59,7 @@ public sealed class VoicePlayback : IDisposable
         {
             if (_isDisposed || _isStarted) return;
             _isStarted = true;
+            _waveOut.Play();
             _playbackTimer.Start();
         }
     }
@@ -63,6 +70,7 @@ public sealed class VoicePlayback : IDisposable
         {
             _isStarted = false;
             _playbackTimer.Stop();
+            _waveOut.Stop();
             _provider.ClearBuffer();
         }
     }
@@ -123,14 +131,14 @@ public sealed class VoicePlayback : IDisposable
             var peerId = pair.Key;
             var frame = pair.Value;
             var volume = peerVolumes.TryGetValue(peerId, out var value) ? value : 1d;
-            var isSpeaking = frame.Any(sample => sample != 0);
+            var isSpeaking = frame.Any(sample => Math.Abs((int)sample) >= SpeakingThreshold);
             speakers[peerId] = isSpeaking;
 
             var scale = (float)(volume * masterVolume);
-            for (var i = 0; i < VoiceEncoder.FrameSamples && i < frame.Length; i++)
+            for (var index = 0; index < VoiceEncoder.FrameSamples && index < frame.Length; index++)
             {
-                var mixedValue = (float)mixed[i] + (frame[i] * scale);
-                mixed[i] = (short)Math.Clamp(mixedValue, short.MinValue, short.MaxValue);
+                var mixedValue = (float)mixed[index] + (frame[index] * scale);
+                mixed[index] = (short)Math.Clamp(mixedValue, short.MinValue, short.MaxValue);
             }
         }
 
@@ -155,6 +163,7 @@ public sealed class VoicePlayback : IDisposable
             _playbackTimer.Dispose();
             _waveOut.Stop();
             _waveOut.Dispose();
+            _device.Dispose();
         }
     }
 }

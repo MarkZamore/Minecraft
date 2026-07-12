@@ -78,7 +78,7 @@ public sealed class PeerEndpointInfo
 public sealed class PeerAnnouncement
 {
     public string App { get; set; } = "MinecraftPortable";
-    public int Version { get; set; } = 1;
+    public int ProtocolVersion { get; set; }
     public string PlayerName { get; set; } = "";
     public string IdentityId { get; set; } = "";
     public string IdentityName { get; set; } = "";
@@ -89,6 +89,7 @@ public sealed class PeerAnnouncement
     public int ServerPort { get; set; }
     public string State { get; set; } = "";
     public bool IsVoiceChannelActive { get; set; }
+    public bool IsVoiceMuted { get; set; }
 }
 
 public sealed class PeerViewModel : INotifyPropertyChanged
@@ -104,6 +105,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private int _serverPort;
     private bool _isInVoiceChannel;
     private bool _isSpeaking;
+    private bool _isVoiceMuted;
     private double _voiceVolume = 1.0d;
     private string _state = "";
     private DateTimeOffset _lastSeen;
@@ -212,6 +214,18 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
     }
 
+    public bool IsVoiceMuted
+    {
+        get => _isVoiceMuted;
+        set
+        {
+            if (Set(ref _isVoiceMuted, value))
+            {
+                OnPropertyChanged(nameof(VoiceDisplayName));
+            }
+        }
+    }
+
     public double VoiceVolume
     {
         get => _voiceVolume;
@@ -268,8 +282,10 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     {
         get
         {
-            var displayName = IsLocalVoicePeer ? $"{DisplayName} (Вы)" : DisplayName;
-            return IsSpeaking ? $"{displayName} (говорит)" : displayName;
+            var name = string.IsNullOrWhiteSpace(PlayerName) ? "Неизвестный игрок" : PlayerName;
+            var localSuffix = IsLocalVoicePeer ? " (Вы)" : string.Empty;
+            var address = string.IsNullOrWhiteSpace(VpnIp) ? "—" : VpnIp;
+            return $"{name}{localSuffix} - {address}";
         }
     }
 
@@ -316,6 +332,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         IdentityId = announcement.IdentityId;
         IdentityName = announcement.IdentityName;
         IsInVoiceChannel = announcement.IsVoiceChannelActive;
+        IsVoiceMuted = announcement.IsVoiceMuted;
         PackHash = announcement.PackHash;
         State = announcement.State;
         LocalPackHash = localPackHash;
@@ -463,7 +480,9 @@ public sealed class ClientBuildViewModel
 
 public sealed class WorldTransferHeader
 {
-    public string Protocol { get; set; } = WorldTransferService.TransferProtocol;
+    public string Protocol { get; set; } = "";
+    public int ProtocolVersion { get; set; }
+    public string MessageType { get; set; } = "";
     public string TransferId { get; set; } = "";
     public string SenderName { get; set; } = "";
     public string SenderIdentityId { get; set; } = "";
@@ -479,6 +498,8 @@ public sealed class WorldTransferHeader
 
 public sealed class WorldTransferAck
 {
+    public string Protocol { get; set; } = "";
+    public int ProtocolVersion { get; set; }
     public bool Ok { get; set; }
     public string Stage { get; set; } = "";
     public string TransferId { get; set; } = "";
@@ -489,7 +510,8 @@ public sealed class WorldTransferAck
 
 public sealed class WorldTransferControl
 {
-    public string Protocol { get; set; } = WorldTransferService.TransferProtocol;
+    public string Protocol { get; set; } = "";
+    public int ProtocolVersion { get; set; }
     public string TransferId { get; set; } = "";
     public string Command { get; set; } = "Commit";
 }

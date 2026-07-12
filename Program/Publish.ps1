@@ -1,6 +1,7 @@
 param(
     [string]$SourceRevisionId = "",
     [string]$PublishDir = "",
+    [int]$ReleaseNumber = 1,
     [switch]$NoRestore
 )
 
@@ -13,6 +14,8 @@ $buildRoots = @(
     (Join-Path $programDir "bin"),
     (Join-Path $programDir "obj"),
     (Join-Path $programDir "Build"),
+    (Join-Path $programDir "Patch\bin"),
+    (Join-Path $programDir "Patch\obj"),
     (Join-Path $projectRoot "Minecraft\Personal\Build")
 )
 
@@ -45,6 +48,9 @@ $PublishDir = [System.IO.Path]::GetFullPath($PublishDir)
 if ([string]::IsNullOrWhiteSpace($SourceRevisionId)) {
     $SourceRevisionId = (& git -C $projectRoot rev-parse HEAD).Trim()
 }
+if ($ReleaseNumber -lt 1) {
+    throw "ReleaseNumber must be at least 1."
+}
 if ([string]::IsNullOrWhiteSpace($SourceRevisionId)) {
     throw "Source revision could not be determined."
 }
@@ -55,12 +61,12 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed with exit code $LASTEXITCODE." }
     }
 
-    & dotnet build $projectFile -c Release --no-restore "-p:SourceRevisionId=$SourceRevisionId"
+    & dotnet build $projectFile -c Release --no-restore "-p:SourceRevisionId=$SourceRevisionId" "-p:ReleaseNumber=$ReleaseNumber"
     if ($LASTEXITCODE -ne 0) { throw "dotnet build failed with exit code $LASTEXITCODE." }
 
     # WPF's markup pass creates a temporary assembly. Publishing without a second
     # build guarantees that the final pass-two assembly is the one bundled.
-    & dotnet publish $projectFile -c Release --no-build --no-restore "-p:SourceRevisionId=$SourceRevisionId" "-p:PublishDir=$PublishDir"
+    & dotnet publish $projectFile -c Release --no-build --no-restore "-p:SourceRevisionId=$SourceRevisionId" "-p:ReleaseNumber=$ReleaseNumber" "-p:PublishDir=$PublishDir"
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
 
     $executable = Join-Path $PublishDir "Minecraft.exe"

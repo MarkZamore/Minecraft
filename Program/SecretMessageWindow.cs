@@ -15,7 +15,7 @@ public sealed class SecretMessageWindow : Window
         Title = SecretMessage.Title;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         var baseSize = CalculateInitialSize(SecretMessage.Text);
-        var scale = Math.Clamp(ownerScale, 0.7, 1.8);
+        var scale = Math.Clamp(ownerScale, 0.5, 2.5);
         Width = Math.Min(baseSize.Width * scale, SystemParameters.WorkArea.Width * 0.9);
         Height = Math.Min(baseSize.Height * scale, SystemParameters.WorkArea.Height * 0.9);
         MinWidth = MinBaseWidth * scale;
@@ -39,15 +39,22 @@ public sealed class SecretMessageWindow : Window
         var message = new TextBlock
         {
             Text = SecretMessage.Text.Trim(),
-            TextWrapping = TextWrapping.Wrap,
+            TextWrapping = TextWrapping.NoWrap,
             TextAlignment = TextAlignment.Center,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
-            FontSize = 16,
+            FontSize = 48,
             FontWeight = FontWeights.SemiBold,
             Foreground = brush
         };
-        layout.Children.Add(message);
+        var messageScaler = new Viewbox
+        {
+            Stretch = Stretch.Uniform,
+            StretchDirection = StretchDirection.Both,
+            Margin = new Thickness(2),
+            Child = message
+        };
+        layout.Children.Add(messageScaler);
         root.Child = layout;
         Content = root;
     }

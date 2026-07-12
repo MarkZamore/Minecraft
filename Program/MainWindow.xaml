@@ -1,9 +1,13 @@
 <Window x:Class="Minecraft.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Minecraft" Height="760" Width="860" MinHeight="460" MinWidth="520"
+        xmlns:local="clr-namespace:Minecraft"
+        Title="Minecraft" Height="460" Width="520" MinHeight="460" MinWidth="520"
+        WindowStartupLocation="CenterScreen"
         Icon="Minecraft.ico" Loaded="Window_Loaded" Closing="Window_Closing">
     <Window.Resources>
+        <SolidColorBrush x:Key="VoiceMutedBrush" Color="#C93636"/>
+
         <Style TargetType="TextBlock">
             <Setter Property="VerticalAlignment" Value="Center"/>
         </Style>
@@ -11,6 +15,7 @@
             <Setter Property="MinHeight" Value="28"/>
             <Setter Property="Padding" Value="8,3"/>
             <Setter Property="HorizontalAlignment" Value="Stretch"/>
+            <Setter Property="Background" Value="{DynamicResource ControlSurfaceBrush}"/>
         </Style>
         <Style TargetType="TextBox">
             <Setter Property="MinHeight" Value="28"/>
@@ -18,20 +23,43 @@
             <Setter Property="TextAlignment" Value="Center"/>
             <Setter Property="VerticalContentAlignment" Value="Center"/>
         </Style>
-        <Style TargetType="ComboBox">
-            <Setter Property="MinHeight" Value="28"/>
-            <Setter Property="HorizontalContentAlignment" Value="Center"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
-        </Style>
-        <Style TargetType="ComboBoxItem">
-            <Setter Property="HorizontalContentAlignment" Value="Center"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Style TargetType="ProgressBar">
+            <Setter Property="Background" Value="{DynamicResource ControlSurfaceBrush}"/>
+            <Setter Property="Foreground" Value="{DynamicResource ProgressIdleBrush}"/>
         </Style>
         <Style x:Key="SectionTitleStyle" TargetType="TextBlock">
             <Setter Property="FontSize" Value="13"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="Margin" Value="0,0,0,5"/>
         </Style>
+
+        <DataTemplate x:Key="BuildItemTemplate">
+            <TextBlock Text="{Binding Name}" TextAlignment="Center" HorizontalAlignment="Stretch"/>
+        </DataTemplate>
+        <DataTemplate x:Key="WorldItemTemplate">
+            <TextBlock Text="{Binding DisplayName}" TextAlignment="Center" HorizontalAlignment="Stretch"/>
+        </DataTemplate>
+        <DataTemplate x:Key="PeerItemTemplate">
+            <TextBlock Text="{Binding DisplayName}" TextAlignment="Center" HorizontalAlignment="Stretch"/>
+        </DataTemplate>
+        <DataTemplate x:Key="VoicePeerTemplate">
+            <TextBlock Text="{Binding VoiceDisplayName}" TextAlignment="Left"
+                       HorizontalAlignment="Stretch" Margin="6,0">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Foreground" Value="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/>
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsSpeaking}" Value="True">
+                                <Setter Property="Foreground" Value="{StaticResource ProgressActiveBrush}"/>
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding IsVoiceMuted}" Value="True">
+                                <Setter Property="Foreground" Value="{StaticResource VoiceMutedBrush}"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
+        </DataTemplate>
     </Window.Resources>
 
     <Viewbox Stretch="Uniform" StretchDirection="Both">
@@ -41,263 +69,229 @@
                 <ColumnDefinition Width="1*"/>
                 <ColumnDefinition Width="270"/>
             </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*" MinHeight="96"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
 
-            <Grid Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,0">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="*"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
-
-                <Grid Grid.Row="0" Margin="0,0,0,10">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="1.1*"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="1.4*"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="0" Text="Имя"/>
-                    <TextBox Grid.Column="1" x:Name="PlayerNameTextBox"
-                             MaxLength="16"
-                             IsReadOnly="True"
-                             TextChanged="PlayerNameTextBox_TextChanged"
-                             PreviewTextInput="PlayerNameTextBox_PreviewTextInput"
-                             DataObject.Pasting="PlayerNameTextBox_Pasting"
-                             LostFocus="PlayerNameTextBox_LostFocus"
-                             KeyDown="PlayerNameTextBox_KeyDown"
-                             Margin="8,0,6,0"/>
-                    <Button Grid.Column="2" x:Name="ChangePlayerNameButton"
-                            Content="Изменить" Click="ChangePlayerNameButton_Click"
-                            MinWidth="72" Margin="0,0,12,0"/>
-                    <TextBlock Grid.Column="3" Text="Сборка"/>
-                    <ComboBox Grid.Column="4" x:Name="BuildComboBox"
-                              DisplayMemberPath="Name"
-                              SelectionChanged="BuildComboBox_SelectionChanged"
-                              Margin="8,0,0,0"/>
-                </Grid>
-
-                <Grid Grid.Row="1" Margin="0,0,0,12">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="68"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <Button Grid.Column="0" x:Name="PlayButton" Content="Играть" Click="PlayButton_Click"
-                            MinHeight="38" FontSize="16" FontWeight="SemiBold"/>
-                    <TextBlock Grid.Column="1" Text="RAM" Margin="12,0,6,0"/>
-                    <TextBox Grid.Column="2" x:Name="MemoryTextBox" TextAlignment="Center" FontSize="16"
-                             PreviewTextInput="MemoryTextBox_PreviewTextInput"
-                             TextChanged="MemoryTextBox_TextChanged"
-                             DataObject.Pasting="MemoryTextBox_Pasting"
-                             LostFocus="MemoryTextBox_LostFocus" KeyDown="MemoryTextBox_KeyDown"/>
-                    <TextBlock Grid.Column="3" Text="GB" Margin="6,0,0,0"/>
-                </Grid>
-
-                <StackPanel Grid.Row="2" Margin="0,0,0,12">
-                    <TextBlock Text="Radmin VPN" Style="{StaticResource SectionTitleStyle}"/>
-                    <Grid Margin="0,0,0,7">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <Button Grid.Column="0" x:Name="InstallRadminButton" Content="Установить"
-                                Click="InstallRadminButton_Click" Margin="0,0,4,0"/>
-                        <Button Grid.Column="1" x:Name="GenerateRadminButton" Content="Сгенерировать"
-                                Click="GenerateRadminButton_Click" Margin="4,0,0,0"/>
-                    </Grid>
-                    <Grid Margin="0,0,0,6">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="58"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="88"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Сеть"/>
-                        <TextBox Grid.Column="1" x:Name="RadminNetworkNameTextBox"
-                                 TextChanged="RadminNetworkTextBox_TextChanged"/>
-                        <Button Grid.Column="2" x:Name="CopyRadminNetworkButton" Content="Копировать"
-                                Click="CopyRadminNetworkButton_Click" Margin="6,0,0,0"/>
-                    </Grid>
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="58"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="88"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Пароль"/>
-                        <TextBox Grid.Column="1" x:Name="RadminNetworkPasswordTextBox"
-                                 TextChanged="RadminNetworkTextBox_TextChanged"/>
-                        <Button Grid.Column="2" x:Name="CopyRadminPasswordButton" Content="Копировать"
-                                Click="CopyRadminPasswordButton_Click" Margin="6,0,0,0"/>
-                    </Grid>
-                </StackPanel>
-
-                <StackPanel Grid.Row="3" Margin="0,0,0,12">
-                    <TextBlock Text="Передача мира" Style="{StaticResource SectionTitleStyle}"/>
-                    <Grid Margin="0,0,0,6">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="70"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Мир"/>
-                        <Grid Grid.Column="1">
-                            <ComboBox x:Name="WorldComboBox"
-                                      DisplayMemberPath="DisplayName"
-                                      SelectionChanged="WorldComboBox_SelectionChanged"/>
-                            <TextBlock x:Name="WorldPlaceholderText"
-                                       Text="Нет миров для передачи"
-                                       HorizontalAlignment="Center"
-                                       IsHitTestVisible="False"
-                                       Visibility="Collapsed"/>
-                        </Grid>
-                    </Grid>
-                    <Grid Margin="0,0,0,8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="70"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Игрок"/>
-                        <Grid Grid.Column="1">
-                            <ComboBox x:Name="OnlinePlayerComboBox"
-                                      DisplayMemberPath="DisplayName"
-                                      SelectionChanged="TransferSelectionChanged"/>
-                            <TextBlock x:Name="OnlinePlayerPlaceholderText"
-                                       Text="Нет игроков в сети"
-                                       HorizontalAlignment="Center"
-                                       IsHitTestVisible="False"
-                                       Visibility="Collapsed"/>
-                        </Grid>
-                    </Grid>
-                    <TextBlock x:Name="TransferProgressText" Margin="0,0,0,2"/>
-                    <ProgressBar x:Name="TransferProgressBar" Height="8" Minimum="0" Maximum="100" Value="0" Margin="0,0,0,8"/>
-                    <Button x:Name="TransferButton" Content="Передать мир" Click="TransferButton_Click" MinHeight="32"/>
-                </StackPanel>
-
-                <Grid Grid.Row="5" Margin="0,0,0,6">
-                    <ProgressBar x:Name="RuntimeProgressBar" Minimum="0" Maximum="100" Height="28"/>
-                    <TextBlock x:Name="RuntimeProgressText"
-                               Text="Подготовка сборки"
-                               HorizontalAlignment="Center"
-                               VerticalAlignment="Center"
-                               FontWeight="SemiBold"/>
-                </Grid>
-
-                <Grid Grid.Row="6" VerticalAlignment="Bottom" Margin="0,0,0,6">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <Grid Grid.Column="0" MinHeight="28">
-                        <ProgressBar x:Name="UpdateProgressBar" Minimum="0" Maximum="100" Height="28"/>
-                        <TextBlock x:Name="UpdateProgressText"
-                                   Text="Вы на последней версии"
-                                   HorizontalAlignment="Center"
-                                   VerticalAlignment="Center"
-                                   FontWeight="SemiBold"/>
-                    </Grid>
-                    <Button Grid.Column="1" x:Name="UpdateButton" Content="Обновить"
-                            Click="UpdateButton_Click" Margin="8,0,0,0" MinWidth="88"
-                            IsEnabled="False"/>
-                </Grid>
-
-                <Grid Grid.Row="7" Margin="0,0,0,8">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <Grid Grid.Column="0" MinHeight="28">
-                        <ProgressBar x:Name="SecretProgressBar" Minimum="0" Maximum="600" Height="28"/>
-                        <TextBlock x:Name="SecretProgressText"
-                                   Text="Загрузка"
-                                   HorizontalAlignment="Center"
-                                   VerticalAlignment="Center"
-                                   FontWeight="SemiBold"/>
-                    </Grid>
-                    <Button Grid.Column="1" x:Name="SecretOpenButton" Content="Открыть"
-                            Click="SecretOpenButton_Click" Margin="8,0,0,0" MinWidth="88"
-                            IsEnabled="False"/>
-                </Grid>
-
-                <TextBlock Grid.Row="8"
-                           Text="Лучше TLauncher"
-                           HorizontalAlignment="Left"
-                           FontSize="11"/>
-
-                <TextBlock Grid.Row="8" x:Name="VersionTextBlock"
-                           HorizontalAlignment="Right"
-                           FontSize="11"/>
+            <Grid Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="1.1*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="1.4*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Имя"/>
+                <TextBox Grid.Column="1" x:Name="PlayerNameTextBox"
+                         MaxLength="16"
+                         IsReadOnly="True"
+                         TextChanged="PlayerNameTextBox_TextChanged"
+                         PreviewTextInput="PlayerNameTextBox_PreviewTextInput"
+                         DataObject.Pasting="PlayerNameTextBox_Pasting"
+                         LostFocus="PlayerNameTextBox_LostFocus"
+                         KeyDown="PlayerNameTextBox_KeyDown"
+                         Margin="8,0,6,0"/>
+                <Button Grid.Column="2" x:Name="ChangePlayerNameButton"
+                        Content="Изменить" Click="ChangePlayerNameButton_Click"
+                        MinWidth="72" Margin="0,0,12,0"/>
+                <TextBlock Grid.Column="3" Text="Сборка"/>
+                <local:CenteredDropDown Grid.Column="4" x:Name="BuildComboBox"
+                                        ItemTemplate="{StaticResource BuildItemTemplate}"
+                                        SelectionChanged="BuildComboBox_SelectionChanged"
+                                        Margin="8,0,0,0"/>
             </Grid>
 
-            <Grid Grid.Column="2">
+            <Grid Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="68"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Button Grid.Column="0" x:Name="PlayButton" Content="Играть" Click="PlayButton_Click"
+                        MinHeight="38" FontSize="16" FontWeight="SemiBold"/>
+                <TextBlock Grid.Column="1" Text="RAM" Margin="12,0,6,0"/>
+                <TextBox Grid.Column="2" x:Name="MemoryTextBox" TextAlignment="Center" FontSize="16"
+                         PreviewTextInput="MemoryTextBox_PreviewTextInput"
+                         TextChanged="MemoryTextBox_TextChanged"
+                         DataObject.Pasting="MemoryTextBox_Pasting"
+                         LostFocus="MemoryTextBox_LostFocus" KeyDown="MemoryTextBox_KeyDown"/>
+                <TextBlock Grid.Column="3" Text="GB" Margin="6,0,0,0"/>
+            </Grid>
+
+            <Grid Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="210"/>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
-                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
-
-                <Grid Grid.Row="0" Margin="0,0,0,16">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="*"/>
-                    </Grid.RowDefinitions>
-                    <Grid Grid.Row="0" Margin="0,0,0,8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="58"/>
-                            <ColumnDefinition Width="32"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="Голосовой чат" FontSize="13" FontWeight="SemiBold"/>
-                        <Button Grid.Column="1" x:Name="VoiceJoinButton" Content="Войти"
-                                Click="VoiceJoinButton_Click" Margin="0,0,4,0"/>
-                        <Button Grid.Column="2" x:Name="VoiceSettingsButton" Content="⚙"
-                                Padding="0"
-                                ToolTip="Настройки голосового чата"
-                                Click="VoiceSettingsButton_Click"/>
-                    </Grid>
-                    <ListBox Grid.Row="1" x:Name="VoicePeersListBox"
-                             ScrollViewer.VerticalScrollBarVisibility="Auto"
-                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
-                             DisplayMemberPath="VoiceDisplayName"/>
-                </Grid>
-
-                <Grid Grid.Row="1" Grid.RowSpan="2">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="*"/>
-                        <RowDefinition Height="Auto"/>
-                    </Grid.RowDefinitions>
-                    <TextBlock Grid.Row="0"
-                               Text="AI-помощник обученный на вашей сборке Minecraft"
-                               TextWrapping="Wrap"
-                               TextAlignment="Center"
-                               HorizontalAlignment="Center"
-                               VerticalAlignment="Center"
-                               FontSize="15"
-                               FontWeight="SemiBold"
-                               Margin="10"/>
-                    <Grid Grid.Row="1" Margin="0,12,0,0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="82"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBox Grid.Column="0"
-                                 Text="Пока не работает :("
-                                 IsReadOnly="True"
-                                 IsEnabled="False"
-                                 TextAlignment="Left"/>
-                        <Button Grid.Column="1"
-                                Content="Отправить"
-                                IsEnabled="False"
-                                Margin="6,0,0,0"/>
-                    </Grid>
+                <TextBlock Grid.Row="0" Text="Голосовой чат" FontSize="13" FontWeight="SemiBold"
+                           Margin="0,0,0,5"/>
+                <ListBox Grid.Row="1" x:Name="VoicePeersListBox"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         HorizontalContentAlignment="Stretch"
+                         ItemTemplate="{StaticResource VoicePeerTemplate}"/>
+                <Grid Grid.Row="2" Margin="0,5,0,0">
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+                        <Button x:Name="VoiceJoinButton" Content="+" Width="30" Height="28" Padding="0"
+                                FontSize="16" ToolTip="Войти в голосовой канал"
+                                Click="VoiceJoinButton_Click"/>
+                        <Button x:Name="VoiceMuteButton" Content="🎙" Width="30" Height="28" Padding="0"
+                                FontSize="14" ToolTip="Выключить микрофон" Margin="5,0,0,0"
+                                Click="VoiceMuteButton_Click"/>
+                    </StackPanel>
+                    <Button x:Name="VoiceSettingsButton" Content="⚙" Width="30" Height="28"
+                            HorizontalAlignment="Right" Padding="0"
+                            ToolTip="Настройки голосового чата"
+                            Click="VoiceSettingsButton_Click"/>
                 </Grid>
             </Grid>
+
+            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
+                <TextBlock Text="Radmin VPN" Style="{StaticResource SectionTitleStyle}"/>
+                <Grid Margin="0,0,0,5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Button Grid.Column="0" x:Name="InstallRadminButton" Content="Установить"
+                            Click="InstallRadminButton_Click" Margin="0,0,4,0"/>
+                    <Button Grid.Column="1" x:Name="GenerateRadminButton" Content="Сгенерировать"
+                            Click="GenerateRadminButton_Click" Margin="4,0"/>
+                    <Button Grid.Column="2" x:Name="CopyRadminButton" Content="Копировать"
+                            Click="CopyRadminButton_Click" Margin="4,0,0,0"/>
+                </Grid>
+                <TextBlock x:Name="RadminNetworkNameText" Text="Сеть: —" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="RadminNetworkPasswordText" Text="Пароль: —" TextTrimming="CharacterEllipsis"/>
+            </StackPanel>
+
+            <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
+                <TextBlock Text="Передача мира" Style="{StaticResource SectionTitleStyle}"/>
+                <Grid Margin="0,0,0,5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="70"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Мир"/>
+                    <Grid Grid.Column="1">
+                        <local:CenteredDropDown x:Name="WorldComboBox"
+                                                ItemTemplate="{StaticResource WorldItemTemplate}"
+                                                SelectionChanged="WorldComboBox_SelectionChanged"/>
+                        <TextBlock x:Name="WorldPlaceholderText"
+                                   Text="Нет миров для передачи"
+                                   HorizontalAlignment="Center"
+                                   IsHitTestVisible="False"
+                                   Visibility="Collapsed"/>
+                    </Grid>
+                </Grid>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="70"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Игрок"/>
+                    <Grid Grid.Column="1">
+                        <local:CenteredDropDown x:Name="OnlinePlayerComboBox"
+                                                ItemTemplate="{StaticResource PeerItemTemplate}"
+                                                SelectionChanged="TransferSelectionChanged"/>
+                        <TextBlock x:Name="OnlinePlayerPlaceholderText"
+                                   Text="Нет игроков в сети"
+                                   HorizontalAlignment="Center"
+                                   IsHitTestVisible="False"
+                                   Visibility="Collapsed"/>
+                    </Grid>
+                </Grid>
+            </StackPanel>
+
+            <Grid Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Grid Grid.Column="0" MinHeight="28">
+                    <ProgressBar x:Name="TransferProgressBar" Minimum="0" Maximum="100" Height="28"
+                                 Foreground="{StaticResource ProgressIdleBrush}"/>
+                    <TextBlock x:Name="TransferProgressText" Text="В ожидании мира"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                </Grid>
+                <Button Grid.Column="1" x:Name="TransferButton" Content="Передать"
+                        Click="TransferButton_Click" Margin="8,0,0,0" MinWidth="88"/>
+            </Grid>
+
+            <Grid Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Grid Grid.Column="0" MinHeight="28">
+                    <ProgressBar x:Name="UpdateProgressBar" Minimum="0" Maximum="100" Height="28"
+                                 Foreground="{StaticResource ProgressIdleBrush}"/>
+                    <TextBlock x:Name="UpdateProgressText" Text="Вы на последней версии"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                </Grid>
+                <Button Grid.Column="1" x:Name="UpdateButton" Content="Обновить"
+                        Click="UpdateButton_Click" Margin="8,0,0,0" MinWidth="88" IsEnabled="False"/>
+            </Grid>
+
+            <Grid Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6"
+                  ClipToBounds="True">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <ProgressBar Grid.Column="0" x:Name="SecretProgressBar" Minimum="0" Maximum="100" Height="28"
+                             Foreground="{StaticResource ProgressIdleBrush}"/>
+                <Button Grid.Column="1" x:Name="SecretOpenButton" Content="Открыть"
+                        Click="SecretOpenButton_Click" Margin="8,0,0,0" MinWidth="88" IsEnabled="False"/>
+                <ProgressBar Grid.Column="0" Grid.ColumnSpan="2" x:Name="SecretExtendedProgressBar"
+                             Minimum="0" Maximum="600" Height="28"
+                             Background="Transparent" BorderThickness="0"
+                             Foreground="{StaticResource ProgressActiveBrush}"
+                             IsHitTestVisible="False" Panel.ZIndex="2"/>
+                <TextBlock Grid.Column="0" x:Name="SecretProgressText" Text="Загрузка"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           FontWeight="SemiBold" Panel.ZIndex="3"/>
+            </Grid>
+
+            <Grid Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,8">
+                <ProgressBar x:Name="RuntimeProgressBar" Minimum="0" Maximum="100" Height="28"
+                             Foreground="{StaticResource ProgressIdleBrush}"/>
+                <TextBlock x:Name="RuntimeProgressText" Text="В ожидании сборки"
+                           HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold"/>
+            </Grid>
+
+            <Grid Grid.Column="2" Grid.Row="0" Grid.RowSpan="10">
+                <TextBlock Text="AI-помощник обученный на вашей сборке Minecraft"
+                           TextWrapping="Wrap" TextAlignment="Center"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           FontSize="15" FontWeight="SemiBold" Margin="10,10,10,46"/>
+            </Grid>
+            <Grid Grid.Column="2" Grid.Row="8" Height="28">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="82"/>
+                </Grid.ColumnDefinitions>
+                <TextBox Grid.Column="0" Text="Пока не работает :("
+                         Height="28" IsReadOnly="True" IsEnabled="False" TextAlignment="Left"/>
+                <Button Grid.Column="1" Content="Отправить" Height="28"
+                        IsEnabled="False" Margin="6,0,0,0"/>
+            </Grid>
+
+            <TextBlock Grid.Row="9" Grid.Column="0" Grid.ColumnSpan="2"
+                       Text="Лучше TLauncher" HorizontalAlignment="Left" FontSize="11"/>
+            <TextBlock Grid.Row="9" Grid.Column="2" x:Name="VersionTextBlock"
+                       HorizontalAlignment="Right" TextAlignment="Right" FontSize="11"/>
 
             <Grid Visibility="Collapsed">
                 <ComboBox x:Name="AdapterComboBox" DisplayMemberPath="DisplayName"
@@ -313,7 +307,6 @@
                 <ComboBox x:Name="VoiceOutputComboBox" SelectionChanged="VoiceOutputComboBox_SelectionChanged"/>
                 <Slider x:Name="VoiceMasterVolumeSlider" Minimum="0" Maximum="2"
                         ValueChanged="VoiceMasterVolumeSlider_ValueChanged"/>
-                <Button x:Name="VoiceMuteButton" Click="VoiceMuteButton_Click"/>
                 <Button x:Name="VoiceDeafenButton" Click="VoiceDeafenButton_Click"/>
             </Grid>
         </Grid>

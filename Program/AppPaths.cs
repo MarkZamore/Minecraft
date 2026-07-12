@@ -53,6 +53,7 @@ public sealed class AppPaths
     public string IdentityFile => Path.Combine(Personal, "UUID.json");
     public string NetworkPeersFile => Path.Combine(Personal, "network-peers.json");
     public string PackHashesFile => Path.Combine(Personal, "pack-hashes.json");
+    public string WindowPlacementFile => Path.Combine(Personal, "window-placement.json");
     public string[] LegacySettingsFiles => new[]
     {
         Path.Combine(Service, "settings.json"),

@@ -7,7 +7,7 @@ namespace Minecraft;
 
 public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
 {
-    private const int PacketVersion = 2;
+    private const int ProtocolVersion = 2;
     private const int SpeakingThreshold = 300;
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan SpeakingHold = TimeSpan.FromMilliseconds(250);
@@ -32,8 +32,6 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     private string _selfPeerId = "";
     private string _inputDeviceId = "";
     private string _outputDeviceId = "";
-    private int _inputDeviceIndex;
-    private int _outputDeviceIndex;
     private int _nextSequence;
     private bool _isJoined;
     private bool _isMuted;
@@ -196,8 +194,6 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             var output = _deviceManager.FindById(outputDevices, _outputDeviceId) ??
                          (outputDevices.Count > 0 ? outputDevices[0] : null) ??
                          throw new InvalidOperationException("No speaker available.");
-            _inputDeviceIndex = input.WaveInDeviceIndex;
-            _outputDeviceIndex = output.WaveOutDeviceIndex;
             _inputDeviceId = input.Id;
             _outputDeviceId = output.Id;
 
@@ -206,7 +202,10 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _nextSequence = 0;
             _captureStarted = false;
             _isPttActive = false;
-            _playback = new VoicePlayback(_receiver, _outputDeviceIndex, _outputVolume);
+            _playback = new VoicePlayback(
+                _receiver,
+                _deviceManager.OpenOutputDevice(_outputDeviceId),
+                _outputVolume);
             _playback.SpeakingStateChanged += OnSpeakingStateChanged;
             _playback.SetDeafened(_isDeafened);
             foreach (var pair in _peerVolumes) _playback.SetPeerVolume(pair.Key, pair.Value);
@@ -300,7 +299,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             {
                 _capture = new VoiceCapture();
                 _capture.FrameCaptured += OnFrameCaptured;
-                _capture.Start(_inputDeviceIndex);
+                _capture.Start(_deviceManager.OpenInputDevice(_inputDeviceId));
                 _captureStarted = true;
                 _logger.Info("Voice capture started.");
             }
@@ -458,7 +457,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         if (payload.Length > ushort.MaxValue) payload = payload.Take(ushort.MaxValue).ToArray();
 
         var packet = new byte[2 + sizeof(ushort) + peerBytes.Length + sizeof(int) + sizeof(ushort) + payload.Length];
-        packet[0] = PacketVersion;
+        packet[0] = ProtocolVersion;
         packet[1] = (byte)type;
         var offset = 2;
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(offset, sizeof(ushort)), (ushort)peerBytes.Length);
@@ -484,7 +483,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         peerId = "";
         sequence = 0;
         payload = Array.Empty<byte>();
-        if (packet.Length < 2 + sizeof(ushort) + sizeof(int) + sizeof(ushort) || packet[0] != PacketVersion) return false;
+        if (packet.Length < 2 + sizeof(ushort) + sizeof(int) + sizeof(ushort) || packet[0] != ProtocolVersion) return false;
         type = (VoicePacketType)packet[1];
         if (type is not (VoicePacketType.Hello or VoicePacketType.Ack or VoicePacketType.Audio)) return false;
 
@@ -528,6 +527,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         await LeaveAsync().ConfigureAwait(false);
         await _transport.DisposeAsync().ConfigureAwait(false);
         _capture?.Dispose();
+        _deviceManager.Dispose();
         _encoder.Dispose();
         _receiver.Reset();
         GC.SuppressFinalize(this);

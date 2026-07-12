@@ -18,7 +18,9 @@ public sealed class UpdateService
     public const string ExecutableAssetName = "Minecraft.exe";
     public const string ManifestAssetName = "update.json";
     public const string DeltaPatchAssetName = "Minecraft.bsdiff";
-    public const string DeltaPatchAlgorithm = "bsdiff-v1";
+    public const int ManifestSchemaVersion = 2;
+    public const string DeltaPatchAlgorithm = "bsdiff";
+    public const int DeltaPatchAlgorithmVersion = 1;
 
     private static readonly Uri LatestReleaseApiUri = new($"https://api.github.com/repos/{RepositoryOwner}/{RepositoryName}/releases/tags/{ReleaseTag}");
     private readonly AppPaths _paths;
@@ -52,7 +54,7 @@ public sealed class UpdateService
     }
 
     public static string CurrentCommitSha => ResolveCurrentCommitSha();
-    public static string CurrentCommitShortSha => ShortSha(CurrentCommitSha);
+    public static int CurrentReleaseNumber => ResolveCurrentReleaseNumber();
 
     public PreparedUpdate? TryGetPreparedUpdate()
     {
@@ -433,6 +435,11 @@ public sealed class UpdateService
             return UpdateCheckResult.UpToDate("Manifest commit SHA is empty.");
         }
 
+        if (manifest.ReleaseNumber < 1)
+        {
+            throw new InvalidOperationException("Update manifest contains an invalid release number.");
+        }
+
         if (string.IsNullOrWhiteSpace(currentCommitSha))
         {
             return UpdateCheckResult.UpToDate("Current build has no embedded commit SHA.");
@@ -450,7 +457,7 @@ public sealed class UpdateService
 
     public static void ValidateManifest(UpdateManifest manifest)
     {
-        if (manifest.SchemaVersion is < 0 or > 2)
+        if (manifest.SchemaVersion != ManifestSchemaVersion)
         {
             throw new InvalidOperationException("Update manifest schema is not supported.");
         }
@@ -458,6 +465,11 @@ public sealed class UpdateService
         if (string.IsNullOrWhiteSpace(manifest.CommitSha))
         {
             throw new InvalidOperationException("Update manifest is missing commit SHA.");
+        }
+
+        if (manifest.ReleaseNumber < 1)
+        {
+            throw new InvalidOperationException("Update manifest contains an invalid release number.");
         }
 
         if (!string.Equals(manifest.AssetName, ExecutableAssetName, StringComparison.Ordinal))
@@ -487,6 +499,10 @@ public sealed class UpdateService
         if (!string.Equals(delta.Algorithm, DeltaPatchAlgorithm, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("Update manifest contains an unsupported delta algorithm.");
+        }
+        if (delta.AlgorithmVersion != DeltaPatchAlgorithmVersion)
+        {
+            throw new InvalidOperationException("Update manifest contains an unsupported delta algorithm version.");
         }
         if (string.IsNullOrWhiteSpace(delta.BaseCommitSha) ||
             string.Equals(NormalizeSha(delta.BaseCommitSha), NormalizeSha(targetCommitSha), StringComparison.OrdinalIgnoreCase))
@@ -689,22 +705,28 @@ public sealed class UpdateService
             : string.Empty;
     }
 
+    private static int ResolveCurrentReleaseNumber()
+    {
+        var value = typeof(UpdateService).Assembly
+            .GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(attribute =>
+                string.Equals(attribute.Key, "ReleaseNumber", StringComparison.OrdinalIgnoreCase))
+            ?.Value;
+        return int.TryParse(value, out var releaseNumber) && releaseNumber > 0 ? releaseNumber : 1;
+    }
+
     private static string NormalizeSha(string? value)
     {
         return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim().ToLowerInvariant();
     }
 
-    private static string ShortSha(string? value)
-    {
-        var normalized = NormalizeSha(value);
-        return normalized.Length <= 7 ? normalized : normalized[..7];
-    }
 }
 
 public sealed class UpdateManifest
 {
     public int SchemaVersion { get; set; }
     public string CommitSha { get; set; } = "";
+    public int ReleaseNumber { get; set; }
     public string Version { get; set; } = "";
     public DateTimeOffset PublishedAtUtc { get; set; }
     public string AssetName { get; set; } = UpdateService.ExecutableAssetName;
@@ -716,6 +738,7 @@ public sealed class UpdateManifest
 public sealed class DeltaPatchManifest
 {
     public string Algorithm { get; set; } = UpdateService.DeltaPatchAlgorithm;
+    public int AlgorithmVersion { get; set; }
     public string BaseCommitSha { get; set; } = "";
     public string BaseSha256 { get; set; } = "";
     public string AssetName { get; set; } = UpdateService.DeltaPatchAssetName;
