@@ -130,13 +130,13 @@ jobs:
             dotnet run `
               --project Program\Patch\DeltaPatchTool.csproj `
               -c Release `
-              --no-restore `
               -- create $env:PREVIOUS_EXE $exe $patch
             if ($LASTEXITCODE -ne 0) { throw "Delta patch generation failed." }
 
             dotnet run `
               --project Program\Patch\DeltaPatchTool.csproj `
               -c Release `
+              --no-build `
               --no-restore `
               -- apply $env:PREVIOUS_EXE $patch $roundTrip
             if ($LASTEXITCODE -ne 0) { throw "Delta patch roundtrip failed." }
