@@ -103,6 +103,8 @@ public static class LogCleanupService
         foreach (var fileName in new[]
                  {
                      $"{UpdateService.ExecutableAssetName}.download",
+                     $"{UpdateService.DeltaPatchAssetName}.download",
+                     $"{UpdateService.ExecutableAssetName}.new",
                      "apply-update.ps1",
                      $"{UpdateService.ExecutableAssetName}.bak",
                      "update.log"

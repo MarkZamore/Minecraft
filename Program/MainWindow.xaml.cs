@@ -1968,10 +1968,13 @@ public partial class MainWindow : Window
                 RefreshUi();
             });
 
-            var progress = new Progress<double>(value =>
+            var progress = new Progress<UpdatePreparationProgress>(value =>
             {
-                UpdateProgressBar.IsIndeterminate = false;
-                UpdateProgressBar.Value = Math.Clamp(value * 100d, 0d, 100d);
+                UpdateProgressBar.IsIndeterminate = value.Fraction is null;
+                if (value.Fraction is not null)
+                {
+                    UpdateProgressBar.Value = Math.Clamp(value.Fraction.Value * 100d, 0d, 100d);
+                }
             });
             prepared = await _updateService.DownloadUpdateAsync(result, progress, token);
             token.ThrowIfCancellationRequested();

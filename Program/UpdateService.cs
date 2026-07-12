@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using BsDiff;
 
 namespace Minecraft;
 
@@ -16,12 +17,15 @@ public sealed class UpdateService
     public const string ReleaseTag = "latest";
     public const string ExecutableAssetName = "Minecraft.exe";
     public const string ManifestAssetName = "update.json";
+    public const string DeltaPatchAssetName = "Minecraft.bsdiff";
+    public const string DeltaPatchAlgorithm = "bsdiff-v1";
 
     private static readonly Uri LatestReleaseApiUri = new($"https://api.github.com/repos/{RepositoryOwner}/{RepositoryName}/releases/tags/{ReleaseTag}");
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly HttpClient _httpClient;
     private readonly string _currentCommitSha;
+    private readonly string? _currentExecutablePath;
     private readonly TimeSpan _checkTimeout;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -34,13 +38,17 @@ public sealed class UpdateService
         Logger logger,
         HttpClient? httpClient = null,
         string? currentCommitSha = null,
-        TimeSpan? checkTimeout = null)
+        TimeSpan? checkTimeout = null,
+        string? currentExecutablePath = null)
     {
         _paths = paths;
         _logger = logger;
         _httpClient = httpClient ?? PortableHttpClient.Shared;
         _currentCommitSha = string.IsNullOrWhiteSpace(currentCommitSha) ? CurrentCommitSha : NormalizeSha(currentCommitSha);
         _checkTimeout = checkTimeout ?? TimeSpan.FromSeconds(5);
+        _currentExecutablePath = string.IsNullOrWhiteSpace(currentExecutablePath)
+            ? null
+            : Path.GetFullPath(currentExecutablePath);
     }
 
     public static string CurrentCommitSha => ResolveCurrentCommitSha();
@@ -115,7 +123,33 @@ public sealed class UpdateService
                 return evaluation;
             }
 
-            return UpdateCheckResult.Available(manifest, executableAsset.BrowserDownloadUrl);
+            Uri? deltaPatchDownloadUrl = null;
+            if (manifest.DeltaPatch is not null &&
+                string.Equals(NormalizeSha(manifest.DeltaPatch.BaseCommitSha), _currentCommitSha, StringComparison.OrdinalIgnoreCase))
+            {
+                var deltaAsset = release.FindAsset(manifest.DeltaPatch.AssetName);
+                if (deltaAsset is null)
+                {
+                    _logger.Warn("Delta patch asset is missing; the full update will be downloaded.");
+                }
+                else if (deltaAsset.Size > 0 && deltaAsset.Size != manifest.DeltaPatch.SizeBytes)
+                {
+                    _logger.Warn("Delta patch asset size does not match the manifest; the full update will be downloaded.");
+                }
+                else if (await CurrentExecutableMatchesBaseAsync(manifest.DeltaPatch, token).ConfigureAwait(false))
+                {
+                    deltaPatchDownloadUrl = deltaAsset.BrowserDownloadUrl;
+                }
+                else
+                {
+                    _logger.Info("The current executable does not match the delta base; the full update will be downloaded.");
+                }
+            }
+
+            return UpdateCheckResult.Available(
+                manifest,
+                executableAsset.BrowserDownloadUrl,
+                deltaPatchDownloadUrl);
         }
         catch (Exception ex)
         {
@@ -124,7 +158,10 @@ public sealed class UpdateService
         }
     }
 
-    public async Task<PreparedUpdate> DownloadUpdateAsync(UpdateCheckResult update, IProgress<double>? progress, CancellationToken token)
+    public async Task<PreparedUpdate> DownloadUpdateAsync(
+        UpdateCheckResult update,
+        IProgress<UpdatePreparationProgress>? progress,
+        CancellationToken token)
     {
         if (!update.IsUpdateAvailable || update.Manifest is null || update.ExecutableDownloadUrl is null)
         {
@@ -133,48 +170,226 @@ public sealed class UpdateService
 
         ValidateGitHubDownloadUri(update.ExecutableDownloadUrl);
         ValidateManifest(update.Manifest);
+
+        if (update.DeltaPatchDownloadUrl is not null && update.Manifest.DeltaPatch is not null)
+        {
+            try
+            {
+                return await DownloadAndApplyDeltaAsync(
+                    update.Manifest,
+                    update.Manifest.DeltaPatch,
+                    update.DeltaPatchDownloadUrl,
+                    progress,
+                    token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"Delta update failed; downloading the full executable instead: {ex.Message}");
+                CleanupDeltaArtifacts(GetUpdatesDirectory(create: false));
+            }
+        }
+
+        return await DownloadFullUpdateAsync(
+            update.Manifest,
+            update.ExecutableDownloadUrl,
+            progress,
+            token).ConfigureAwait(false);
+    }
+
+    private async Task<PreparedUpdate> DownloadAndApplyDeltaAsync(
+        UpdateManifest manifest,
+        DeltaPatchManifest delta,
+        Uri downloadUri,
+        IProgress<UpdatePreparationProgress>? progress,
+        CancellationToken token)
+    {
+        ValidateGitHubDownloadUri(downloadUri);
+        var updatesDir = GetUpdatesDirectory(create: true);
+        var patchPath = Path.Combine(updatesDir, $"{DeltaPatchAssetName}.download");
+        var reconstructedPath = Path.Combine(updatesDir, $"{ExecutableAssetName}.new");
+        CleanupDeltaArtifacts(updatesDir);
+
+        try
+        {
+            await DownloadFileAsync(
+                downloadUri,
+                patchPath,
+                delta.SizeBytes,
+                delta.Sha256,
+                "delta patch",
+                progress,
+                token).ConfigureAwait(false);
+
+            token.ThrowIfCancellationRequested();
+            progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.ApplyingDelta, null));
+            var currentExe = GetCurrentExecutablePath();
+            await Task.Run(
+                () => ApplyDeltaPatch(currentExe, patchPath, reconstructedPath, delta.BaseSha256),
+                token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+
+            ValidateDownloadedFile(reconstructedPath, manifest);
+            var readyPath = StorePreparedUpdate(reconstructedPath, manifest, updatesDir);
+            DeleteFileIfExists(patchPath);
+            progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.Ready, 1d));
+            return new PreparedUpdate(manifest, readyPath);
+        }
+        catch
+        {
+            DeleteFileIfExists(patchPath);
+            DeleteFileIfExists(reconstructedPath);
+            throw;
+        }
+    }
+
+    private async Task<PreparedUpdate> DownloadFullUpdateAsync(
+        UpdateManifest manifest,
+        Uri downloadUri,
+        IProgress<UpdatePreparationProgress>? progress,
+        CancellationToken token)
+    {
+        ValidateGitHubDownloadUri(downloadUri);
         var updatesDir = GetUpdatesDirectory(create: true);
         var downloadPath = Path.Combine(updatesDir, $"{ExecutableAssetName}.download");
         DeleteFileIfExists(downloadPath);
         try
         {
-            using var response = await _httpClient.GetAsync(update.ExecutableDownloadUrl, HttpCompletionOption.ResponseHeadersRead, token);
-            response.EnsureSuccessStatusCode();
+            await DownloadFileAsync(
+                downloadUri,
+                downloadPath,
+                manifest.SizeBytes,
+                manifest.Sha256,
+                "update",
+                progress,
+                token).ConfigureAwait(false);
 
-            var expectedSize = update.Manifest.SizeBytes;
-            var contentLength = response.Content.Headers.ContentLength;
-            if (contentLength.HasValue && contentLength.Value != expectedSize)
-            {
-                throw new InvalidOperationException("Downloaded update size does not match manifest.");
-            }
-
-            progress?.Report(0d);
-            await using (var input = await response.Content.ReadAsStreamAsync(token))
-            await using (var output = new FileStream(
-                             downloadPath,
-                             FileMode.CreateNew,
-                             FileAccess.Write,
-                             FileShare.None,
-                             1024 * 1024,
-                             FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough))
-            {
-                await CopyWithProgressAsync(input, output, expectedSize, progress, token);
-                await output.FlushAsync(token);
-                output.Flush(flushToDisk: true);
-            }
-
-            ValidateDownloadedFile(downloadPath, update.Manifest);
-            var readyPath = Path.Combine(updatesDir, ExecutableAssetName);
-            File.Move(downloadPath, readyPath, overwrite: true);
-
-            var manifestPath = Path.Combine(updatesDir, ManifestAssetName);
-            AtomicFile.WriteAllText(manifestPath, JsonSerializer.Serialize(update.Manifest, _jsonOptions));
-            return new PreparedUpdate(update.Manifest, readyPath);
+            ValidateDownloadedFile(downloadPath, manifest);
+            var readyPath = StorePreparedUpdate(downloadPath, manifest, updatesDir);
+            progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.Ready, 1d));
+            return new PreparedUpdate(manifest, readyPath);
         }
         catch
         {
             DeleteFileIfExists(downloadPath);
             throw;
+        }
+    }
+
+    private async Task DownloadFileAsync(
+        Uri downloadUri,
+        string destinationPath,
+        long expectedSize,
+        string expectedSha256,
+        string description,
+        IProgress<UpdatePreparationProgress>? progress,
+        CancellationToken token)
+    {
+        DeleteFileIfExists(destinationPath);
+        using var response = await _httpClient.GetAsync(downloadUri, HttpCompletionOption.ResponseHeadersRead, token)
+            .ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+
+        var contentLength = response.Content.Headers.ContentLength;
+        if (contentLength.HasValue && contentLength.Value != expectedSize)
+        {
+            throw new InvalidOperationException($"Downloaded {description} size does not match the manifest.");
+        }
+
+        progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.Downloading, 0d));
+        await using (var input = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false))
+        await using (var output = new FileStream(
+                         destinationPath,
+                         FileMode.CreateNew,
+                         FileAccess.Write,
+                         FileShare.None,
+                         1024 * 1024,
+                         FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough))
+        {
+            await CopyWithProgressAsync(input, output, expectedSize, progress, token).ConfigureAwait(false);
+            await output.FlushAsync(token).ConfigureAwait(false);
+            output.Flush(flushToDisk: true);
+        }
+
+        ValidateFile(destinationPath, expectedSize, expectedSha256, description);
+    }
+
+    private string StorePreparedUpdate(string sourcePath, UpdateManifest manifest, string updatesDir)
+    {
+        var readyPath = Path.Combine(updatesDir, ExecutableAssetName);
+        File.Move(sourcePath, readyPath, overwrite: true);
+        var manifestPath = Path.Combine(updatesDir, ManifestAssetName);
+        AtomicFile.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, _jsonOptions));
+        return readyPath;
+    }
+
+    private static void ApplyDeltaPatch(
+        string currentExecutablePath,
+        string patchPath,
+        string outputPath,
+        string expectedBaseSha256)
+    {
+        var actualBaseSha256 = HashFile(currentExecutablePath);
+        if (!string.Equals(actualBaseSha256, expectedBaseSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("The current executable changed before the delta patch was applied.");
+        }
+
+        DeleteFileIfExists(outputPath);
+        using var oldFile = new FileStream(
+            currentExecutablePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            1024 * 1024,
+            FileOptions.SequentialScan);
+        using var output = new FileStream(
+            outputPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            1024 * 1024,
+            FileOptions.SequentialScan | FileOptions.WriteThrough);
+        BinaryPatch.Apply(oldFile, () => File.OpenRead(patchPath), output);
+        output.Flush(flushToDisk: true);
+    }
+
+    private static void CleanupDeltaArtifacts(string updatesDir)
+    {
+        if (string.IsNullOrWhiteSpace(updatesDir)) return;
+        DeleteFileIfExists(Path.Combine(updatesDir, $"{DeltaPatchAssetName}.download"));
+        DeleteFileIfExists(Path.Combine(updatesDir, $"{ExecutableAssetName}.new"));
+    }
+
+    private string GetCurrentExecutablePath()
+    {
+        var path = _currentExecutablePath ?? Environment.ProcessPath ?? Path.Combine(_paths.Root, ExecutableAssetName);
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException("The current executable was not found.", path);
+        }
+        return path;
+    }
+
+    private async Task<bool> CurrentExecutableMatchesBaseAsync(DeltaPatchManifest delta, CancellationToken token)
+    {
+        try
+        {
+            var currentExe = GetCurrentExecutablePath();
+            var actualSha = await Task.Run(() => HashFile(currentExe), token).ConfigureAwait(false);
+            return string.Equals(actualSha, delta.BaseSha256, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"The current executable could not be checked for a delta update: {ex.Message}");
+            return false;
         }
     }
 
@@ -230,33 +445,16 @@ public sealed class UpdateService
 
     public static void ValidateDownloadedFile(string path, UpdateManifest manifest)
     {
-        var file = new FileInfo(path);
-        if (!file.Exists)
-        {
-            throw new FileNotFoundException("Downloaded update was not found.", path);
-        }
-
-        if (manifest.SizeBytes > 0 && file.Length != manifest.SizeBytes)
-        {
-            throw new InvalidOperationException("Downloaded update size does not match manifest.");
-        }
-
-        var expectedSha = manifest.Sha256?.Trim() ?? "";
-        if (expectedSha.Length == 0)
-        {
-            throw new InvalidOperationException("Update manifest is missing SHA-256.");
-        }
-
-        using var stream = File.OpenRead(path);
-        var actualSha = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
-        if (!string.Equals(actualSha, expectedSha, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException("Downloaded update SHA-256 does not match manifest.");
-        }
+        ValidateFile(path, manifest.SizeBytes, manifest.Sha256, "update");
     }
 
     public static void ValidateManifest(UpdateManifest manifest)
     {
+        if (manifest.SchemaVersion is < 0 or > 2)
+        {
+            throw new InvalidOperationException("Update manifest schema is not supported.");
+        }
+
         if (string.IsNullOrWhiteSpace(manifest.CommitSha))
         {
             throw new InvalidOperationException("Update manifest is missing commit SHA.");
@@ -277,6 +475,74 @@ public sealed class UpdateService
         {
             throw new InvalidOperationException("Update manifest contains an invalid SHA-256.");
         }
+
+        if (manifest.DeltaPatch is not null)
+        {
+            ValidateDeltaPatchManifest(manifest.DeltaPatch, manifest.CommitSha);
+        }
+    }
+
+    private static void ValidateDeltaPatchManifest(DeltaPatchManifest delta, string targetCommitSha)
+    {
+        if (!string.Equals(delta.Algorithm, DeltaPatchAlgorithm, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Update manifest contains an unsupported delta algorithm.");
+        }
+        if (string.IsNullOrWhiteSpace(delta.BaseCommitSha) ||
+            string.Equals(NormalizeSha(delta.BaseCommitSha), NormalizeSha(targetCommitSha), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Update manifest contains an invalid delta base commit.");
+        }
+        if (!string.Equals(delta.AssetName, DeltaPatchAssetName, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Update manifest contains an unexpected delta asset name.");
+        }
+        if (delta.SizeBytes <= 0)
+        {
+            throw new InvalidOperationException("Update manifest contains an invalid delta size.");
+        }
+        ValidateSha256(delta.BaseSha256, "delta base");
+        ValidateSha256(delta.Sha256, "delta patch");
+    }
+
+    private static void ValidateSha256(string? value, string description)
+    {
+        var sha256 = value?.Trim() ?? string.Empty;
+        if (sha256.Length != 64 || sha256.Any(character => !Uri.IsHexDigit(character)))
+        {
+            throw new InvalidOperationException($"Update manifest contains an invalid {description} SHA-256.");
+        }
+    }
+
+    private static void ValidateFile(string path, long expectedSize, string expectedSha256, string description)
+    {
+        var file = new FileInfo(path);
+        if (!file.Exists)
+        {
+            throw new FileNotFoundException($"Downloaded {description} was not found.", path);
+        }
+        if (expectedSize <= 0 || file.Length != expectedSize)
+        {
+            throw new InvalidOperationException($"Downloaded {description} size does not match the manifest.");
+        }
+
+        var actualSha = HashFile(path);
+        if (!string.Equals(actualSha, expectedSha256?.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"Downloaded {description} SHA-256 does not match the manifest.");
+        }
+    }
+
+    private static string HashFile(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            1024 * 1024,
+            FileOptions.SequentialScan);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 
     private async Task<GitHubRelease> GetLatestReleaseAsync(CancellationToken token)
@@ -296,7 +562,12 @@ public sealed class UpdateService
                throw new InvalidOperationException("Update manifest was empty.");
     }
 
-    private static async Task CopyWithProgressAsync(Stream input, Stream output, long expectedSize, IProgress<double>? progress, CancellationToken token)
+    private static async Task CopyWithProgressAsync(
+        Stream input,
+        Stream output,
+        long expectedSize,
+        IProgress<UpdatePreparationProgress>? progress,
+        CancellationToken token)
     {
         var buffer = new byte[1024 * 1024];
         long total = 0;
@@ -308,11 +579,13 @@ public sealed class UpdateService
             total += read;
             if (expectedSize > 0)
             {
-                progress?.Report(Math.Clamp(total / (double)expectedSize, 0d, 1d));
+                progress?.Report(new UpdatePreparationProgress(
+                    UpdatePreparationStage.Downloading,
+                    Math.Clamp(total / (double)expectedSize, 0d, 1d)));
             }
         }
 
-        progress?.Report(1d);
+        progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.Downloading, 1d));
     }
 
     private static void ValidateGitHubDownloadUri(Uri uri)
@@ -430,34 +703,65 @@ public sealed class UpdateService
 
 public sealed class UpdateManifest
 {
+    public int SchemaVersion { get; set; }
     public string CommitSha { get; set; } = "";
     public string Version { get; set; } = "";
     public DateTimeOffset PublishedAtUtc { get; set; }
     public string AssetName { get; set; } = UpdateService.ExecutableAssetName;
     public string Sha256 { get; set; } = "";
     public long SizeBytes { get; set; }
+    public DeltaPatchManifest? DeltaPatch { get; set; }
 }
+
+public sealed class DeltaPatchManifest
+{
+    public string Algorithm { get; set; } = UpdateService.DeltaPatchAlgorithm;
+    public string BaseCommitSha { get; set; } = "";
+    public string BaseSha256 { get; set; } = "";
+    public string AssetName { get; set; } = UpdateService.DeltaPatchAssetName;
+    public string Sha256 { get; set; } = "";
+    public long SizeBytes { get; set; }
+}
+
+public enum UpdatePreparationStage
+{
+    Downloading,
+    ApplyingDelta,
+    Ready
+}
+
+public sealed record UpdatePreparationProgress(UpdatePreparationStage Stage, double? Fraction);
 
 public sealed record PreparedUpdate(UpdateManifest Manifest, string ExecutablePath);
 
 public sealed class UpdateCheckResult
 {
-    private UpdateCheckResult(bool isUpdateAvailable, UpdateManifest? manifest, Uri? executableDownloadUrl, string message)
+    private UpdateCheckResult(
+        bool isUpdateAvailable,
+        UpdateManifest? manifest,
+        Uri? executableDownloadUrl,
+        Uri? deltaPatchDownloadUrl,
+        string message)
     {
         IsUpdateAvailable = isUpdateAvailable;
         Manifest = manifest;
         ExecutableDownloadUrl = executableDownloadUrl;
+        DeltaPatchDownloadUrl = deltaPatchDownloadUrl;
         Message = message;
     }
 
     public bool IsUpdateAvailable { get; }
     public UpdateManifest? Manifest { get; }
     public Uri? ExecutableDownloadUrl { get; }
+    public Uri? DeltaPatchDownloadUrl { get; }
     public string Message { get; }
 
-    public static UpdateCheckResult UpToDate(string message = "") => new(false, null, null, message);
+    public static UpdateCheckResult UpToDate(string message = "") => new(false, null, null, null, message);
 
-    public static UpdateCheckResult Available(UpdateManifest manifest, Uri? executableDownloadUrl) => new(true, manifest, executableDownloadUrl, "");
+    public static UpdateCheckResult Available(
+        UpdateManifest manifest,
+        Uri? executableDownloadUrl,
+        Uri? deltaPatchDownloadUrl = null) => new(true, manifest, executableDownloadUrl, deltaPatchDownloadUrl, "");
 }
 
 public sealed class GitHubRelease

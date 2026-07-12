@@ -16,6 +16,25 @@ $buildRoots = @(
     (Join-Path $projectRoot "Minecraft\Personal\Build")
 )
 
+function Remove-BuildRoot([string]$buildRoot, [bool]$throwOnFailure) {
+    $lastCleanupError = $null
+    for ($attempt = 0; $attempt -lt 5 -and (Test-Path -LiteralPath $buildRoot -PathType Container); $attempt++) {
+        try {
+            Remove-Item -LiteralPath ('\\?\' + [System.IO.Path]::GetFullPath($buildRoot)) -Recurse -Force -ErrorAction Stop
+            $lastCleanupError = $null
+        } catch {
+            $lastCleanupError = $_
+        }
+        if (Test-Path -LiteralPath $buildRoot -PathType Container) {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    if ($throwOnFailure -and (Test-Path -LiteralPath $buildRoot -PathType Container)) {
+        $detail = if ($lastCleanupError) { $lastCleanupError.Exception.Message } else { "The directory was recreated after cleanup." }
+        throw "Build output could not be removed: $buildRoot. $detail"
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($PublishDir)) {
     $PublishDir = $projectRoot
 } elseif (-not [System.IO.Path]::IsPathRooted($PublishDir)) {
@@ -50,13 +69,10 @@ try {
     }
 } finally {
     & dotnet build-server shutdown | Out-Null
-    Start-Sleep -Seconds 1
-    foreach ($buildRoot in $buildRoots) {
-        for ($attempt = 0; $attempt -lt 5 -and (Test-Path -LiteralPath $buildRoot -PathType Container); $attempt++) {
-            Remove-Item -LiteralPath ('\\?\' + [System.IO.Path]::GetFullPath($buildRoot)) -Recurse -Force
-            if (Test-Path -LiteralPath $buildRoot -PathType Container) {
-                Start-Sleep -Milliseconds 500
-            }
+    for ($cleanupPass = 0; $cleanupPass -lt 3; $cleanupPass++) {
+        Start-Sleep -Seconds 1
+        foreach ($buildRoot in $buildRoots) {
+            Remove-BuildRoot $buildRoot ($cleanupPass -eq 2)
         }
     }
 }

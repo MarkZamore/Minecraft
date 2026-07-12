@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: minecraft-latest-release
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -27,11 +31,61 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Capture previous release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          "HAS_PREVIOUS=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          gh release view latest --json tagName *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No previous latest release is available; a full-only release will be created."
+            exit 0
+          }
+
+          $previousDir = Join-Path $env:RUNNER_TEMP 'minecraft-previous-release'
+          New-Item -ItemType Directory -Path $previousDir -Force | Out-Null
+          gh release download latest `
+            --pattern 'Minecraft.exe' `
+            --pattern 'update.json' `
+            --dir $previousDir `
+            --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Previous release assets could not be downloaded." }
+
+          $previousExe = Join-Path $previousDir 'Minecraft.exe'
+          $previousManifestPath = Join-Path $previousDir 'update.json'
+          if (-not (Test-Path -LiteralPath $previousExe -PathType Leaf) -or
+              -not (Test-Path -LiteralPath $previousManifestPath -PathType Leaf)) {
+            throw "Previous latest release is incomplete."
+          }
+
+          $manifest = Get-Content -LiteralPath $previousManifestPath -Raw | ConvertFrom-Json
+          $commit = [string]$manifest.commitSha
+          $expectedSha = ([string]$manifest.sha256).ToLowerInvariant()
+          $expectedSize = [long]$manifest.sizeBytes
+          if ($commit -notmatch '^[0-9a-fA-F]{40}$' -or $expectedSha -notmatch '^[0-9a-f]{64}$' -or $expectedSize -le 0) {
+            throw "Previous update manifest is invalid."
+          }
+          $file = Get-Item -LiteralPath $previousExe
+          $actualSha = (Get-FileHash -LiteralPath $previousExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($file.Length -ne $expectedSize -or $actualSha -ne $expectedSha) {
+            throw "Previous Minecraft.exe does not match its update manifest."
+          }
+
+          "HAS_PREVIOUS=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_EXE=$previousExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_COMMIT=$($commit.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_SHA256=$expectedSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Restore
-        run: dotnet restore Program\Minecraft.csproj -r win-x64 -p:Configuration=Release
+        run: |
+          dotnet restore Program\Minecraft.csproj -r win-x64 -p:Configuration=Release
+          dotnet restore Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj -p:Configuration=Release
 
       - name: Audit dependencies
-        run: dotnet list Program\Minecraft.csproj package --vulnerable --include-transitive
+        run: |
+          dotnet list Program\Minecraft.csproj package --vulnerable --include-transitive
+          dotnet list Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj package --vulnerable --include-transitive
 
       - name: Publish
         shell: pwsh
@@ -41,35 +95,88 @@ jobs:
           -PublishDir "${{ github.workspace }}\artifacts"
           -NoRestore
 
-      - name: Create update manifest
+      - name: Create delta and update manifest
         shell: pwsh
         run: |
-          $exe = Join-Path $env:GITHUB_WORKSPACE 'artifacts\Minecraft.exe'
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $exe = Join-Path $artifactDir 'Minecraft.exe'
           if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
             throw "Published Minecraft.exe was not found: $exe"
           }
 
           $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           $size = (Get-Item -LiteralPath $exe).Length
+          $deltaManifest = $null
+
+          if ($env:HAS_PREVIOUS -eq 'true' -and $env:PREVIOUS_COMMIT -ne '${{ github.sha }}') {
+            $patch = Join-Path $artifactDir 'Minecraft.bsdiff'
+            $roundTrip = Join-Path $env:RUNNER_TEMP 'Minecraft.delta-roundtrip.exe'
+            dotnet run `
+              --project Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj `
+              -c Release `
+              --no-restore `
+              -- create $env:PREVIOUS_EXE $exe $patch
+            if ($LASTEXITCODE -ne 0) { throw "Delta patch generation failed." }
+
+            dotnet run `
+              --project Program\BuildTools\DeltaPatch\DeltaPatchTool.csproj `
+              -c Release `
+              --no-restore `
+              -- apply $env:PREVIOUS_EXE $patch $roundTrip
+            if ($LASTEXITCODE -ne 0) { throw "Delta patch roundtrip failed." }
+
+            $roundTripHash = (Get-FileHash -LiteralPath $roundTrip -Algorithm SHA256).Hash.ToLowerInvariant()
+            $roundTripSize = (Get-Item -LiteralPath $roundTrip).Length
+            Remove-Item -LiteralPath $roundTrip -Force
+            if ($roundTripHash -ne $hash -or $roundTripSize -ne $size) {
+              throw "Delta patch roundtrip does not reproduce the published executable."
+            }
+
+            $patchHash = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
+            $patchSize = (Get-Item -LiteralPath $patch).Length
+            $deltaManifest = [ordered]@{
+              algorithm = 'bsdiff-v1'
+              baseCommitSha = $env:PREVIOUS_COMMIT
+              baseSha256 = $env:PREVIOUS_SHA256
+              assetName = 'Minecraft.bsdiff'
+              sha256 = $patchHash
+              sizeBytes = $patchSize
+            }
+          }
+
           $manifest = [ordered]@{
+            schemaVersion = 2
             commitSha = '${{ github.sha }}'
             version = '1.0.0'
             publishedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
             assetName = 'Minecraft.exe'
             sha256 = $hash
             sizeBytes = $size
+            deltaPatch = $deltaManifest
           }
-          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts\update.json') -Encoding UTF8
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $artifactDir 'update.json') -Encoding UTF8
 
       - name: Verify release contents
         shell: pwsh
         run: |
-          $files = Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'artifacts') -File
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $files = Get-ChildItem -LiteralPath $artifactDir -File
           $expected = @('Minecraft.exe', 'update.json')
+          if (Test-Path -LiteralPath (Join-Path $artifactDir 'Minecraft.bsdiff')) {
+            $expected += 'Minecraft.bsdiff'
+          }
           $unexpected = $files.Name | Where-Object { $_ -notin $expected }
           $missing = $expected | Where-Object { $_ -notin $files.Name }
-          if ($unexpected -or $missing -or $files.Count -ne 2) {
-            throw "Release must contain only Minecraft.exe and update.json. Missing: $missing; unexpected: $unexpected"
+          if ($unexpected -or $missing -or $files.Count -ne $expected.Count) {
+            throw "Release contents are invalid. Missing: $missing; unexpected: $unexpected"
+          }
+
+          $manifest = Get-Content -LiteralPath (Join-Path $artifactDir 'update.json') -Raw | ConvertFrom-Json
+          if ($manifest.schemaVersion -ne 2 -or $manifest.assetName -ne 'Minecraft.exe') {
+            throw "Update manifest v2 is invalid."
+          }
+          if ($manifest.deltaPatch -and -not (Test-Path -LiteralPath (Join-Path $artifactDir $manifest.deltaPatch.assetName))) {
+            throw "Delta manifest references a missing patch asset."
           }
 
       - name: Publish latest release
@@ -77,14 +184,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $assets = @(
+            (Join-Path $artifactDir 'Minecraft.exe'),
+            (Join-Path $artifactDir 'update.json')
+          )
+          $patch = Join-Path $artifactDir 'Minecraft.bsdiff'
+          if (Test-Path -LiteralPath $patch) { $assets += $patch }
+
           if (gh release view latest 2>$null) {
             gh release delete latest --cleanup-tag --yes
           } elseif (git ls-remote --exit-code --tags origin refs/tags/latest 2>$null) {
             git push origin --delete latest
           }
           gh release create latest `
-            "$env:GITHUB_WORKSPACE\artifacts\Minecraft.exe" `
-            "$env:GITHUB_WORKSPACE\artifacts\update.json" `
+            @assets `
             --target "${{ github.sha }}" `
             --latest `
             --title "Latest Minecraft.exe" `
