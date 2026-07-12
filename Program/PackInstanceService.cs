@@ -281,8 +281,11 @@ public sealed class PackInstanceService : IDisposable
             Directory.Delete(destination);
         }
 
+        var managedModsDirectory =
+            string.Equals(state.ModsMode, "HardLink", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(state.ModsMode, "Copy", StringComparison.OrdinalIgnoreCase);
         if (Directory.Exists(destination) &&
-            !string.Equals(state.ModsMode, "Copy", StringComparison.OrdinalIgnoreCase) &&
+            !managedModsDirectory &&
             Directory.EnumerateFileSystemEntries(destination).Any())
         {
             var conflictRoot = CreateConflictRoot(state.PackRelativePath);
