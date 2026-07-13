@@ -1,0 +1,20 @@
+{
+  "id": "hamachi",
+  "displayName": "Hamachi",
+  "installerUri": "https://secure.logmein.com/hamachi.msi",
+  "allowedDownloadHosts": [
+    "secure.logmein.com"
+  ],
+  "signerSubjectContains": "GoTo Technologies USA, LLC",
+  "registryDisplayNameContains": [
+    "Hamachi",
+    "LogMeIn"
+  ],
+  "installDirectoryNames": [
+    "LogMeIn Hamachi"
+  ],
+  "executableNames": [
+    "hamachi-2-ui.exe"
+  ],
+  "installerKind": "msi"
+}

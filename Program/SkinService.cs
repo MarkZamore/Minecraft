@@ -147,7 +147,7 @@ public sealed class SkinService : IAsyncDisposable
             uuid,
             peer.SkinSha256.ToUpperInvariant(),
             NormalizeModel(peer.SkinModel),
-            peer.GetCandidateIps().ToArray());
+            peer.GetCandidateAddresses().ToArray());
         var metadataChanged = !_peers.TryGetValue(uuid, out var previousDescriptor) ||
                               previousDescriptor.Sha256 != descriptor.Sha256 ||
                               previousDescriptor.Model != descriptor.Model ||
@@ -222,7 +222,7 @@ public sealed class SkinService : IAsyncDisposable
                 {
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
                     timeout.CancelAfter(TimeSpan.FromSeconds(5));
-                    using var client = new TcpClient();
+                    using var client = new TcpClient(address.AddressFamily);
                     await client.ConnectAsync(address, WorldTransferService.TransferPort, timeout.Token).ConfigureAwait(false);
                     await using var stream = client.GetStream();
                     await PortableProtocol.WriteJsonAsync(stream, new SkinRequest

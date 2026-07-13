@@ -27,6 +27,7 @@ public sealed class WorldTransferService : IAsyncDisposable
     private readonly WorldPlayerProfileService _playerProfiles;
     private readonly WaypointSyncService _waypointSync;
     private readonly SkinService _skinService;
+    private readonly LanRelayService _lanRelay;
     private readonly VoiceNetworkCoordinator _voiceNetwork;
     private readonly WorldTransferRuntimeOptions _runtimeOptions;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
@@ -50,6 +51,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         WorldPlayerProfileService playerProfiles,
         WaypointSyncService waypointSync,
         SkinService skinService,
+        LanRelayService lanRelay,
         VoiceNetworkCoordinator voiceNetwork,
         WorldTransferRuntimeOptions? runtimeOptions = null)
     {
@@ -62,6 +64,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         _playerProfiles = playerProfiles;
         _waypointSync = waypointSync;
         _skinService = skinService;
+        _lanRelay = lanRelay;
         _voiceNetwork = voiceNetwork;
         _runtimeOptions = runtimeOptions ?? new WorldTransferRuntimeOptions();
         _runtimeOptions.Validate();
@@ -229,7 +232,7 @@ public sealed class WorldTransferService : IAsyncDisposable
                     };
 
                     StatusChanged?.Invoke("Sending world archive...");
-                    using var client = new TcpClient();
+                    using var client = new TcpClient(peerAddress.AddressFamily);
                     await client.ConnectAsync(peerAddress, _runtimeOptions.Port, token);
                     await using var stream = client.GetStream();
                     await WriteJsonAsync(stream, header, token);
@@ -320,10 +323,24 @@ public sealed class WorldTransferService : IAsyncDisposable
         TaskCompletionSource ready,
         CancellationToken token)
     {
-        var listener = new TcpListener(_runtimeOptions.ListenAddress, _runtimeOptions.Port);
+        TcpListener? listener = null;
         try
         {
-            listener.Start();
+            var listenAddress = _runtimeOptions.ListenAddress.Equals(IPAddress.Any)
+                ? IPAddress.IPv6Any
+                : _runtimeOptions.ListenAddress;
+            listener = CreateListener(listenAddress, _runtimeOptions.Port);
+            try
+            {
+                listener.Start();
+            }
+            catch (SocketException ex) when (listenAddress.Equals(IPAddress.IPv6Any))
+            {
+                listener.Stop();
+                _logger.Warn($"Dual-stack transfer listener is unavailable; using IPv4: {ex.Message}");
+                listener = CreateListener(IPAddress.Any, _runtimeOptions.Port);
+                listener.Start();
+            }
             ready.TrySetResult();
             while (!token.IsCancellationRequested)
             {
@@ -348,8 +365,18 @@ public sealed class WorldTransferService : IAsyncDisposable
         }
         finally
         {
-            listener.Stop();
+            listener?.Stop();
         }
+    }
+
+    private static TcpListener CreateListener(IPAddress address, int port)
+    {
+        var listener = new TcpListener(address, port);
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            listener.Server.DualMode = true;
+        }
+        return listener;
     }
 
     private async Task HandleIncomingClientAsync(TcpClient client, AppSettings settings, CancellationToken token)
@@ -368,6 +395,11 @@ public sealed class WorldTransferService : IAsyncDisposable
             if (string.Equals(protocol, SkinService.ProtocolName, StringComparison.Ordinal))
             {
                 await _skinService.HandleIncomingAsync(stream, initialFrame, token).ConfigureAwait(false);
+                return;
+            }
+            if (string.Equals(protocol, LanRelayService.ProtocolName, StringComparison.Ordinal))
+            {
+                await _lanRelay.HandleIncomingAsync(stream, initialFrame, token).ConfigureAwait(false);
                 return;
             }
             await ReceiveWorldAsync(stream, settings, initialFrame, token).ConfigureAwait(false);
@@ -589,7 +621,7 @@ public sealed class WorldTransferService : IAsyncDisposable
     private async Task<IPAddress> VerifyPeerTransferReadyAsync(PeerViewModel peer, AppSettings settings, CancellationToken token)
     {
         var identity = _identityService.ResolveContext(settings);
-        var candidateAddresses = peer.GetCandidateIps()
+        var candidateAddresses = peer.GetCandidateAddresses()
             .Select(value => IPAddress.TryParse(value, out var address) ? address : null)
             .Where(address => address is not null)
             .Cast<IPAddress>()
@@ -607,7 +639,7 @@ public sealed class WorldTransferService : IAsyncDisposable
             timeoutCts.CancelAfter(TimeSpan.FromSeconds(4));
             try
             {
-                using var client = new TcpClient();
+                using var client = new TcpClient(ip.AddressFamily);
                 await client.ConnectAsync(ip, _runtimeOptions.Port, timeoutCts.Token);
                 await using var stream = client.GetStream();
                 await WriteJsonAsync(stream, new WorldTransferHeader
@@ -1027,7 +1059,7 @@ public sealed record WorldTransferProgress(bool IsActive, long Current, long Tot
 public sealed class WorldTransferRuntimeOptions
 {
     public int Port { get; init; } = WorldTransferService.TransferPort;
-    public IPAddress ListenAddress { get; init; } = IPAddress.Any;
+    public IPAddress ListenAddress { get; init; } = IPAddress.IPv6Any;
     internal void Validate()
     {
         if (Port is < 1 or > 65535)

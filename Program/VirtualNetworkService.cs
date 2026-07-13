@@ -6,239 +6,251 @@ namespace Minecraft;
 
 public sealed class VirtualNetworkService
 {
-    public IReadOnlyList<NetworkAdapterInfo> GetAdapters(string? preferredAdapterId = null)
+    private readonly NetworkProviderCatalog _providers;
+
+    public VirtualNetworkService(Logger logger)
     {
-        var adapters = new List<NetworkAdapterInfo>();
+        _providers = new NetworkProviderCatalog(logger);
+    }
+
+    public NetworkEnvironmentSnapshot GetSnapshot()
+    {
+        var activeProviders = _providers.GetLatestClientStarts();
+        var endpoints = new List<NetworkEndpointInfo>();
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
-            if (nic.OperationalStatus != OperationalStatus.Up) continue;
-            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+            if (nic.OperationalStatus != OperationalStatus.Up ||
+                nic.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+            {
+                continue;
+            }
 
-            IPInterfaceProperties props;
+            IPInterfaceProperties properties;
             try
             {
-                props = nic.GetIPProperties();
+                properties = nic.GetIPProperties();
             }
             catch (NetworkInformationException)
             {
                 continue;
             }
 
-            var interfaceIndex = 0;
-            try
+            var provider = _providers.MatchAdapter(nic.Name, nic.Description);
+            var isVirtual = provider is not null || IsGenericVirtualInterface(nic);
+            var isPhysical = nic.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211;
+            foreach (var unicast in properties.UnicastAddresses)
             {
-                interfaceIndex = props.GetIPv4Properties()?.Index ?? 0;
-            }
-            catch (NetworkInformationException)
-            {
-                // Some virtual adapters expose IPv4 addresses but no IPv4 properties.
-            }
-            foreach (var address in props.UnicastAddresses)
-            {
-                if (address.Address.AddressFamily != AddressFamily.InterNetwork) continue;
-                var ip = address.Address;
-                var mask = address.IPv4Mask;
-                if (mask is null || !IsUsableIPv4(ip)) continue;
+                var address = unicast.Address;
+                if (!IsUsableAddress(address)) continue;
 
-                var isPreferred = IsPreferredNetwork(nic, ip);
-                adapters.Add(new NetworkAdapterInfo
+                var interfaceIndex = GetInterfaceIndex(properties, address.AddressFamily);
+                if (interfaceIndex <= 0) continue;
+                var prefixLength = Math.Clamp(unicast.PrefixLength, 0, address.AddressFamily == AddressFamily.InterNetwork ? 32 : 128);
+                var hasDefaultRoute = HasDefaultRoute(properties, address.AddressFamily);
+                var providerIsOpen = provider is not null && activeProviders.ContainsKey(provider.Id);
+                var networkType = isVirtual ? "VPN" : isPhysical ? "LAN" : "Unknown";
+                var broadcast = address.AddressFamily == AddressFamily.InterNetwork
+                    ? CalculateBroadcast(address, PrefixToMask(prefixLength)).ToString()
+                    : string.Empty;
+                endpoints.Add(new NetworkEndpointInfo
                 {
-                    Id = nic.Id,
+                    InterfaceId = nic.Id,
                     InterfaceIndex = interfaceIndex,
-                    Name = nic.Name,
+                    InterfaceName = nic.Name,
                     Description = nic.Description,
-                    IPv4 = ip.ToString(),
-                    Mask = mask.ToString(),
-                    Broadcast = CalculateBroadcast(ip, mask).ToString(),
-                    IsPreferredNetwork = isPreferred,
-                    NetworkType = DetectNetworkType(nic, ip),
-                    SortPriority = CalculatePriority(nic, ip, isPreferred, preferredAdapterId)
+                    NetworkAddress = address.ToString(),
+                    PrefixLength = prefixLength,
+                    BroadcastAddress = broadcast,
+                    ProviderId = provider?.Id ?? string.Empty,
+                    IsPreferredNetwork = providerIsOpen,
+                    IsPhysical = isPhysical,
+                    HasDefaultRoute = hasDefaultRoute,
+                    NetworkType = networkType,
+                    SortPriority = providerIsOpen ? 0 : isVirtual ? 20 : hasDefaultRoute && isPhysical ? 30 : isPhysical ? 40 : 50
                 });
             }
         }
 
-        return adapters
-            .OrderBy(a => a.SortPriority)
-            .ThenBy(a => a.Name, StringComparer.CurrentCultureIgnoreCase)
-            .ThenBy(a => a.IPv4, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
+        var primary = SelectPrimaryEndpoint(endpoints, activeProviders);
 
-    public static string DetectNetworkType(NetworkAdapterInfo adapter)
-    {
-        if (IPAddress.TryParse(adapter.IPv4, out var ip))
+        var ordered = endpoints
+            .OrderByDescending(endpoint => primary is not null &&
+                                           endpoint.InterfaceId == primary.InterfaceId &&
+                                           endpoint.NetworkAddress == primary.NetworkAddress)
+            .ThenBy(endpoint => endpoint.SortPriority)
+            .ThenBy(endpoint => endpoint.InterfaceName, StringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+            .ThenBy(endpoint => endpoint.NetworkAddress, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return new NetworkEnvironmentSnapshot
         {
-            return DetectNetworkType(adapter.Name, adapter.Description, ip);
-        }
-
-        return NormalizeNetworkType(adapter.NetworkType);
-    }
-
-    public static string NormalizeNetworkType(string? networkType)
-    {
-        if (string.IsNullOrWhiteSpace(networkType))
-        {
-            return "Unknown";
-        }
-
-        return networkType.Trim() switch
-        {
-            "VPN" => "VPN",
-            "LAN" => "LAN",
-            "Unknown" => "Unknown",
-            _ => "VPN"
+            CapturedAtUtc = DateTimeOffset.UtcNow,
+            Endpoints = ordered,
+            PrimaryEndpoint = primary
         };
     }
 
-    public static bool IsInSameNetwork(IPAddress address, IPAddress adapterAddress, IPAddress mask)
+    internal static NetworkEndpointInfo? SelectPrimaryEndpoint(
+        IReadOnlyList<NetworkEndpointInfo> endpoints,
+        IReadOnlyDictionary<string, DateTimeOffset> activeProviders)
     {
-        var addressBytes = address.GetAddressBytes();
-        var adapterBytes = adapterAddress.GetAddressBytes();
-        var maskBytes = mask.GetAddressBytes();
-        if (addressBytes.Length != 4 || adapterBytes.Length != 4 || maskBytes.Length != 4)
+        var selectedProvider = activeProviders
+            .Where(pair => endpoints.Any(endpoint => string.Equals(endpoint.ProviderId, pair.Key, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(pair => pair.Value)
+            .Select(pair => pair.Key)
+            .FirstOrDefault();
+        return !string.IsNullOrWhiteSpace(selectedProvider)
+            ? endpoints
+                .Where(endpoint => string.Equals(endpoint.ProviderId, selectedProvider, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+                .ThenByDescending(endpoint => endpoint.HasDefaultRoute)
+                .FirstOrDefault()
+            : endpoints
+                .Where(endpoint => endpoint.IsPhysical && endpoint.HasDefaultRoute)
+                .OrderBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+                .FirstOrDefault() ?? endpoints
+                .OrderBy(endpoint => endpoint.SortPriority)
+                .ThenBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+                .FirstOrDefault();
+    }
+
+    public Task<IReadOnlyList<IPAddress>> GetDynamicPeerTargetsAsync(
+        NetworkEnvironmentSnapshot snapshot,
+        CancellationToken token) =>
+        _providers.GetDynamicPeerTargetsAsync(snapshot, token);
+
+    public static string DetectNetworkType(NetworkEndpointInfo endpoint) =>
+        NormalizeNetworkType(endpoint.NetworkType);
+
+    public static string NormalizeNetworkType(string? networkType)
+    {
+        if (string.IsNullOrWhiteSpace(networkType)) return "Unknown";
+        return networkType.Trim().ToUpperInvariant() switch
+        {
+            "VPN" => "VPN",
+            "LAN" => "LAN",
+            _ => "Unknown"
+        };
+    }
+
+    public static bool IsInSameNetwork(IPAddress address, NetworkEndpointInfo endpoint)
+    {
+        if (!IPAddress.TryParse(endpoint.NetworkAddress, out var adapterAddress) ||
+            address.AddressFamily != adapterAddress.AddressFamily)
         {
             return false;
         }
-
-        for (var i = 0; i < 4; i++)
-        {
-            if ((addressBytes[i] & maskBytes[i]) != (adapterBytes[i] & maskBytes[i]))
-            {
-                return false;
-            }
-        }
-
-        return true;
+        return PrefixMatches(address, adapterAddress, endpoint.PrefixLength);
     }
 
-    public static IReadOnlyList<IPAddress> EnumerateProbeAddresses(NetworkAdapterInfo adapter, int maxSubnetSize)
+    public static IReadOnlyList<IPAddress> EnumerateProbeAddresses(NetworkEndpointInfo endpoint, int maxSubnetSize)
     {
-        if (!IPAddress.TryParse(adapter.IPv4, out var adapterIp) ||
-            !IPAddress.TryParse(adapter.Mask, out var mask))
+        if (endpoint.AddressFamily != AddressFamily.InterNetwork ||
+            !IPAddress.TryParse(endpoint.NetworkAddress, out var adapterIp))
         {
             return Array.Empty<IPAddress>();
         }
 
+        var mask = PrefixToMask(endpoint.PrefixLength);
         var adapterValue = ToUInt32(adapterIp);
         var maskValue = ToUInt32(mask);
         var network = adapterValue & maskValue;
         var broadcast = network | ~maskValue;
         var count = broadcast >= network ? broadcast - network + 1 : 0;
+        if (count <= 2 || count > (uint)maxSubnetSize) return Array.Empty<IPAddress>();
 
-        if (count > 2 && count <= (uint)maxSubnetSize)
-        {
-            return EnumerateRange(network + 1, broadcast - 1, adapterValue, maxSubnetSize);
-        }
-
-        return Array.Empty<IPAddress>();
-    }
-
-    private static List<IPAddress> EnumerateRange(uint first, uint last, uint excluded, int limit)
-    {
         var result = new List<IPAddress>();
-        for (var value = first; value <= last && result.Count < limit; value++)
+        for (var value = network + 1; value < broadcast && result.Count < maxSubnetSize; value++)
         {
-            if (value == excluded) continue;
-            result.Add(FromUInt32(value));
+            if (value != adapterValue) result.Add(FromUInt32(value));
             if (value == uint.MaxValue) break;
         }
-
         return result;
     }
 
-    private static int CalculatePriority(NetworkInterface nic, IPAddress ip, bool isPreferred, string? preferredAdapterId)
+    public static bool SupportsDirectedBroadcast(NetworkEndpointInfo endpoint)
     {
-        if (!string.IsNullOrWhiteSpace(preferredAdapterId) &&
-            string.Equals(nic.Id, preferredAdapterId, StringComparison.OrdinalIgnoreCase))
+        if (endpoint.AddressFamily != AddressFamily.InterNetwork ||
+            !IPAddress.TryParse(endpoint.NetworkAddress, out var adapterIp) ||
+            !IPAddress.TryParse(endpoint.BroadcastAddress, out var broadcast))
+        {
+            return false;
+        }
+        var addressCount = endpoint.PrefixLength >= 32 ? 1UL : 1UL << (32 - endpoint.PrefixLength);
+        return addressCount > 2 && !broadcast.Equals(adapterIp);
+    }
+
+    private static int GetInterfaceIndex(IPInterfaceProperties properties, AddressFamily family)
+    {
+        try
+        {
+            return family == AddressFamily.InterNetwork
+                ? properties.GetIPv4Properties()?.Index ?? 0
+                : properties.GetIPv6Properties()?.Index ?? 0;
+        }
+        catch (NetworkInformationException)
         {
             return 0;
         }
-
-        if (IsVirtualRange(ip)) return 10;
-        if (isPreferred) return 20;
-        if (IsPrivateLan(ip)) return 30;
-        return 50;
     }
 
-    private static bool IsPreferredNetwork(NetworkInterface nic, IPAddress ip)
-    {
-        return IsVirtualRange(ip) ||
-               IsPrivateLan(ip) ||
-               nic.NetworkInterfaceType is NetworkInterfaceType.Tunnel or NetworkInterfaceType.Ppp ||
-               LooksVirtual(nic.Name) ||
-               LooksVirtual(nic.Description);
-    }
+    private static bool HasDefaultRoute(IPInterfaceProperties properties, AddressFamily family) =>
+        properties.GatewayAddresses.Any(gateway =>
+            gateway.Address.AddressFamily == family &&
+            !gateway.Address.Equals(IPAddress.Any) &&
+            !gateway.Address.Equals(IPAddress.IPv6Any));
 
-    private static string DetectNetworkType(NetworkInterface nic, IPAddress ip)
+    private static bool IsUsableAddress(IPAddress address)
     {
-        if (IsVirtualRange(ip) ||
-            nic.NetworkInterfaceType is NetworkInterfaceType.Tunnel or NetworkInterfaceType.Ppp ||
-            LooksVirtual(nic.Name) ||
-            LooksVirtual(nic.Description))
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any) ||
+            address.IsIPv6Multicast)
         {
-            return "VPN";
+            return false;
         }
-
-        if (IsPrivateLan(ip))
+        if (address.AddressFamily == AddressFamily.InterNetwork)
         {
-            return "LAN";
+            var bytes = address.GetAddressBytes();
+            return bytes[0] != 0 && !(bytes[0] == 169 && bytes[1] == 254);
         }
-
-        return "Unknown";
+        return address.AddressFamily == AddressFamily.InterNetworkV6 && !address.IsIPv6LinkLocal;
     }
 
-    private static string DetectNetworkType(string name, string description, IPAddress ip)
+    private static bool IsGenericVirtualInterface(NetworkInterface nic)
     {
-        if (IsVirtualRange(ip) ||
-            LooksVirtual(name) ||
-            LooksVirtual(description))
+        if (nic.NetworkInterfaceType is NetworkInterfaceType.Tunnel or NetworkInterfaceType.Ppp) return true;
+        return LooksVirtual(nic.Name) || LooksVirtual(nic.Description);
+    }
+
+    private static bool LooksVirtual(string value) =>
+        value.Contains("VPN", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("Virtual", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("Tunnel", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("TAP", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("TUN", StringComparison.OrdinalIgnoreCase);
+
+    private static bool PrefixMatches(IPAddress left, IPAddress right, int prefixLength)
+    {
+        var leftBytes = left.GetAddressBytes();
+        var rightBytes = right.GetAddressBytes();
+        if (leftBytes.Length != rightBytes.Length) return false;
+        var maxBits = leftBytes.Length * 8;
+        var bits = Math.Clamp(prefixLength, 0, maxBits);
+        var wholeBytes = bits / 8;
+        var remainingBits = bits % 8;
+        for (var index = 0; index < wholeBytes; index++)
         {
-            return "VPN";
+            if (leftBytes[index] != rightBytes[index]) return false;
         }
-
-        if (IsPrivateLan(ip))
-        {
-            return "LAN";
-        }
-
-        return "Unknown";
+        if (remainingBits == 0) return true;
+        var mask = (byte)(0xFF << (8 - remainingBits));
+        return (leftBytes[wholeBytes] & mask) == (rightBytes[wholeBytes] & mask);
     }
 
-    private static bool LooksVirtual(string value)
+    private static IPAddress PrefixToMask(int prefixLength)
     {
-        return value.Contains("VPN", StringComparison.OrdinalIgnoreCase) ||
-               value.Contains("TAP", StringComparison.OrdinalIgnoreCase) ||
-               value.Contains("TUN", StringComparison.OrdinalIgnoreCase) ||
-               value.Contains("WireGuard", StringComparison.OrdinalIgnoreCase) ||
-               value.Contains("ZeroTier", StringComparison.OrdinalIgnoreCase) ||
-               value.Contains("Tailscale", StringComparison.OrdinalIgnoreCase) ||
-               value.Contains("Virtual", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsUsableIPv4(IPAddress ip)
-    {
-        var bytes = ip.GetAddressBytes();
-        return bytes.Length == 4 &&
-               bytes[0] != 0 &&
-               bytes[0] != 127 &&
-               !(bytes[0] == 169 && bytes[1] == 254);
-    }
-
-    private static bool IsVirtualRange(IPAddress ip)
-    {
-        var bytes = ip.GetAddressBytes();
-        return bytes.Length == 4 &&
-               (bytes[0] is 25 or 26 ||
-                (bytes[0] == 100 && bytes[1] is >= 64 and <= 127));
-    }
-
-    private static bool IsPrivateLan(IPAddress ip)
-    {
-        var bytes = ip.GetAddressBytes();
-        return bytes.Length == 4 &&
-               (bytes[0] == 10 ||
-                (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) ||
-                (bytes[0] == 192 && bytes[1] == 168));
+        var bits = Math.Clamp(prefixLength, 0, 32);
+        var value = bits == 0 ? 0U : uint.MaxValue << (32 - bits);
+        return FromUInt32(value);
     }
 
     private static IPAddress CalculateBroadcast(IPAddress ip, IPAddress mask)
@@ -246,9 +258,9 @@ public sealed class VirtualNetworkService
         var ipBytes = ip.GetAddressBytes();
         var maskBytes = mask.GetAddressBytes();
         var result = new byte[4];
-        for (var i = 0; i < 4; i++)
+        for (var index = 0; index < result.Length; index++)
         {
-            result[i] = (byte)(ipBytes[i] | ~maskBytes[i]);
+            result[index] = (byte)(ipBytes[index] | ~maskBytes[index]);
         }
         return new IPAddress(result);
     }
@@ -256,20 +268,14 @@ public sealed class VirtualNetworkService
     private static uint ToUInt32(IPAddress ip)
     {
         var bytes = ip.GetAddressBytes();
-        return ((uint)bytes[0] << 24) |
-               ((uint)bytes[1] << 16) |
-               ((uint)bytes[2] << 8) |
-               bytes[3];
+        return ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
     }
 
-    private static IPAddress FromUInt32(uint value)
+    private static IPAddress FromUInt32(uint value) => new(new[]
     {
-        return new IPAddress(new[]
-        {
-            (byte)(value >> 24),
-            (byte)(value >> 16),
-            (byte)(value >> 8),
-            (byte)value
-        });
-    }
+        (byte)(value >> 24),
+        (byte)(value >> 16),
+        (byte)(value >> 8),
+        (byte)value
+    });
 }

@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "providers": [
+    {
+      "id": "hamachi",
+      "clientProcesses": ["hamachi-2-ui"],
+      "adapterPatterns": ["Hamachi", "LogMeIn Hamachi"]
+    },
+    {
+      "id": "radmin",
+      "clientProcesses": ["RadminVPN", "RvRvpnGui"],
+      "adapterPatterns": ["Radmin VPN"]
+    },
+    {
+      "id": "zerotier",
+      "clientProcesses": ["zerotier_desktop_ui", "ZeroTier One"],
+      "adapterPatterns": ["ZeroTier"]
+    },
+    {
+      "id": "tailscale",
+      "clientProcesses": ["tailscale-ipn"],
+      "adapterPatterns": ["Tailscale"],
+      "peerSources": [
+        {
+          "executableNames": ["tailscale.exe", "%ProgramFiles%\\Tailscale\\tailscale.exe"],
+          "arguments": "status --json"
+        }
+      ]
+    },
+    {
+      "id": "netbird",
+      "clientProcesses": ["netbird-ui"],
+      "adapterPatterns": ["NetBird", "WireGuard Tunnel: netbird"],
+      "peerSources": [
+        {
+          "executableNames": ["netbird.exe", "%ProgramFiles%\\NetBird\\netbird.exe"],
+          "arguments": "status --json"
+        }
+      ]
+    },
+    {
+      "id": "easytier",
+      "clientProcesses": ["easytier-gui", "easytier-manager", "easytier-core"],
+      "adapterPatterns": ["EasyTier"],
+      "peerSources": [
+        {
+          "executableNames": ["easytier-cli.exe", "easytier-cli"],
+          "arguments": "peer"
+        }
+      ]
+    },
+    {
+      "id": "nord-meshnet",
+      "clientProcesses": ["NordVPN"],
+      "adapterPatterns": ["NordLynx", "NordVPN"]
+    },
+    {
+      "id": "husarnet",
+      "clientProcesses": ["husarnet-daemon", "husarnet"],
+      "adapterPatterns": ["Husarnet"],
+      "peerSources": [
+        {
+          "executableNames": ["husarnet.exe", "husarnet"],
+          "arguments": "daemon whitelist ls"
+        }
+      ]
+    }
+  ]
+}

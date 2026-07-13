@@ -32,6 +32,7 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, VoicePresenceEntry> _voicePresence = new(StringComparer.OrdinalIgnoreCase);
     private readonly DispatcherTimer _uiTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly DispatcherTimer _secretTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly DispatcherTimer _networkRefreshTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly CancellationTokenSource _lifetimeCts = new();
 
     private AppPaths? _paths;
@@ -39,7 +40,7 @@ public partial class MainWindow : Window
     private SettingsService? _settingsService;
     private Logger? _logger;
     private VirtualNetworkService? _network;
-    private RadminVpnSetupService? _radminSetup;
+    private NetworkToolSetupService? _networkToolSetup;
     private PackHashService? _packHash;
     private WorldMetadataService? _worldMetadata;
     private WorldPlayerProfileService? _worldPlayerProfiles;
@@ -51,6 +52,7 @@ public partial class MainWindow : Window
     private SkinService? _skinService;
     private PeerDiscoveryService? _discovery;
     private LanAdvertisementService? _lanAdvertisement;
+    private LanRelayService? _lanRelay;
     private MinecraftProcessService? _minecraft;
     private WorldTransferService? _transfer;
     private UpdateService? _updateService;
@@ -58,19 +60,21 @@ public partial class MainWindow : Window
     private VoiceNetworkCoordinator? _voiceNetwork;
     private VoiceSettingsWindow? _voiceSettingsWindow;
     private GlobalPttHotkeyService? _pttHotkey;
-    private NetworkAdapterInfo? _adapter;
-    private List<NetworkAdapterInfo> _discoveryAdapters = new();
+    private NetworkEnvironmentSnapshot _networkSnapshot = new();
+    private NetworkEndpointInfo? _primaryEndpoint;
+    private List<NetworkEndpointInfo> _networkEndpoints = [];
     private string _localPackHash = "";
     private string _state = "Starting";
     private int? _openToLanPort;
     private long _openToLanLogPosition;
     private int? _cachedOpenToLanPort;
-    private bool _radminInstalled;
+    private bool _networkToolInstalled;
+    private bool _networkRefreshInProgress;
+    private bool _networkChangeSubscribed;
     private bool _busy;
     private bool _voiceBusy;
     private bool _suppressTextPersistence;
     private bool _suppressBuildPersistence;
-    private bool _suppressAdapterPersistence;
     private bool _suppressMemoryTextChanged;
     private bool _suppressVoicePersistence;
     private string _lastVoicePeerListSignature = "";
@@ -116,8 +120,10 @@ public partial class MainWindow : Window
             UpdateVoicePeersFromDiscovery();
             RefreshLanAdvertisementState();
             RefreshUi();
+            _ = RefreshNetworkAdaptersSafelyAsync(forceRestart: false);
         };
         _secretTimer.Tick += (_, _) => RefreshSecretLoadingProgress();
+        _networkRefreshTimer.Tick += NetworkRefreshTimer_Tick;
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -132,8 +138,10 @@ public partial class MainWindow : Window
             _settings = _settingsService.Load();
             _logger = new Logger(_paths.LogFile);
             _logger.LineWritten += line => Dispatcher.Invoke(() => AppendLog(line));
-            _network = new VirtualNetworkService();
-            _radminSetup = new RadminVpnSetupService(_paths, _logger);
+            _network = new VirtualNetworkService(_logger);
+            _networkToolSetup = new NetworkToolSetupService(_paths, _logger);
+            NetworkChange.NetworkAddressChanged += NetworkAddressChanged;
+            _networkChangeSubscribed = true;
             _packHash = new PackHashService(_paths);
             _worldMetadata = new WorldMetadataService();
             _identityService = new LocalIdentityService(_paths);
@@ -146,9 +154,10 @@ public partial class MainWindow : Window
             _skinService = new SkinService(_paths, _logger);
             await _skinService.StartAsync(_lifetimeCts.Token);
             _voiceNetwork = new VoiceNetworkCoordinator();
+            _lanRelay = new LanRelayService(_logger);
             _minecraft = new MinecraftProcessService(_paths, _logger, _identityService, _identityAdapter, _worldPlayerProfiles, _packInstances, _packRuntimes, _waypointSync, _skinService);
             _minecraft.ClientRunningChanged += OnMinecraftClientRunningChanged;
-            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _voiceNetwork);
+            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _lanRelay, _voiceNetwork);
             _updateService = new UpdateService(_paths, _logger);
             _transfer.StatusChanged += message => Dispatcher.Invoke(() => SetState(message));
             _transfer.ProgressChanged += progress =>
@@ -161,9 +170,9 @@ public partial class MainWindow : Window
                 RefreshWorlds();
                 RefreshUi();
             });
-            _discovery = new PeerDiscoveryService(_paths, _logger);
+            _discovery = new PeerDiscoveryService(_paths, _logger, _network);
             _discovery.PeerUpdated += announcement => Dispatcher.Invoke(() => ApplyPeer(announcement));
-            _lanAdvertisement = new LanAdvertisementService(_logger);
+            _lanAdvertisement = new LanAdvertisementService(_logger, _lanRelay);
             _lanAdvertisement.Start();
             _voiceChannel = new VoiceChannelService(_logger, _voiceNetwork);
             _voiceChannel.Initialize(_settings);
@@ -174,11 +183,11 @@ public partial class MainWindow : Window
             LoadSettingsIntoUi();
             RefreshVoiceDevices();
             RefreshBuilds();
-            RefreshAdapters();
-            RefreshRadminSetupStatus();
-            if (_settings.RadminAutoLaunch)
+            RefreshNetworkEnvironment();
+            RefreshNetworkToolSetupStatus();
+            if (_settings.NetworkToolAutoLaunch)
             {
-                _ = AutoLaunchInstalledRadminAsync();
+                _ = AutoLaunchInstalledNetworkToolAsync();
             }
             RefreshHostPeers();
             RefreshMemoryText(saveIfChanged: true);
@@ -218,6 +227,12 @@ public partial class MainWindow : Window
 
         _uiTimer.Stop();
         _secretTimer.Stop();
+        _networkRefreshTimer.Stop();
+        if (_networkChangeSubscribed)
+        {
+            NetworkChange.NetworkAddressChanged -= NetworkAddressChanged;
+            _networkChangeSubscribed = false;
+        }
         _lifetimeCts.Cancel();
         try
         {
@@ -227,6 +242,7 @@ public partial class MainWindow : Window
             _voiceSettingsWindow?.Close();
             if (_voiceChannel is not null) await _voiceChannel.DisposeAsync();
             if (_transfer is not null) await _transfer.DisposeAsync();
+            if (_lanRelay is not null) await _lanRelay.DisposeAsync();
             if (_waypointSync is not null) await _waypointSync.DisposeAsync();
             if (_skinService is not null) await _skinService.DisposeAsync();
             _packInstances?.Dispose();
@@ -253,8 +269,8 @@ public partial class MainWindow : Window
         try
         {
             PlayerNameTextBox.Text = RequireSettings().PlayerName;
-            RefreshRadminTicketText();
-            RadminAutoLaunchCheckBox.IsChecked = settings.RadminAutoLaunch;
+            RefreshNetworkCredentialsText();
+            NetworkToolAutoLaunchCheckBox.IsChecked = settings.NetworkToolAutoLaunch;
             VoiceMasterVolumeSlider.Value = settings.VoiceOutputVolume;
             VoiceMuteButton.Content = "Микрофон";
             VoiceDeafenButton.Content = "Звук";
@@ -265,28 +281,81 @@ public partial class MainWindow : Window
         }
     }
 
-    private void RefreshAdapters()
+    private void RefreshNetworkEnvironment()
     {
-        var settings = RequireSettings();
-        var adapters = RequireNetwork().GetAdapters(settings.AdapterId);
-        _discoveryAdapters = adapters.ToList();
-        _adapter = adapters.FirstOrDefault(a => string.Equals(a.Id, settings.AdapterId, StringComparison.OrdinalIgnoreCase)) ??
-                   adapters.FirstOrDefault(a => a.IsPreferredNetwork) ??
-                   (adapters.Count > 0 ? adapters[0] : null);
-        _suppressAdapterPersistence = true;
+        _networkSnapshot = RequireNetwork().GetSnapshot();
+        _networkEndpoints = _networkSnapshot.Endpoints.ToList();
+        _primaryEndpoint = _networkSnapshot.PrimaryEndpoint;
+        var preferredProvider = _primaryEndpoint?.ProviderId;
+        foreach (var peer in _peers)
+        {
+            peer.SetPreferredProvider(preferredProvider);
+        }
+    }
+
+    private void NetworkAddressChanged(object? sender, EventArgs e)
+    {
+        if (_shutdownStarted || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+        {
+            return;
+        }
+
+        _ = Dispatcher.BeginInvoke(() =>
+        {
+            if (_shutdownStarted) return;
+            _networkRefreshTimer.Stop();
+            _networkRefreshTimer.Start();
+        });
+    }
+
+    private async void NetworkRefreshTimer_Tick(object? sender, EventArgs e)
+    {
+        _networkRefreshTimer.Stop();
+        await RefreshNetworkAdaptersSafelyAsync(forceRestart: false);
+    }
+
+    private async Task RefreshNetworkAdaptersSafelyAsync(bool forceRestart)
+    {
         try
         {
-            AdapterComboBox.ItemsSource = adapters;
-            AdapterComboBox.SelectedItem = _adapter;
+            await RefreshNetworkAdaptersAsync(forceRestart);
+        }
+        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger?.Warn($"Network adapter refresh failed: {ex.Message}");
+        }
+    }
+
+    private async Task RefreshNetworkAdaptersAsync(bool forceRestart)
+    {
+        if (_networkRefreshInProgress || _network is null || _settings is null)
+        {
+            return;
+        }
+
+        _networkRefreshInProgress = true;
+        try
+        {
+            var previousFingerprint = _networkSnapshot.Fingerprint;
+            RefreshNetworkEnvironment();
+            var currentFingerprint = _networkSnapshot.Fingerprint;
+            if (_startupComplete &&
+                (forceRestart || !string.Equals(previousFingerprint, currentFingerprint, StringComparison.Ordinal)))
+            {
+                await StartNetworkingAsync();
+            }
+
+            RefreshNetworkToolSetupStatus();
+            RefreshVoicePeers();
+            RefreshLanAdvertisementState();
+            RefreshUi();
         }
         finally
         {
-            _suppressAdapterPersistence = false;
-        }
-        if (_adapter is not null && !string.Equals(settings.AdapterId, _adapter.Id, StringComparison.OrdinalIgnoreCase))
-        {
-            settings.AdapterId = _adapter.Id;
-            RequireSettingsService().Save(settings);
+            _networkRefreshInProgress = false;
         }
     }
 
@@ -699,7 +768,7 @@ public partial class MainWindow : Window
 
     private void RefreshHostPeers()
     {
-        var selectedIp = (HostComboBox.SelectedItem as PeerViewModel)?.VpnIp;
+        var selectedIp = (HostComboBox.SelectedItem as PeerViewModel)?.NetworkAddress;
         var hosts = _peers
             .Where(peer => peer.IsHost)
             .OrderByDescending(peer => peer.LastSeen)
@@ -719,7 +788,7 @@ public partial class MainWindow : Window
         }
         else
         {
-            var restored = _hostPeers.FirstOrDefault(host => string.Equals(host.VpnIp, selectedIp, StringComparison.OrdinalIgnoreCase));
+            var restored = _hostPeers.FirstOrDefault(host => string.Equals(host.NetworkAddress, selectedIp, StringComparison.OrdinalIgnoreCase));
             HostComboBox.SelectedItem = restored ?? _hostPeers[0];
         }
 
@@ -745,7 +814,7 @@ public partial class MainWindow : Window
             _localVoicePeer.PlayerName = identity.name;
             _localVoicePeer.IdentityName = identity.name;
             _localVoicePeer.IdentityId = identity.id;
-            _localVoicePeer.VpnIp = _adapter?.IPv4 ?? _discoveryAdapters.FirstOrDefault()?.IPv4 ?? string.Empty;
+            _localVoicePeer.NetworkAddress = _primaryEndpoint?.NetworkAddress ?? _networkEndpoints.FirstOrDefault()?.NetworkAddress ?? string.Empty;
             _localVoicePeer.IsInVoiceChannel = true;
             _localVoicePeer.IsVoiceMuted = _voiceChannel.IsMuted;
             _localVoicePeer.LastSeen = DateTimeOffset.Now;
@@ -755,7 +824,7 @@ public partial class MainWindow : Window
         {
             _localVoicePeer = null;
         }
-        var signature = string.Join("|", peers.Select(peer => $"{ResolveVoicePeerId(peer)}@{peer.VpnIp}"));
+        var signature = string.Join("|", peers.Select(peer => $"{ResolveVoicePeerId(peer)}@{peer.NetworkAddress}"));
         var shouldRefreshList =
             !string.Equals(signature, _lastVoicePeerListSignature, StringComparison.Ordinal) ||
             _voicePeers.Count != peers.Count ||
@@ -821,7 +890,7 @@ public partial class MainWindow : Window
             return peer.IdentityId;
         }
 
-        return peer.VpnIp;
+        return peer.NetworkAddress;
     }
 
     private WorldMetadataContext? CreateWorldMetadataContext()
@@ -874,16 +943,15 @@ public partial class MainWindow : Window
     private async Task StartNetworkingAsync()
     {
         var settings = RequireSettings();
-        if (_adapter is null)
+        await RequireTransfer().StartListenerAsync(settings, _lifetimeCts.Token);
+        if (_networkEndpoints.Count == 0)
         {
-            RequireLogger().Warn("No network adapter selected.");
+            await RequireDiscovery().StopAsync();
+            RequireLogger().Warn("No usable network endpoint is available.");
             return;
         }
 
-        settings.AdapterId = _adapter.Id;
-        RequireSettingsService().Save(settings);
-        await RequireDiscovery().StartAsync(_discoveryAdapters.Count > 0 ? _discoveryAdapters : new[] { _adapter }, CreateAnnouncement);
-        await RequireTransfer().StartListenerAsync(settings, _lifetimeCts.Token);
+        await RequireDiscovery().StartAsync(_networkSnapshot, CreateAnnouncement);
     }
 
     private async Task RefreshPackHashAndNetworkingAsync()
@@ -899,7 +967,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private PeerAnnouncement CreateAnnouncement(NetworkAdapterInfo adapter)
+    private PeerAnnouncement CreateAnnouncement(NetworkEndpointInfo endpoint)
     {
         var settings = RequireSettings();
         var identity = ResolveActiveLocalIdentity();
@@ -919,8 +987,10 @@ public partial class MainWindow : Window
             PlayerName = identity.name,
             IdentityId = identity.id,
             IdentityName = identity.name,
-            VpnIp = adapter.IPv4,
-            NetworkType = VirtualNetworkService.DetectNetworkType(adapter),
+            NetworkAddress = endpoint.NetworkAddress,
+            NetworkProviderId = endpoint.ProviderId,
+            NetworkAddressFamily = endpoint.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
+            NetworkType = VirtualNetworkService.DetectNetworkType(endpoint),
             IsHost = openToLanPort.HasValue,
             PackHash = _localPackHash,
             ServerPort = openToLanPort ?? 0,
@@ -972,7 +1042,7 @@ public partial class MainWindow : Window
                     {
                         _voicePresence[peerId] = new VoicePresenceEntry(
                             peer,
-                            peer.GetCandidateIps().ToArray(),
+                            peer.GetCandidateAddresses(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
                             DateTimeOffset.UtcNow);
                     }
                 }
@@ -1017,11 +1087,7 @@ public partial class MainWindow : Window
         {
             return;
         }
-        if (_adapter is not null && string.Equals(announcement.VpnIp, _adapter.IPv4, StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-        if (announcement.VpnIp is not null && RequireDiscovery().IsLocalIp(announcement.VpnIp))
+        if (announcement.NetworkAddress is not null && RequireDiscovery().IsLocalAddress(announcement.NetworkAddress))
         {
             return;
         }
@@ -1033,13 +1099,14 @@ public partial class MainWindow : Window
                 string.Equals(item.IdentityId, announcement.IdentityId, StringComparison.OrdinalIgnoreCase))
             : _peers.FirstOrDefault(item =>
                 item.NetworkEndpoints.Any(endpoint =>
-                    string.Equals(endpoint.Address, announcement.VpnIp, StringComparison.OrdinalIgnoreCase)));
+                    string.Equals(endpoint.Address, announcement.NetworkAddress, StringComparison.OrdinalIgnoreCase)));
         if (peer is null)
         {
             peer = new PeerViewModel();
             _peers.Add(peer);
         }
 
+        peer.SetPreferredProvider(_primaryEndpoint?.ProviderId);
         peer.Apply(announcement, _localPackHash);
         RequireSkinService().ObservePeer(peer);
         var voicePeerId = ResolveVoicePeerId(peer);
@@ -1049,7 +1116,7 @@ public partial class MainWindow : Window
             {
                 _voicePresence[voicePeerId] = new VoicePresenceEntry(
                     peer,
-                    peer.GetCandidateIps().ToArray(),
+                    peer.GetCandidateAddresses(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
                     DateTimeOffset.UtcNow);
             }
             else
@@ -1071,7 +1138,7 @@ public partial class MainWindow : Window
     private void PruneStalePeers()
     {
         var cutoff = DateTimeOffset.Now - PeerTtl;
-        var selectedIp = (OnlinePlayerComboBox.SelectedItem as PeerViewModel)?.VpnIp;
+        var selectedIp = (OnlinePlayerComboBox.SelectedItem as PeerViewModel)?.NetworkAddress;
         for (var index = _peers.Count - 1; index >= 0; index--)
         {
             if (!_peers[index].PruneEndpoints(cutoff))
@@ -1083,7 +1150,7 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(selectedIp))
         {
             OnlinePlayerComboBox.SelectedItem = _peers.FirstOrDefault(peer =>
-                string.Equals(peer.VpnIp, selectedIp, StringComparison.OrdinalIgnoreCase));
+                string.Equals(peer.NetworkAddress, selectedIp, StringComparison.OrdinalIgnoreCase));
         }
 
         if (OnlinePlayerComboBox.SelectedItem is null && _peers.Count > 0)
@@ -1104,7 +1171,7 @@ public partial class MainWindow : Window
         _lanAdvertisement.Update(
             _openToLanPort,
             string.IsNullOrWhiteSpace(identity.name) ? "Minecraft LAN" : identity.name,
-            _discoveryAdapters,
+            _networkEndpoints,
             _peers);
     }
 
@@ -1114,7 +1181,7 @@ public partial class MainWindow : Window
 
         var hostPeers = _peers
             .Where(peer => peer.IsHost && peer.ServerPort > 0)
-            .Where(peer => !string.IsNullOrWhiteSpace(peer.VpnIp))
+            .Where(peer => !string.IsNullOrWhiteSpace(peer.NetworkAddress))
             .ToList();
         if (hostPeers.Count == 0) return;
 
@@ -1128,7 +1195,7 @@ public partial class MainWindow : Window
         {
             var probes = hostPeers.Select(async peer =>
             {
-                var peerIp = peer.VpnIp;
+                var peerIp = peer.NetworkAddress;
                 var peerPort = Math.Clamp(peer.ServerPort, 1, 65535);
                 var result = await CheckHostReachabilityAsync(peerIp, peerPort, attempts: 1, timeout: TimeSpan.FromMilliseconds(600));
 
@@ -1137,7 +1204,7 @@ public partial class MainWindow : Window
                     var current = _peers.FirstOrDefault(item =>
                         item.IsHost &&
                         item.ServerPort == peer.ServerPort &&
-                        string.Equals(item.VpnIp, peerIp, StringComparison.OrdinalIgnoreCase));
+                        string.Equals(item.NetworkAddress, peerIp, StringComparison.OrdinalIgnoreCase));
                     if (current is null) return;
 
                     current.LastRttMs = result.IsReachable ? result.RoundTripMs : null;
@@ -1416,9 +1483,9 @@ public partial class MainWindow : Window
             return null;
         }
 
-        if (!IPAddress.TryParse(peer.VpnIp, out var peerIp))
+        if (!IPAddress.TryParse(peer.NetworkAddress, out var peerIp))
         {
-            SetState($"Invalid host IP: {peer.VpnIp}");
+            SetState($"Invalid host IP: {peer.NetworkAddress}");
             return null;
         }
 
@@ -1428,7 +1495,7 @@ public partial class MainWindow : Window
             return null;
         }
 
-        var host = (Ip: peer.VpnIp, Port: Math.Clamp(peer.ServerPort, 1, 65535));
+        var host = (Ip: peer.NetworkAddress, Port: Math.Clamp(peer.ServerPort, 1, 65535));
         var reachability = await CheckHostReachabilityAsync(host.Ip, host.Port, HostReachabilityAttempts, HostReachabilityTimeout);
         if (!reachability.IsReachable)
         {
@@ -1455,8 +1522,12 @@ public partial class MainWindow : Window
             var stopwatch = Stopwatch.StartNew();
             try
             {
-                using var tcpClient = new TcpClient();
-                await tcpClient.ConnectAsync(host, port, cts.Token);
+                if (!IPAddress.TryParse(host, out var address))
+                {
+                    throw new SocketException((int)SocketError.HostNotFound);
+                }
+                using var tcpClient = new TcpClient(address.AddressFamily);
+                await tcpClient.ConnectAsync(address, port, cts.Token);
                 return HostReachabilityResult.Succeeded(stopwatch.ElapsedMilliseconds);
             }
             catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException or TimeoutException)
@@ -1857,14 +1928,15 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private async void InstallRadminButton_Click(object sender, RoutedEventArgs e)
+    private async void InstallNetworkToolButton_Click(object sender, RoutedEventArgs e)
     {
         await RunUiActionAsync(async () =>
         {
-            if (RequireRadminSetup().GetInstallInfo().IsInstalled)
+            var setup = RequireNetworkToolSetup();
+            if (setup.GetInstallInfo().IsInstalled)
             {
-                RefreshRadminSetupStatus();
-                SetState("Radmin installed");
+                RefreshNetworkToolSetupStatus();
+                SetState($"{setup.DisplayName} installed");
                 return;
             }
 
@@ -1873,55 +1945,45 @@ public partial class MainWindow : Window
                 SetState(message);
                 RequireLogger().Info(message);
             });
-            var installer = await RequireRadminSetup().DownloadInstallerAsync(progress, CancellationToken.None);
-            await RequireRadminSetup().InstallAndCleanupAsync(installer, progress, CancellationToken.None);
-            RefreshRadminSetupStatus();
+            var installer = await setup.DownloadInstallerAsync(progress, CancellationToken.None);
+            await setup.InstallAndCleanupAsync(installer, progress, CancellationToken.None);
+            RefreshNetworkToolSetupStatus();
+            await RefreshNetworkAdaptersAsync(forceRestart: true);
         });
     }
 
-    private async void GenerateRadminButton_Click(object sender, RoutedEventArgs e)
+    private async void GenerateNetworkCredentialsButton_Click(object sender, RoutedEventArgs e)
     {
         await RunUiActionAsync(() =>
         {
-            var ticket = GenerateAndFillRadminTicket();
-            RequireLogger().Info($"Generated Radmin network name: {ticket.NetworkName}");
-            SetState("Radmin network generated");
+            var credentials = GenerateAndFillNetworkCredentials();
+            RequireLogger().Info($"Generated network name: {credentials.NetworkName}");
+            SetState("Network credentials generated");
             return Task.CompletedTask;
         });
     }
 
-    private void CopyRadminNetworkButton_Click(object sender, RoutedEventArgs e)
+    private void CopyNetworkNameButton_Click(object sender, RoutedEventArgs e)
     {
-        CopyTextIfPossible(RequireSettings().RadminNetworkName);
+        CopyTextIfPossible(RequireSettings().NetworkName);
         SetState("Network name copied");
     }
 
-    private void CopyRadminPasswordButton_Click(object sender, RoutedEventArgs e)
+    private void CopyNetworkPasswordButton_Click(object sender, RoutedEventArgs e)
     {
-        CopyTextIfPossible(RequireSettings().RadminNetworkPassword);
+        CopyTextIfPossible(RequireSettings().NetworkPassword);
         SetState("Network password copied");
     }
 
-    private void RadminAutoLaunchCheckBox_Changed(object sender, RoutedEventArgs e)
+    private void NetworkToolAutoLaunchCheckBox_Changed(object sender, RoutedEventArgs e)
     {
         if (_suppressTextPersistence || _settings is null || _settingsService is null)
         {
             return;
         }
 
-        _settings.RadminAutoLaunch = RadminAutoLaunchCheckBox.IsChecked == true;
+        _settings.NetworkToolAutoLaunch = NetworkToolAutoLaunchCheckBox.IsChecked == true;
         _settingsService.Save(_settings);
-    }
-
-    private async void AdapterComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (_suppressAdapterPersistence) return;
-        if (AdapterComboBox.SelectedItem is not NetworkAdapterInfo adapter || _settings is null || _settingsService is null) return;
-        _adapter = adapter;
-        _settings.AdapterId = adapter.Id;
-        _settingsService.Save(_settings);
-        if (_startupComplete) await StartNetworkingAsync();
-        RefreshUi();
     }
 
     private void TransferSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -2415,14 +2477,15 @@ public partial class MainWindow : Window
         SetVoicePeerVolume(peer, e.NewValue);
     }
 
-    private async Task AutoLaunchInstalledRadminAsync()
+    private async Task AutoLaunchInstalledNetworkToolAsync()
     {
         await Task.Delay(1000, _lifetimeCts.Token);
         try
         {
-            if (RequireRadminSetup().LaunchRadminVpn())
+            if (RequireNetworkToolSetup().Launch())
             {
-                await WaitForRadminAdapterAsync(TimeSpan.FromSeconds(15), throwOnTimeout: false);
+                await Task.Delay(TimeSpan.FromSeconds(2), _lifetimeCts.Token);
+                await RefreshNetworkAdaptersAsync(forceRestart: true);
             }
         }
         catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
@@ -2430,89 +2493,51 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            RequireLogger().Warn($"Radmin auto-launch failed: {ex.Message}");
+            RequireLogger().Warn($"Network tool auto-launch failed: {ex.Message}");
         }
     }
 
-    private async Task WaitForRadminAdapterAsync(TimeSpan timeout, bool throwOnTimeout)
-    {
-        var adapter = await RequireRadminSetup().WaitForAdapterAsync(RequireNetwork(), timeout, _lifetimeCts.Token);
-        if (adapter is null)
-        {
-            if (throwOnTimeout) throw new TimeoutException("Radmin VPN adapter did not appear.");
-            RefreshRadminSetupStatus();
-            return;
-        }
-
-        var adapterChanged = _adapter is null ||
-                             !string.Equals(_adapter.Id, adapter.Id, StringComparison.OrdinalIgnoreCase);
-        _adapter = adapter;
-        _suppressAdapterPersistence = true;
-        try
-        {
-            AdapterComboBox.SelectedItem = adapter;
-        }
-        finally
-        {
-            _suppressAdapterPersistence = false;
-        }
-        RequireSettings().AdapterId = adapter.Id;
-        RequireSettingsService().Save(RequireSettings());
-        RefreshRadminSetupStatus();
-        if (_startupComplete && adapterChanged) await StartNetworkingAsync();
-    }
-
-    private RadminNetworkTicket GenerateAndFillRadminTicket()
+    private NetworkCredentials GenerateAndFillNetworkCredentials()
     {
         var settings = RequireSettings();
         var playerName = GetPlayerDisplayName();
-        var ticket = RequireRadminSetup().GenerateNetworkTicket(playerName);
-        settings.RadminNetworkName = ticket.NetworkName;
-        settings.RadminNetworkPassword = ticket.Password;
+        var credentials = RequireNetworkToolSetup().GenerateCredentials(playerName);
+        settings.NetworkName = credentials.NetworkName;
+        settings.NetworkPassword = credentials.Password;
         RequireSettingsService().Save(settings);
 
         _suppressTextPersistence = true;
         try
         {
-            RefreshRadminTicketText();
+            RefreshNetworkCredentialsText();
         }
         finally
         {
             _suppressTextPersistence = false;
         }
 
-        return ticket;
+        return credentials;
     }
 
-    private void RefreshRadminTicketText()
+    private void RefreshNetworkCredentialsText()
     {
         if (_settings is null)
         {
             return;
         }
 
-        RadminNetworkNameTextBox.Text = _settings.RadminNetworkName?.Trim() ?? string.Empty;
-        RadminNetworkPasswordTextBox.Text = _settings.RadminNetworkPassword?.Trim() ?? string.Empty;
+        NetworkNameTextBox.Text = _settings.NetworkName?.Trim() ?? string.Empty;
+        NetworkPasswordTextBox.Text = _settings.NetworkPassword?.Trim() ?? string.Empty;
     }
 
-    private void RefreshRadminSetupStatus()
+    private void RefreshNetworkToolSetupStatus()
     {
-        if (_radminSetup is null || _network is null) return;
-        var installInfo = _radminSetup.GetInstallInfo();
-        _radminInstalled = installInfo.IsInstalled;
-        var radminAdapter = RequireRadminSetup().FindInstalledAdapter(_network.GetAdapters());
-        if (radminAdapter is not null)
-        {
-            SetState($"Radmin ready: {radminAdapter.IPv4}");
-        }
-        else if (installInfo.IsInstalled)
-        {
-            SetState("Radmin installed, adapter not active");
-        }
-        else
-        {
-            SetState("Radmin not installed");
-        }
+        if (_networkToolSetup is null) return;
+        var installInfo = _networkToolSetup.GetInstallInfo();
+        _networkToolInstalled = installInfo.IsInstalled;
+        SetState(installInfo.IsInstalled
+            ? $"{_networkToolSetup.DisplayName} installed"
+            : $"{_networkToolSetup.DisplayName} not installed");
     }
 
     private void ApplyMemoryText()
@@ -2666,11 +2691,11 @@ public partial class MainWindow : Window
         PlayButton.Content = "Играть";
         PlayButton.IsEnabled = configurationEnabled && hasBuild && !_isEditingPlayerName;
         SkinButton.IsEnabled = !_minecraftRunning;
-        InstallRadminButton.IsEnabled = interactiveEnabled && !_radminInstalled;
-        GenerateRadminButton.IsEnabled = interactiveEnabled;
-        CopyRadminNetworkButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.RadminNetworkName);
-        CopyRadminPasswordButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.RadminNetworkPassword);
-        RadminAutoLaunchCheckBox.IsEnabled = interactiveEnabled;
+        InstallNetworkToolButton.IsEnabled = interactiveEnabled && !_networkToolInstalled;
+        GenerateNetworkCredentialsButton.IsEnabled = interactiveEnabled;
+        CopyNetworkNameButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkName);
+        CopyNetworkPasswordButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkPassword);
+        NetworkToolAutoLaunchCheckBox.IsEnabled = interactiveEnabled;
         WorldComboBox.IsEnabled = interactiveEnabled && _worlds.Count > 0;
         OnlinePlayerComboBox.IsEnabled = interactiveEnabled && _peers.Count > 0;
         WorldPlaceholderText.Visibility = _worlds.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -2730,7 +2755,7 @@ public partial class MainWindow : Window
     private SettingsService RequireSettingsService() => _settingsService ?? throw new InvalidOperationException("Settings service is not initialized.");
     private Logger RequireLogger() => _logger ?? throw new InvalidOperationException("Logger is not initialized.");
     private VirtualNetworkService RequireNetwork() => _network ?? throw new InvalidOperationException("Network service is not initialized.");
-    private RadminVpnSetupService RequireRadminSetup() => _radminSetup ?? throw new InvalidOperationException("Radmin setup service is not initialized.");
+    private NetworkToolSetupService RequireNetworkToolSetup() => _networkToolSetup ?? throw new InvalidOperationException("Network tool setup service is not initialized.");
     private PackHashService RequirePackHash() => _packHash ?? throw new InvalidOperationException("Pack hash service is not initialized.");
     private WorldMetadataService RequireWorldMetadata() => _worldMetadata ?? throw new InvalidOperationException("World metadata service is not initialized.");
     private LocalIdentityService RequireIdentityService() => _identityService ?? throw new InvalidOperationException("Identity service is not initialized.");

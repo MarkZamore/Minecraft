@@ -211,7 +211,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
     {
         if (!announcement.IsHost || announcement.WaypointProtocolVersion != ProtocolVersion ||
             !Guid.TryParse(announcement.HostedWorldId, out var worldId) || worldId == Guid.Empty ||
-            !IPAddress.TryParse(announcement.VpnIp, out var address))
+            !IPAddress.TryParse(announcement.NetworkAddress, out var address))
         {
             return;
         }
@@ -700,7 +700,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
             timeoutCts.CancelAfter(TimeSpan.FromSeconds(4));
             try
             {
-                using var client = new TcpClient();
+                using var client = new TcpClient(ip.AddressFamily);
                 await client.ConnectAsync(ip, WorldTransferService.TransferPort, timeoutCts.Token).ConfigureAwait(false);
                 await using var stream = client.GetStream();
                 await PortableProtocol.WriteJsonAsync(stream, request, _jsonOptions, timeoutCts.Token).ConfigureAwait(false);

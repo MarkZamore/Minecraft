@@ -12,17 +12,20 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
     private const int DiscoveryPort = 35655;
     private const int MaxKnownPeers = 64;
     private const int MaxFullSubnetProbeSize = 512;
+    private static readonly IPAddress IPv6MulticastGroup = IPAddress.Parse("ff12::4d43:5054");
     private static readonly TimeSpan BaseSendInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MaxSendInterval = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan KnownPeerTtl = TimeSpan.FromDays(30);
 
     private readonly AppPaths _paths;
     private readonly Logger _logger;
+    private readonly VirtualNetworkService _network;
     private readonly NetworkNeighborService _neighborService = new();
-    private readonly List<SenderEntry> _senders = new();
-    private readonly List<string> _localAdvertisedIps = new();
+    private readonly List<SenderEntry> _senders = [];
+    private readonly List<UdpClient> _listeners = [];
+    private readonly HashSet<string> _localAdvertisedAddresses = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, KnownPeerRecord> _knownPeers = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<int, IReadOnlyList<IPAddress>> _neighborTargets = new();
+    private readonly Dictionary<int, IReadOnlyList<IPAddress>> _neighborTargets = [];
     private readonly Dictionary<string, DateTimeOffset> _lastDirectedReplies = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _peerGate = new();
     private readonly object _senderGate = new();
@@ -30,23 +33,27 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
     private readonly Random _random = new();
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private CancellationTokenSource? _cts;
-    private UdpClient? _listener;
-    private Task? _receiveLoopTask;
+    private Task[] _receiveLoopTasks = [];
     private Task? _sendLoopTask;
     private bool _knownPeersDirty;
     private DateTimeOffset _lastKnownPeerSave = DateTimeOffset.MinValue;
     private DateTimeOffset _lastNeighborWarning = DateTimeOffset.MinValue;
-    private Func<NetworkAdapterInfo, PeerAnnouncement>? _createAnnouncement;
+    private Func<NetworkEndpointInfo, PeerAnnouncement>? _createAnnouncement;
+    private NetworkEnvironmentSnapshot _snapshot = new();
+    private IReadOnlyList<IPAddress> _dynamicTargets = Array.Empty<IPAddress>();
 
-    public PeerDiscoveryService(AppPaths paths, Logger logger)
+    public PeerDiscoveryService(AppPaths paths, Logger logger, VirtualNetworkService network)
     {
         _paths = paths;
         _logger = logger;
+        _network = network;
     }
 
     public event Action<PeerAnnouncement>? PeerUpdated;
 
-    public async Task StartAsync(IEnumerable<NetworkAdapterInfo> adapters, Func<NetworkAdapterInfo, PeerAnnouncement> createAnnouncement)
+    public async Task StartAsync(
+        NetworkEnvironmentSnapshot snapshot,
+        Func<NetworkEndpointInfo, PeerAnnouncement> createAnnouncement)
     {
         await _lifecycleGate.WaitAsync().ConfigureAwait(false);
         try
@@ -54,45 +61,47 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             await StopCoreAsync().ConfigureAwait(false);
             LoadKnownPeers();
             PruneKnownPeers();
-            RefreshNeighborTargets();
+            _snapshot = snapshot;
             _createAnnouncement = createAnnouncement;
-
             _cts = new CancellationTokenSource();
-            _listener = new UdpClient(new IPEndPoint(IPAddress.Any, DiscoveryPort)) { EnableBroadcast = true };
 
-            foreach (var adapter in adapters)
+            ConfigureListeners(snapshot.Endpoints);
+            foreach (var endpoint in snapshot.Endpoints)
             {
-                if (!IPAddress.TryParse(adapter.IPv4, out var adapterIp))
-                {
-                    _logger.Warn($"Peer discovery skipped adapter '{adapter.Name}' due to invalid IPv4: {adapter.IPv4}");
-                    continue;
-                }
-
+                if (!IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress)) continue;
                 try
                 {
-                    var sender = new UdpClient(new IPEndPoint(adapterIp, 0)) { EnableBroadcast = true };
-                    var targets = BuildTargets(adapter);
+                    var sender = new UdpClient(new IPEndPoint(localAddress, 0));
+                    if (localAddress.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        sender.EnableBroadcast = true;
+                    }
+                    else
+                    {
+                        sender.Client.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.MulticastInterface, endpoint.InterfaceIndex);
+                    }
+                    var targets = BuildTargets(endpoint);
                     lock (_senderGate)
                     {
-                        _senders.Add(new SenderEntry(sender, adapter, targets));
-                        if (!_localAdvertisedIps.Contains(adapter.IPv4))
-                        {
-                            _localAdvertisedIps.Add(adapter.IPv4);
-                        }
+                        _senders.Add(new SenderEntry(sender, endpoint, targets));
+                        _localAdvertisedAddresses.Add(endpoint.NetworkAddress);
                     }
-
-                    _logger.Info($"Peer discovery sender configured for {adapter.Name} ({adapter.IPv4}/{adapter.Mask}) with {targets.Count} target(s).");
+                    _logger.Info(
+                        $"Peer discovery sender configured for {endpoint.InterfaceName} " +
+                        $"({endpoint.NetworkAddress}/{endpoint.PrefixLength}) with {targets.Count} target(s).");
                 }
                 catch (Exception ex)
                 {
-                    _logger.Warn($"Peer discovery sender init failed for adapter '{adapter.Name}': {ex.Message}");
+                    _logger.Warn($"Peer discovery sender init failed for '{endpoint.InterfaceName}': {ex.Message}");
                 }
             }
 
-            _receiveLoopTask = ReceiveLoopAsync(_listener, _cts.Token);
+            await RefreshDynamicTargetsAsync(_cts.Token).ConfigureAwait(false);
+            _receiveLoopTasks = _listeners.Select(listener => ReceiveLoopAsync(listener, _cts.Token)).ToArray();
             _sendLoopTask = SendLoopAsync(createAnnouncement, _cts.Token);
-            _logger.Info($"Peer discovery started on {_senders.Count} interface(s): " +
-                string.Join(", ", _senders.Select(s => $"{s.Adapter.Name} [{s.Adapter.IPv4}]").Take(8)));
+            _logger.Info($"Peer discovery started on {_senders.Count} endpoint(s): " +
+                string.Join(", ", _senders.Select(sender =>
+                    $"{sender.Endpoint.InterfaceName} [{sender.Endpoint.NetworkAddress}]").Take(12)));
         }
         finally
         {
@@ -113,31 +122,83 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         }
     }
 
+    private void ConfigureListeners(IReadOnlyList<NetworkEndpointInfo> endpoints)
+    {
+        if (endpoints.Any(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork))
+        {
+            try
+            {
+                var listener = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
+                listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                listener.Client.Bind(new IPEndPoint(IPAddress.Any, DiscoveryPort));
+                _listeners.Add(listener);
+            }
+            catch (SocketException ex)
+            {
+                _logger.Warn($"IPv4 discovery listener is unavailable: {ex.Message}");
+            }
+        }
+
+        var ipv6Interfaces = endpoints
+            .Where(endpoint => endpoint.AddressFamily == AddressFamily.InterNetworkV6)
+            .Select(endpoint => endpoint.InterfaceIndex)
+            .Distinct()
+            .ToArray();
+        if (ipv6Interfaces.Length == 0) return;
+
+        try
+        {
+            var ipv6Listener = new UdpClient(AddressFamily.InterNetworkV6);
+            ipv6Listener.Client.DualMode = false;
+            ipv6Listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            ipv6Listener.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, DiscoveryPort));
+            foreach (var interfaceIndex in ipv6Interfaces)
+            {
+                try
+                {
+                    ipv6Listener.JoinMulticastGroup(interfaceIndex, IPv6MulticastGroup);
+                }
+                catch (SocketException ex)
+                {
+                    _logger.Warn($"IPv6 discovery multicast is unavailable on interface {interfaceIndex}: {ex.Message}");
+                }
+            }
+            _listeners.Add(ipv6Listener);
+        }
+        catch (SocketException ex)
+        {
+            _logger.Warn($"IPv6 discovery listener is unavailable: {ex.Message}");
+        }
+    }
+
     private async Task StopCoreAsync()
     {
         var cts = _cts;
-        var listener = _listener;
         SenderEntry[] senders;
+        UdpClient[] listeners;
         lock (_senderGate)
         {
             senders = _senders.ToArray();
+            listeners = _listeners.ToArray();
             _senders.Clear();
-            _localAdvertisedIps.Clear();
+            _listeners.Clear();
+            _localAdvertisedAddresses.Clear();
         }
-        var tasks = new[] { _receiveLoopTask, _sendLoopTask }.Where(task => task is not null).Cast<Task>().ToArray();
+        var tasks = _receiveLoopTasks.Concat(_sendLoopTask is null ? [] : [_sendLoopTask]).ToArray();
         _cts = null;
-        _listener = null;
-        _receiveLoopTask = null;
+        _receiveLoopTasks = [];
         _sendLoopTask = null;
+        _createAnnouncement = null;
+        _snapshot = new NetworkEnvironmentSnapshot();
+        _dynamicTargets = Array.Empty<IPAddress>();
         lock (_peerGate)
         {
             _neighborTargets.Clear();
             _lastDirectedReplies.Clear();
         }
-        _createAnnouncement = null;
 
         cts?.Cancel();
-        listener?.Dispose();
+        foreach (var listener in listeners) listener.Dispose();
         foreach (var sender in senders) sender.Sender.Dispose();
         if (tasks.Length > 0)
         {
@@ -149,37 +210,36 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             {
             }
         }
-
         cts?.Dispose();
         PersistKnownPeers(force: true);
     }
 
-    private List<DiscoveryTarget> BuildTargets(NetworkAdapterInfo adapter)
+    private List<DiscoveryTarget> BuildTargets(NetworkEndpointInfo endpoint)
     {
         var result = new List<DiscoveryTarget>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        if (IPAddress.TryParse(adapter.Broadcast, out var broadcast))
+        if (endpoint.AddressFamily == AddressFamily.InterNetwork)
         {
-            AddTarget(new IPEndPoint(broadcast, DiscoveryPort), isProbe: false);
+            if (VirtualNetworkService.SupportsDirectedBroadcast(endpoint) &&
+                IPAddress.TryParse(endpoint.BroadcastAddress, out var broadcast))
+            {
+                Add(new IPEndPoint(broadcast, DiscoveryPort), false);
+            }
+            foreach (var address in VirtualNetworkService.EnumerateProbeAddresses(endpoint, MaxFullSubnetProbeSize))
+            {
+                if (!IsLocalAddress(address.ToString())) Add(new IPEndPoint(address, DiscoveryPort), true);
+            }
         }
-
-        foreach (var ip in VirtualNetworkService.EnumerateProbeAddresses(adapter, MaxFullSubnetProbeSize))
+        else if (endpoint.AddressFamily == AddressFamily.InterNetworkV6)
         {
-            var value = ip.ToString();
-            if (IsLocalIp(value)) continue;
-            AddTarget(new IPEndPoint(ip, DiscoveryPort), isProbe: true);
+            var scopedGroup = new IPAddress(IPv6MulticastGroup.GetAddressBytes(), endpoint.InterfaceIndex);
+            Add(new IPEndPoint(scopedGroup, DiscoveryPort), false);
         }
-
         return result;
 
-        void AddTarget(IPEndPoint endpoint, bool isProbe)
+        void Add(IPEndPoint target, bool probe)
         {
-            var key = endpoint.ToString();
-            if (seen.Add(key))
-            {
-                result.Add(new DiscoveryTarget(endpoint, isProbe));
-            }
+            if (seen.Add(target.ToString())) result.Add(new DiscoveryTarget(target, probe));
         }
     }
 
@@ -189,35 +249,25 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         {
             try
             {
-                var result = await listener.ReceiveAsync(token);
-                var json = Encoding.UTF8.GetString(result.Buffer);
-                var announcement = JsonSerializer.Deserialize<PeerAnnouncement>(json, _jsonOptions);
-                if (announcement?.App == "MinecraftPortable" &&
-                    announcement.ProtocolVersion == ProtocolVersion)
-                {
-                    var peerIp = ResolvePeerIp(announcement, result.RemoteEndPoint);
-                    if (!string.IsNullOrWhiteSpace(peerIp))
-                    {
-                        announcement.VpnIp = peerIp;
-                        RememberPeer(announcement);
-                    }
+                var result = await listener.ReceiveAsync(token).ConfigureAwait(false);
+                var announcement = JsonSerializer.Deserialize<PeerAnnouncement>(
+                    Encoding.UTF8.GetString(result.Buffer),
+                    _jsonOptions);
+                if (announcement?.App != "MinecraftPortable" || announcement.ProtocolVersion != ProtocolVersion) continue;
 
-                    PeerUpdated?.Invoke(announcement);
-                    if (!string.IsNullOrWhiteSpace(peerIp))
-                    {
-                        await SendDirectedReplyAsync(peerIp, token).ConfigureAwait(false);
-                    }
-                }
+                var peerAddress = ResolvePeerAddress(result.RemoteEndPoint);
+                if (peerAddress is null) continue;
+                announcement.NetworkAddress = peerAddress.ToString();
+                announcement.NetworkAddressFamily = peerAddress.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4";
+                RememberPeer(announcement);
+                PeerUpdated?.Invoke(announcement);
+                await SendDirectedReplyAsync(peerAddress, token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
                 break;
             }
-            catch (ObjectDisposedException) when (token.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (SocketException) when (token.IsCancellationRequested)
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException && token.IsCancellationRequested)
             {
                 break;
             }
@@ -228,13 +278,15 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         }
     }
 
-    private async Task SendLoopAsync(Func<NetworkAdapterInfo, PeerAnnouncement> createAnnouncement, CancellationToken token)
+    private async Task SendLoopAsync(
+        Func<NetworkEndpointInfo, PeerAnnouncement> createAnnouncement,
+        CancellationToken token)
     {
         SenderEntry[] senderSnapshot;
         lock (_senderGate) senderSnapshot = _senders.ToArray();
         if (senderSnapshot.Length == 0)
         {
-            _logger.Warn("Peer discovery has no valid senders; peer announcements are not broadcast.");
+            _logger.Warn("Peer discovery has no usable network endpoints.");
             return;
         }
 
@@ -243,80 +295,50 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         {
             tick++;
             var includeProbes = tick % 5 == 1;
-            if (includeProbes)
+            if (includeProbes) await RefreshDynamicTargetsAsync(token).ConfigureAwait(false);
+            foreach (var entry in senderSnapshot)
             {
-                RefreshNeighborTargets();
-            }
-            try
-            {
-                foreach (var entry in senderSnapshot)
+                if (DateTimeOffset.UtcNow < entry.NextAttemptUtc) continue;
+                try
                 {
-                    if (DateTimeOffset.UtcNow < entry.NextAttemptUtc) continue;
-                    try
+                    var announcement = createAnnouncement(entry.Endpoint);
+                    announcement.NetworkAddress = entry.Endpoint.NetworkAddress;
+                    announcement.NetworkProviderId = entry.Endpoint.ProviderId;
+                    announcement.NetworkAddressFamily = entry.Endpoint.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4";
+                    var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(announcement, _jsonOptions));
+                    foreach (var target in BuildCurrentTargets(entry, includeProbes))
                     {
-                        var announcement = createAnnouncement(entry.Adapter);
-                        announcement.VpnIp = entry.Adapter.IPv4;
-                        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(announcement, _jsonOptions));
-                        foreach (var target in BuildCurrentTargets(entry, includeProbes))
-                        {
-                            await entry.Sender.SendAsync(bytes, target.Endpoint, token);
-                        }
-                        entry.FailureDelay = BaseSendInterval;
-                        entry.NextAttemptUtc = DateTimeOffset.MinValue;
+                        await entry.Sender.SendAsync(bytes, target.Endpoint, token).ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    entry.FailureDelay = BaseSendInterval;
+                    entry.NextAttemptUtc = DateTimeOffset.MinValue;
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex) when (ex is ObjectDisposedException or SocketException && token.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    entry.FailureDelay = TimeSpan.FromMilliseconds(Math.Min(
+                        MaxSendInterval.TotalMilliseconds,
+                        Math.Max(BaseSendInterval.TotalMilliseconds, entry.FailureDelay.TotalMilliseconds + 700)));
+                    entry.NextAttemptUtc = DateTimeOffset.UtcNow + entry.FailureDelay +
+                                           TimeSpan.FromMilliseconds(_random.Next(150, 450));
+                    if (DateTimeOffset.UtcNow - entry.LastWarningUtc >= TimeSpan.FromSeconds(15))
                     {
-                        return;
-                    }
-                    catch (ObjectDisposedException) when (token.IsCancellationRequested)
-                    {
-                        return;
-                    }
-                    catch (SocketException) when (token.IsCancellationRequested)
-                    {
-                        return;
-                    }
-                    catch (Exception ex)
-                    {
-                        entry.FailureDelay = TimeSpan.FromMilliseconds(Math.Min(
-                            MaxSendInterval.TotalMilliseconds,
-                            Math.Max(BaseSendInterval.TotalMilliseconds, entry.FailureDelay.TotalMilliseconds + 700)));
-                        entry.NextAttemptUtc = DateTimeOffset.UtcNow + entry.FailureDelay +
-                                               TimeSpan.FromMilliseconds(_random.Next(150, 450));
-                        if (DateTimeOffset.UtcNow - entry.LastWarningUtc >= TimeSpan.FromSeconds(15))
-                        {
-                            entry.LastWarningUtc = DateTimeOffset.UtcNow;
-                            _logger.Warn(
-                                $"Peer discovery send failed for adapter '{entry.Adapter.Name}'; " +
-                                $"retrying it in {entry.FailureDelay.TotalSeconds:0.0}s: {ex.Message}");
-                        }
+                        entry.LastWarningUtc = DateTimeOffset.UtcNow;
+                        _logger.Warn($"Peer discovery send failed for '{entry.Endpoint.InterfaceName}': {ex.Message}");
                     }
                 }
             }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (ObjectDisposedException) when (token.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (SocketException) when (token.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.Warn($"Peer discovery send loop failed: {ex.Message}");
-            }
 
-            var jitter = TimeSpan.FromMilliseconds(_random.Next(-120, 180));
-            var delay = BaseSendInterval + jitter;
-            if (delay < TimeSpan.FromMilliseconds(600))
-            {
-                delay = TimeSpan.FromMilliseconds(600);
-            }
-            await Task.Delay(delay, token);
+            var delay = BaseSendInterval + TimeSpan.FromMilliseconds(_random.Next(-120, 180));
+            if (delay < TimeSpan.FromMilliseconds(600)) delay = TimeSpan.FromMilliseconds(600);
+            await Task.Delay(delay, token).ConfigureAwait(false);
         }
     }
 
@@ -326,192 +348,171 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var target in entry.Targets)
         {
-            if (target.IsProbe && !includeProbes) continue;
-            Add(target.Endpoint, target.IsProbe);
+            if (!target.IsProbe || includeProbes) Add(target.Endpoint, target.IsProbe);
         }
 
-        KnownPeerRecord[] knownPeers;
+        KnownPeerRecord[] known;
         IReadOnlyList<IPAddress> neighbors;
         lock (_peerGate)
         {
-            knownPeers = _knownPeers.Values.ToArray();
-            neighbors = _neighborTargets.TryGetValue(entry.Adapter.InterfaceIndex, out var values)
+            known = _knownPeers.Values.ToArray();
+            neighbors = _neighborTargets.TryGetValue(entry.Endpoint.InterfaceIndex, out var values)
                 ? values
                 : Array.Empty<IPAddress>();
         }
 
-        foreach (var knownPeer in knownPeers)
+        foreach (var address in known.Select(peer => ParseAddress(peer.Address))
+                     .Concat(neighbors)
+                     .Concat(_dynamicTargets)
+                     .Where(address => address is not null)
+                     .Cast<IPAddress>()
+                     .Distinct())
         {
-            if (!IPAddress.TryParse(knownPeer.Ip, out var peerIp) || IsLocalIp(knownPeer.Ip)) continue;
-            Add(new IPEndPoint(peerIp, DiscoveryPort), isProbe: false);
+            if (address.AddressFamily != entry.Endpoint.AddressFamily || IsLocalAddress(address.ToString())) continue;
+            if (RouteUsesEndpoint(address, entry.Endpoint)) Add(new IPEndPoint(address, DiscoveryPort), false);
         }
-
-        foreach (var neighbor in neighbors)
-        {
-            var value = neighbor.ToString();
-            if (IsLocalIp(value)) continue;
-            Add(new IPEndPoint(neighbor, DiscoveryPort), isProbe: false);
-        }
-
         return targets;
 
-        void Add(IPEndPoint endpoint, bool isProbe)
+        void Add(IPEndPoint target, bool probe)
         {
-            if (seen.Add(endpoint.ToString())) targets.Add(new DiscoveryTarget(endpoint, isProbe));
+            if (target.AddressFamily == entry.Endpoint.AddressFamily && seen.Add(target.ToString()))
+            {
+                targets.Add(new DiscoveryTarget(target, probe));
+            }
         }
     }
 
-    private void RefreshNeighborTargets()
+    private async Task RefreshDynamicTargetsAsync(CancellationToken token)
     {
         try
         {
-            var snapshot = _neighborService.GetIPv4Neighbors();
+            var neighbors = _neighborService.GetNeighbors();
             lock (_peerGate)
             {
                 _neighborTargets.Clear();
-                foreach (var pair in snapshot)
-                {
-                    _neighborTargets[pair.Key] = pair.Value;
-                }
+                foreach (var pair in neighbors) _neighborTargets[pair.Key] = pair.Value;
             }
+            _dynamicTargets = await _network.GetDynamicPeerTargetsAsync(_snapshot, token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            var now = DateTimeOffset.UtcNow;
-            if (now - _lastNeighborWarning < TimeSpan.FromMinutes(1)) return;
-            _lastNeighborWarning = now;
-            _logger.Warn($"Could not refresh network neighbors: {ex.Message}");
+            if (DateTimeOffset.UtcNow - _lastNeighborWarning < TimeSpan.FromMinutes(1)) return;
+            _lastNeighborWarning = DateTimeOffset.UtcNow;
+            _logger.Warn($"Could not refresh network discovery targets: {ex.Message}");
         }
     }
 
-    private async Task SendDirectedReplyAsync(string peerIp, CancellationToken token)
+    private async Task SendDirectedReplyAsync(IPAddress peerAddress, CancellationToken token)
     {
-        if (IsLocalIp(peerIp) || !IPAddress.TryParse(peerIp, out var targetIp)) return;
+        if (IsLocalAddress(peerAddress.ToString())) return;
         var factory = _createAnnouncement;
         if (factory is null) return;
-
+        var key = peerAddress.ToString();
         var now = DateTimeOffset.UtcNow;
         lock (_peerGate)
         {
-            if (_lastDirectedReplies.TryGetValue(peerIp, out var previous) &&
-                now - previous < TimeSpan.FromSeconds(3))
-            {
-                return;
-            }
-            _lastDirectedReplies[peerIp] = now;
+            if (_lastDirectedReplies.TryGetValue(key, out var previous) && now - previous < TimeSpan.FromSeconds(3)) return;
+            _lastDirectedReplies[key] = now;
         }
 
         SenderEntry[] senders;
         lock (_senderGate) senders = _senders.ToArray();
-        var matchingSenders = senders.Where(entry =>
-            IPAddress.TryParse(entry.Adapter.IPv4, out var adapterIp) &&
-            IPAddress.TryParse(entry.Adapter.Mask, out var mask) &&
-            VirtualNetworkService.IsInSameNetwork(targetIp, adapterIp, mask)).ToArray();
-        foreach (var entry in matchingSenders.Length > 0 ? matchingSenders : senders)
+        foreach (var entry in senders
+                     .Where(sender => sender.Endpoint.AddressFamily == peerAddress.AddressFamily)
+                     .OrderByDescending(sender => RouteUsesEndpoint(peerAddress, sender.Endpoint)))
         {
+            if (!RouteUsesEndpoint(peerAddress, entry.Endpoint)) continue;
             try
             {
-                var announcement = factory(entry.Adapter);
-                announcement.VpnIp = entry.Adapter.IPv4;
+                var announcement = factory(entry.Endpoint);
+                announcement.NetworkAddress = entry.Endpoint.NetworkAddress;
+                announcement.NetworkProviderId = entry.Endpoint.ProviderId;
+                announcement.NetworkAddressFamily = entry.Endpoint.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4";
                 var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(announcement, _jsonOptions));
-                await entry.Sender.SendAsync(bytes, new IPEndPoint(targetIp, DiscoveryPort), token).ConfigureAwait(false);
+                await entry.Sender.SendAsync(bytes, new IPEndPoint(peerAddress, DiscoveryPort), token).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !token.IsCancellationRequested)
             {
-                _logger.Warn($"Peer discovery directed reply failed for {peerIp}: {ex.Message}");
+                _logger.Warn($"Peer discovery directed reply to {peerAddress} failed: {ex.Message}");
             }
         }
     }
 
-    private static string ResolvePeerIp(PeerAnnouncement announcement, IPEndPoint remoteEndPoint)
+    private static bool RouteUsesEndpoint(IPAddress target, NetworkEndpointInfo endpoint)
     {
-        if (IPAddress.TryParse(announcement.VpnIp, out var announcedIp) &&
-            announcedIp.AddressFamily == AddressFamily.InterNetwork)
+        if (target.AddressFamily != endpoint.AddressFamily ||
+            !IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress))
         {
-            return announcedIp.ToString();
+            return false;
         }
-
-        return remoteEndPoint.Address.AddressFamily == AddressFamily.InterNetwork
-            ? remoteEndPoint.Address.ToString()
-            : string.Empty;
+        if (VirtualNetworkService.IsInSameNetwork(target, endpoint)) return true;
+        try
+        {
+            using var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect(new IPEndPoint(target, DiscoveryPort));
+            return socket.LocalEndPoint is IPEndPoint local && local.Address.Equals(localAddress);
+        }
+        catch (SocketException)
+        {
+            return false;
+        }
     }
+
+    private static IPAddress? ResolvePeerAddress(IPEndPoint remote) =>
+        remote.Address.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6
+            ? remote.Address
+            : null;
 
     private void RememberPeer(PeerAnnouncement announcement)
     {
-        if (string.IsNullOrWhiteSpace(announcement.VpnIp) || IsLocalIp(announcement.VpnIp))
-        {
-            return;
-        }
-
+        if (string.IsNullOrWhiteSpace(announcement.NetworkAddress) || IsLocalAddress(announcement.NetworkAddress)) return;
         var now = DateTimeOffset.UtcNow;
-        bool shouldPersist;
+        bool persist;
         lock (_peerGate)
         {
-            var isNew = !_knownPeers.TryGetValue(announcement.VpnIp, out var peer);
-            peer ??= new KnownPeerRecord { Ip = announcement.VpnIp };
+            var isNew = !_knownPeers.TryGetValue(announcement.NetworkAddress, out var peer);
+            peer ??= new KnownPeerRecord { Address = announcement.NetworkAddress };
             peer.IdentityId = announcement.IdentityId;
             peer.PlayerName = announcement.PlayerName;
+            peer.ProviderId = announcement.NetworkProviderId;
             peer.NetworkType = VirtualNetworkService.NormalizeNetworkType(announcement.NetworkType);
             peer.LastSeenUtc = now;
-            _knownPeers[announcement.VpnIp] = peer;
+            _knownPeers[announcement.NetworkAddress] = peer;
             _knownPeersDirty = true;
-            shouldPersist = isNew || now - _lastKnownPeerSave > TimeSpan.FromMinutes(5);
+            persist = isNew || now - _lastKnownPeerSave > TimeSpan.FromMinutes(5);
         }
-
-        if (shouldPersist)
-        {
-            PersistKnownPeers(force: true);
-        }
+        if (persist) PersistKnownPeers(force: true);
     }
 
     private void LoadKnownPeers()
     {
         try
         {
-            var peers = new List<KnownPeerRecord>();
-            if (File.Exists(_paths.NetworkPeersFile))
-            {
-                var json = File.ReadAllText(_paths.NetworkPeersFile);
-                using var document = JsonDocument.Parse(json);
-                if (document.RootElement.ValueKind == JsonValueKind.Array)
-                {
-                    peers = JsonSerializer.Deserialize<List<KnownPeerRecord>>(json, _jsonOptions) ?? new();
-                }
-                else if (document.RootElement.TryGetProperty("peers", out var peerArray) &&
-                         peerArray.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var element in peerArray.EnumerateArray())
-                    {
-                        if (element.TryGetProperty("endpoints", out _))
-                        {
-                            var identity = element.Deserialize<KnownPeerIdentityRecord>(_jsonOptions);
-                            if (identity is null) continue;
-                            peers.AddRange(identity.Endpoints.Select(endpoint => new KnownPeerRecord
-                            {
-                                Ip = endpoint.Ip,
-                                IdentityId = identity.IdentityId,
-                                PlayerName = identity.PlayerName,
-                                NetworkType = endpoint.NetworkType,
-                                LastSeenUtc = endpoint.LastSeenUtc
-                            }));
-                        }
-                        else
-                        {
-                            var legacyPeer = element.Deserialize<KnownPeerRecord>(_jsonOptions);
-                            if (legacyPeer is not null) peers.Add(legacyPeer);
-                        }
-                    }
-                }
-            }
-
+            if (!File.Exists(_paths.NetworkPeersFile)) return;
+            var cache = JsonSerializer.Deserialize<KnownPeerCache>(File.ReadAllText(_paths.NetworkPeersFile), _jsonOptions);
             lock (_peerGate)
             {
                 _knownPeers.Clear();
-                foreach (var peer in peers)
+                foreach (var identity in cache?.Peers ?? [])
                 {
-                    if (string.IsNullOrWhiteSpace(peer.Ip) || !IPAddress.TryParse(peer.Ip, out _)) continue;
-                    if (DateTimeOffset.UtcNow - peer.LastSeenUtc > KnownPeerTtl) continue;
-                    _knownPeers[peer.Ip] = peer;
+                    foreach (var endpoint in identity.Endpoints)
+                    {
+                        var address = string.IsNullOrWhiteSpace(endpoint.Address) ? endpoint.Ip : endpoint.Address;
+                        if (ParseAddress(address) is null || DateTimeOffset.UtcNow - endpoint.LastSeenUtc > KnownPeerTtl) continue;
+                        _knownPeers[address] = new KnownPeerRecord
+                        {
+                            Address = address,
+                            IdentityId = identity.IdentityId,
+                            PlayerName = identity.PlayerName,
+                            ProviderId = endpoint.ProviderId,
+                            NetworkType = endpoint.NetworkType,
+                            LastSeenUtc = endpoint.LastSeenUtc
+                        };
+                    }
                 }
                 _knownPeersDirty = false;
             }
@@ -529,13 +530,12 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         {
             foreach (var peer in _knownPeers.Values.Where(peer => now - peer.LastSeenUtc > KnownPeerTtl).ToArray())
             {
-                _knownPeers.Remove(peer.Ip);
+                _knownPeers.Remove(peer.Address);
                 _knownPeersDirty = true;
             }
-
             foreach (var peer in _knownPeers.Values.OrderByDescending(peer => peer.LastSeenUtc).Skip(MaxKnownPeers).ToArray())
             {
-                _knownPeers.Remove(peer.Ip);
+                _knownPeers.Remove(peer.Address);
                 _knownPeersDirty = true;
             }
         }
@@ -549,27 +549,26 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             {
                 if (!force && !_knownPeersDirty) return;
                 if (!_knownPeersDirty && File.Exists(_paths.NetworkPeersFile)) return;
-
                 var cache = new KnownPeerCache
                 {
                     Peers = _knownPeers.Values
                         .OrderByDescending(peer => peer.LastSeenUtc)
                         .Take(MaxKnownPeers)
-                        .GroupBy(
-                            peer => string.IsNullOrWhiteSpace(peer.IdentityId) ? $"endpoint:{peer.Ip}" : peer.IdentityId,
-                            StringComparer.OrdinalIgnoreCase)
+                        .GroupBy(peer => string.IsNullOrWhiteSpace(peer.IdentityId)
+                            ? $"endpoint:{peer.Address}"
+                            : peer.IdentityId, StringComparer.OrdinalIgnoreCase)
                         .Select(group => new KnownPeerIdentityRecord
                         {
                             IdentityId = group.Key.StartsWith("endpoint:", StringComparison.Ordinal) ? "" : group.Key,
                             PlayerName = group.OrderByDescending(peer => peer.LastSeenUtc).First().PlayerName,
                             Endpoints = group.Select(peer => new KnownPeerEndpointRecord
                             {
-                                Ip = peer.Ip,
+                                Address = peer.Address,
+                                ProviderId = peer.ProviderId,
                                 NetworkType = peer.NetworkType,
                                 LastSeenUtc = peer.LastSeenUtc
                             }).ToList()
-                        })
-                        .ToList()
+                        }).ToList()
                 };
                 AtomicFile.WriteAllText(_paths.NetworkPeersFile, JsonSerializer.Serialize(cache, _jsonOptions));
                 _knownPeersDirty = false;
@@ -582,9 +581,9 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         }
     }
 
-    public bool IsLocalIp(string ip)
+    public bool IsLocalAddress(string address)
     {
-        lock (_senderGate) return _localAdvertisedIps.Contains(ip);
+        lock (_senderGate) return _localAdvertisedAddresses.Contains(address);
     }
 
     public async ValueTask DisposeAsync()
@@ -593,36 +592,40 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         _lifecycleGate.Dispose();
     }
 
+    private static IPAddress? ParseAddress(string? value) =>
+        IPAddress.TryParse(value, out var address) ? address : null;
+
     private sealed class SenderEntry
     {
-        public SenderEntry(UdpClient sender, NetworkAdapterInfo adapter, IReadOnlyList<DiscoveryTarget> targets)
+        public SenderEntry(UdpClient sender, NetworkEndpointInfo endpoint, IReadOnlyList<DiscoveryTarget> targets)
         {
             Sender = sender;
-            Adapter = adapter;
+            Endpoint = endpoint;
             Targets = targets;
         }
-
         public UdpClient Sender { get; }
-        public NetworkAdapterInfo Adapter { get; }
+        public NetworkEndpointInfo Endpoint { get; }
         public IReadOnlyList<DiscoveryTarget> Targets { get; }
         public TimeSpan FailureDelay { get; set; } = BaseSendInterval;
         public DateTimeOffset NextAttemptUtc { get; set; }
         public DateTimeOffset LastWarningUtc { get; set; } = DateTimeOffset.MinValue;
     }
+
     private sealed record DiscoveryTarget(IPEndPoint Endpoint, bool IsProbe);
 
     private sealed class KnownPeerRecord
     {
-        public string Ip { get; set; } = "";
+        public string Address { get; set; } = "";
         public string IdentityId { get; set; } = "";
         public string PlayerName { get; set; } = "";
+        public string ProviderId { get; set; } = "";
         public string NetworkType { get; set; } = "Unknown";
         public DateTimeOffset LastSeenUtc { get; set; } = DateTimeOffset.UtcNow;
     }
 
     private sealed class KnownPeerCache
     {
-        public int SchemaVersion { get; set; } = 2;
+        public int SchemaVersion { get; set; } = 3;
         public List<KnownPeerIdentityRecord> Peers { get; set; } = [];
     }
 
@@ -635,7 +638,9 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
 
     private sealed class KnownPeerEndpointRecord
     {
+        public string Address { get; set; } = "";
         public string Ip { get; set; } = "";
+        public string ProviderId { get; set; } = "";
         public string NetworkType { get; set; } = "Unknown";
         public DateTimeOffset LastSeenUtc { get; set; } = DateTimeOffset.UtcNow;
     }

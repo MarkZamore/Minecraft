@@ -32,7 +32,10 @@ internal sealed class VoiceQosSession : IDisposable
     {
         try
         {
-            _socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 46 << 2);
+            var level = _socket.AddressFamily == AddressFamily.InterNetworkV6
+                ? SocketOptionLevel.IPv6
+                : SocketOptionLevel.IP;
+            _socket.SetSocketOption(level, SocketOptionName.TypeOfService, 46 << 2);
         }
         catch (Exception ex) when (ex is SocketException or ArgumentException)
         {

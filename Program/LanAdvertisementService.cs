@@ -7,8 +7,10 @@ namespace Minecraft;
 public sealed class LanAdvertisementService : IAsyncDisposable
 {
     public const int MinecraftLanDiscoveryPort = 4445;
+    private static readonly IPAddress MinecraftLanMulticast = IPAddress.Parse("224.0.2.60");
     private static readonly TimeSpan AdvertisementInterval = TimeSpan.FromMilliseconds(1500);
     private readonly Logger _logger;
+    private readonly LanRelayService _relay;
     private readonly object _stateGate = new();
     private readonly Dictionary<string, UdpClient> _senders = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? _cts;
@@ -16,9 +18,10 @@ public sealed class LanAdvertisementService : IAsyncDisposable
     private LanAdvertisementSnapshot _snapshot = LanAdvertisementSnapshot.Empty;
     private DateTimeOffset _lastWarningAt = DateTimeOffset.MinValue;
 
-    public LanAdvertisementService(Logger logger)
+    public LanAdvertisementService(Logger logger, LanRelayService relay)
     {
         _logger = logger;
+        _relay = relay;
     }
 
     public void Start()
@@ -29,24 +32,33 @@ public sealed class LanAdvertisementService : IAsyncDisposable
     }
 
     public void Update(
-        int? port,
+        int? localPort,
         string motd,
-        IEnumerable<NetworkAdapterInfo> adapters,
+        IEnumerable<NetworkEndpointInfo> endpoints,
         IEnumerable<PeerViewModel> peers)
     {
-        var targets = peers
-            .SelectMany(peer => peer.NetworkEndpoints)
-            .Select(endpoint => endpoint.Address)
-            .Where(address => IPAddress.TryParse(address, out _))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        var peerSnapshots = peers.Select(peer =>
+        {
+            var addresses = peer.NetworkEndpoints
+                .Select(endpoint => endpoint.Address)
+                .Where(address => IPAddress.TryParse(address, out _))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return new RemoteLanPeer(
+                peer.IdentityId,
+                peer.PlayerName,
+                peer.IsHost,
+                peer.ServerPort,
+                addresses);
+        }).ToArray();
+        _relay.SetHostPort(localPort);
         lock (_stateGate)
         {
             _snapshot = new LanAdvertisementSnapshot(
-                port is > 0 and <= 65535 ? port : null,
+                localPort is > 0 and <= 65535 ? localPort : null,
                 SanitizeMotd(motd),
-                adapters.ToArray(),
-                targets);
+                endpoints.ToArray(),
+                peerSnapshots);
         }
     }
 
@@ -56,7 +68,7 @@ public sealed class LanAdvertisementService : IAsyncDisposable
         {
             while (!token.IsCancellationRequested)
             {
-                await SendCurrentAdvertisementAsync(token).ConfigureAwait(false);
+                await SendCurrentAdvertisementsAsync(token).ConfigureAwait(false);
                 await Task.Delay(AdvertisementInterval, token).ConfigureAwait(false);
             }
         }
@@ -65,42 +77,64 @@ public sealed class LanAdvertisementService : IAsyncDisposable
         }
     }
 
-    private async Task SendCurrentAdvertisementAsync(CancellationToken token)
+    private async Task SendCurrentAdvertisementsAsync(CancellationToken token)
     {
         LanAdvertisementSnapshot snapshot;
-        lock (_stateGate)
-        {
-            snapshot = _snapshot;
-        }
-        if (snapshot.Port is null || snapshot.Targets.Count == 0) return;
+        lock (_stateGate) snapshot = _snapshot;
 
-        var payload = Encoding.UTF8.GetBytes($"[MOTD]{snapshot.Motd}[/MOTD][AD]{snapshot.Port.Value}[/AD]");
-        foreach (var targetText in snapshot.Targets)
+        if (snapshot.LocalPort is not null)
         {
-            if (!IPAddress.TryParse(targetText, out var targetIp)) continue;
-            var matchingAdapters = snapshot.Adapters.Where(adapter =>
-                IPAddress.TryParse(adapter.IPv4, out var adapterIp) &&
-                IPAddress.TryParse(adapter.Mask, out var mask) &&
-                VirtualNetworkService.IsInSameNetwork(targetIp, adapterIp, mask)).ToArray();
-            var candidateAdapters = matchingAdapters.Length > 0 ? matchingAdapters : snapshot.Adapters;
-            foreach (var adapter in candidateAdapters)
+            var payload = BuildPayload(snapshot.Motd, snapshot.LocalPort.Value);
+            var ipv4Targets = snapshot.Peers
+                .SelectMany(peer => peer.Addresses)
+                .Select(ParseAddress)
+                .Where(address => address?.AddressFamily == AddressFamily.InterNetwork)
+                .Cast<IPAddress>()
+                .Distinct()
+                .ToArray();
+            foreach (var target in ipv4Targets)
             {
-                if (!IPAddress.TryParse(adapter.IPv4, out var adapterIp)) continue;
-
-                try
+                foreach (var endpoint in snapshot.Endpoints.Where(endpoint =>
+                             endpoint.AddressFamily == AddressFamily.InterNetwork && RouteUsesEndpoint(target, endpoint)))
                 {
-                    var sender = GetOrCreateSender(adapterIp);
-                    await sender.SendAsync(
-                        payload,
-                        new IPEndPoint(targetIp, MinecraftLanDiscoveryPort),
-                        token).ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException || !token.IsCancellationRequested)
-                {
-                    WarnThrottled($"Minecraft LAN announcement to {targetIp} failed: {ex.Message}");
+                    if (!IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress)) continue;
+                    try
+                    {
+                        await GetOrCreateSender(localAddress).SendAsync(
+                            payload,
+                            new IPEndPoint(target, MinecraftLanDiscoveryPort),
+                            token).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException || !token.IsCancellationRequested)
+                    {
+                        WarnThrottled($"Minecraft LAN announcement to {target} failed: {ex.Message}");
+                    }
                 }
             }
         }
+
+        var retainedRelays = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var peer in snapshot.Peers.Where(peer => peer.IsHost && peer.ServerPort is > 0 and <= 65535))
+        {
+            var addresses = peer.Addresses.Select(ParseAddress).Where(address => address is not null).Cast<IPAddress>().ToArray();
+            if (addresses.Any(address => address.AddressFamily == AddressFamily.InterNetwork)) continue;
+            var ipv6 = addresses.FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetworkV6);
+            if (ipv6 is null) continue;
+            try
+            {
+                var relay = _relay.GetOrCreateClientRelay(ipv6, peer.ServerPort);
+                retainedRelays.Add(relay.Key);
+                var payload = BuildPayload(SanitizeMotd(peer.PlayerName), relay.LocalPort);
+                var sender = GetOrCreateSender(IPAddress.Loopback);
+                await sender.SendAsync(payload, new IPEndPoint(IPAddress.Loopback, MinecraftLanDiscoveryPort), token).ConfigureAwait(false);
+                await sender.SendAsync(payload, new IPEndPoint(MinecraftLanMulticast, MinecraftLanDiscoveryPort), token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !token.IsCancellationRequested)
+            {
+                WarnThrottled($"Minecraft IPv6 LAN relay advertisement failed: {ex.Message}");
+            }
+        }
+        _relay.RetainClientRelays(retainedRelays);
     }
 
     private UdpClient GetOrCreateSender(IPAddress localAddress)
@@ -110,8 +144,30 @@ public sealed class LanAdvertisementService : IAsyncDisposable
         {
             if (_senders.TryGetValue(key, out var existing)) return existing;
             var sender = new UdpClient(new IPEndPoint(localAddress, 0));
+            if (localAddress.Equals(IPAddress.Loopback))
+            {
+                sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, localAddress.GetAddressBytes());
+                sender.MulticastLoopback = true;
+            }
             _senders[key] = sender;
             return sender;
+        }
+    }
+
+    private static bool RouteUsesEndpoint(IPAddress target, NetworkEndpointInfo endpoint)
+    {
+        if (target.AddressFamily != endpoint.AddressFamily ||
+            !IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress)) return false;
+        if (VirtualNetworkService.IsInSameNetwork(target, endpoint)) return true;
+        try
+        {
+            using var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect(new IPEndPoint(target, MinecraftLanDiscoveryPort));
+            return socket.LocalEndPoint is IPEndPoint local && local.Address.Equals(localAddress);
+        }
+        catch (SocketException)
+        {
+            return false;
         }
     }
 
@@ -123,11 +179,16 @@ public sealed class LanAdvertisementService : IAsyncDisposable
         _logger.Warn(message);
     }
 
+    private static byte[] BuildPayload(string motd, int port) =>
+        Encoding.UTF8.GetBytes($"[MOTD]{motd}[/MOTD][AD]{port}[/AD]");
+
+    private static IPAddress? ParseAddress(string? value) =>
+        IPAddress.TryParse(value, out var address) ? address : null;
+
     private static string SanitizeMotd(string value)
     {
         var result = string.IsNullOrWhiteSpace(value) ? "Minecraft LAN" : value.Trim();
-        return result.Replace("[", "(", StringComparison.Ordinal)
-            .Replace("]", ")", StringComparison.Ordinal);
+        return result.Replace("[", "(", StringComparison.Ordinal).Replace("]", ")", StringComparison.Ordinal);
     }
 
     public async ValueTask DisposeAsync()
@@ -156,11 +217,18 @@ public sealed class LanAdvertisementService : IAsyncDisposable
         }
     }
 
+    private sealed record RemoteLanPeer(
+        string IdentityId,
+        string PlayerName,
+        bool IsHost,
+        int ServerPort,
+        IReadOnlyList<string> Addresses);
+
     private sealed record LanAdvertisementSnapshot(
-        int? Port,
+        int? LocalPort,
         string Motd,
-        IReadOnlyList<NetworkAdapterInfo> Adapters,
-        IReadOnlyList<string> Targets)
+        IReadOnlyList<NetworkEndpointInfo> Endpoints,
+        IReadOnlyList<RemoteLanPeer> Peers)
     {
         public static LanAdvertisementSnapshot Empty { get; } = new(null, "Minecraft LAN", [], []);
     }

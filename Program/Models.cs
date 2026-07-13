@@ -1,6 +1,8 @@
 using System;
 using System.ComponentModel;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
 
@@ -17,17 +19,16 @@ public sealed class AppSettings
     [JsonIgnore]
     public string LocalIdentityName { get; set; } = "";
 
-    public string? AdapterId { get; set; }
-
     public int MaxMemoryGb { get; set; } = 16;
 
     [JsonIgnore]
     public long MaxArchiveBytes { get; set; } = 10L * 1024 * 1024 * 1024;
 
     public string ClientRelativePath { get; set; } = "";
-    public string RadminNetworkName { get; set; } = "";
-    public string RadminNetworkPassword { get; set; } = "";
-    public bool RadminAutoLaunch { get; set; } = true;
+    public string NetworkName { get; set; } = "";
+    public string NetworkPassword { get; set; } = "";
+    public bool NetworkToolAutoLaunch { get; set; } = true;
+    public string NetworkToolId { get; set; } = "hamachi";
     public string SkinPath { get; set; } = "";
     public string SelectedWorldRelativePath { get; set; } = "";
     public string VoiceInputDeviceId { get; set; } = "";
@@ -51,26 +52,49 @@ public sealed class AppSettings
     public double VoiceOutputVolume { get; set; } = 1.0;
 }
 
-public sealed class NetworkAdapterInfo
+public sealed class NetworkEndpointInfo
 {
-    public required string Id { get; init; }
+    public required string InterfaceId { get; init; }
     public int InterfaceIndex { get; init; }
-    public required string Name { get; init; }
+    public required string InterfaceName { get; init; }
     public string Description { get; init; } = "";
-    public required string IPv4 { get; init; }
-    public required string Mask { get; init; }
-    public required string Broadcast { get; init; }
+    public required string NetworkAddress { get; init; }
+    public int PrefixLength { get; init; }
+    public string BroadcastAddress { get; init; } = "";
+    public string ProviderId { get; init; } = "";
     public bool IsPreferredNetwork { get; init; }
+    public bool IsPhysical { get; init; }
+    public bool HasDefaultRoute { get; init; }
     public string NetworkType { get; init; } = "Unknown";
     public int SortPriority { get; init; } = 50;
 
     [JsonIgnore]
-    public string DisplayName => $"{Name} - {IPv4}";
+    public AddressFamily AddressFamily => IPAddress.TryParse(NetworkAddress, out var address)
+        ? address.AddressFamily
+        : AddressFamily.Unspecified;
+
+    [JsonIgnore]
+    public string DisplayName => $"{InterfaceName} - {NetworkAddress}";
+}
+
+public sealed class NetworkEnvironmentSnapshot
+{
+    public DateTimeOffset CapturedAtUtc { get; init; } = DateTimeOffset.UtcNow;
+    public IReadOnlyList<NetworkEndpointInfo> Endpoints { get; init; } = Array.Empty<NetworkEndpointInfo>();
+    public NetworkEndpointInfo? PrimaryEndpoint { get; init; }
+
+    public string Fingerprint => string.Join(
+        "|",
+        Endpoints.Select(endpoint =>
+            $"{endpoint.InterfaceId}@{endpoint.NetworkAddress}/{endpoint.PrefixLength}:{endpoint.ProviderId}")) +
+        $"|primary={PrimaryEndpoint?.InterfaceId}@{PrimaryEndpoint?.NetworkAddress}:{PrimaryEndpoint?.ProviderId}";
 }
 
 public sealed class PeerEndpointInfo
 {
     public required string Address { get; init; }
+    public string ProviderId { get; set; } = "";
+    public string AddressFamily { get; set; } = "";
     public string NetworkType { get; set; } = "Unknown";
     public bool IsHost { get; set; }
     public int ServerPort { get; set; }
@@ -84,7 +108,10 @@ public sealed class PeerAnnouncement
     public string PlayerName { get; set; } = "";
     public string IdentityId { get; set; } = "";
     public string IdentityName { get; set; } = "";
-    public string VpnIp { get; set; } = "";
+    [JsonPropertyName("vpnIp")]
+    public string NetworkAddress { get; set; } = "";
+    public string NetworkProviderId { get; set; } = "";
+    public string NetworkAddressFamily { get; set; } = "";
     public string NetworkType { get; set; } = "";
     public bool IsHost { get; set; }
     public string PackHash { get; set; } = "";
@@ -112,8 +139,9 @@ public sealed class PeerViewModel : INotifyPropertyChanged
 {
     private readonly Dictionary<string, PeerEndpointInfo> _endpoints = new(StringComparer.OrdinalIgnoreCase);
     private string _playerName = "";
-    private string _vpnIp = "";
+    private string _networkAddress = "";
     private string _networkType = "";
+    private string _preferredProviderId = "";
     private string _identityId = "";
     private string _identityName = "";
     private bool _isHost;
@@ -151,12 +179,12 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
     }
 
-    public string VpnIp
+    public string NetworkAddress
     {
-        get => _vpnIp;
+        get => _networkAddress;
         set
         {
-            if (Set(ref _vpnIp, value))
+            if (Set(ref _networkAddress, value))
             {
                 OnPropertyChanged(nameof(DisplayName));
                 OnPropertyChanged(nameof(VoiceDisplayName));
@@ -169,7 +197,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     public string NetworkType
     {
         get => string.IsNullOrWhiteSpace(_networkType)
-            ? IpBelongsToNetwork(_vpnIp)
+            ? AddressBelongsToNetwork(_networkAddress)
             : _networkType;
         set
         {
@@ -328,7 +356,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         get
         {
             var name = string.IsNullOrWhiteSpace(PlayerName) ? "Неизвестный игрок" : PlayerName;
-            return string.IsNullOrWhiteSpace(VpnIp) ? name : $"{name} - {VpnIp}";
+            return string.IsNullOrWhiteSpace(NetworkAddress) ? name : $"{name} - {NetworkAddress}";
         }
     }
 
@@ -338,7 +366,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         {
             var name = string.IsNullOrWhiteSpace(PlayerName) ? "Неизвестный игрок" : PlayerName;
             var localSuffix = IsLocalVoicePeer ? " (Вы)" : string.Empty;
-            var address = string.IsNullOrWhiteSpace(VpnIp) ? "—" : VpnIp;
+            var address = string.IsNullOrWhiteSpace(NetworkAddress) ? "—" : NetworkAddress;
             return $"{name}{localSuffix} - {address}";
         }
     }
@@ -400,14 +428,16 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         var now = DateTimeOffset.Now;
         LastSeen = now;
 
-        if (!string.IsNullOrWhiteSpace(announcement.VpnIp))
+        if (!string.IsNullOrWhiteSpace(announcement.NetworkAddress))
         {
-            if (!_endpoints.TryGetValue(announcement.VpnIp, out var endpoint))
+            if (!_endpoints.TryGetValue(announcement.NetworkAddress, out var endpoint))
             {
-                endpoint = new PeerEndpointInfo { Address = announcement.VpnIp };
-                _endpoints[announcement.VpnIp] = endpoint;
+                endpoint = new PeerEndpointInfo { Address = announcement.NetworkAddress };
+                _endpoints[announcement.NetworkAddress] = endpoint;
             }
 
+            endpoint.ProviderId = announcement.NetworkProviderId?.Trim() ?? "";
+            endpoint.AddressFamily = announcement.NetworkAddressFamily?.Trim() ?? "";
             endpoint.NetworkType = NormalizeNetworkType(announcement.NetworkType);
             endpoint.IsHost = announcement.IsHost;
             endpoint.ServerPort = announcement.ServerPort;
@@ -428,33 +458,46 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         return _endpoints.Count > 0;
     }
 
-    public IReadOnlyList<string> GetCandidateIps(bool requireHost = false)
+    public IReadOnlyList<string> GetCandidateAddresses(bool requireHost = false, string? preferredProviderId = null)
     {
+        var preferred = string.IsNullOrWhiteSpace(preferredProviderId)
+            ? _preferredProviderId
+            : preferredProviderId;
         return _endpoints.Values
             .Where(endpoint => !requireHost || endpoint.IsHost)
-            .OrderByDescending(endpoint => endpoint.Address.Equals(VpnIp, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(endpoint => !string.IsNullOrWhiteSpace(preferred) &&
+                                           string.Equals(endpoint.ProviderId, preferred, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(endpoint => endpoint.Address.Equals(NetworkAddress, StringComparison.OrdinalIgnoreCase))
             .ThenByDescending(endpoint => endpoint.LastSeen)
             .Select(endpoint => endpoint.Address)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
 
+    public void SetPreferredProvider(string? providerId)
+    {
+        _preferredProviderId = providerId?.Trim() ?? "";
+        SelectPrimaryEndpoint();
+    }
+
     private void SelectPrimaryEndpoint()
     {
         var primary = _endpoints.Values
-            .OrderByDescending(endpoint => endpoint.IsHost)
+            .OrderByDescending(endpoint => !string.IsNullOrWhiteSpace(_preferredProviderId) &&
+                                           string.Equals(endpoint.ProviderId, _preferredProviderId, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(endpoint => endpoint.IsHost)
             .ThenByDescending(endpoint => endpoint.LastSeen)
             .FirstOrDefault();
         if (primary is null)
         {
-            VpnIp = "";
+            NetworkAddress = "";
             NetworkType = "";
             IsHost = false;
             ServerPort = 0;
             return;
         }
 
-        VpnIp = primary.Address;
+        NetworkAddress = primary.Address;
         NetworkType = primary.NetworkType;
         IsHost = _endpoints.Values.Any(endpoint => endpoint.IsHost);
         ServerPort = _endpoints.Values
@@ -484,7 +527,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         return "VPN";
     }
 
-    private static string IpBelongsToNetwork(string ip)
+    private static string AddressBelongsToNetwork(string ip)
     {
         if (!System.Net.IPAddress.TryParse(ip, out var parsed))
         {
@@ -492,13 +535,11 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
 
         var bytes = parsed.GetAddressBytes();
-        if (bytes.Length != 4) return "Unknown";
-
-        if (bytes[0] is 25 or 26 ||
-            (bytes[0] == 100 && bytes[1] is >= 64 and <= 127))
+        if (bytes.Length == 16)
         {
-            return "VPN";
+            return (bytes[0] & 0xFE) == 0xFC ? "LAN" : "Unknown";
         }
+        if (bytes.Length != 4) return "Unknown";
 
         if (bytes[0] == 10 ||
             (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) ||

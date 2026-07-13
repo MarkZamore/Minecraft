@@ -33,9 +33,9 @@ public sealed class SettingsService
         {
             var json = File.ReadAllText(settingsFile);
             var hasConfiguredMemory = HasJsonProperty(json, "maxMemoryGb");
-            var settings = ApplyFallbacks(
-                JsonSerializer.Deserialize<AppSettings>(json, _options),
-                useRecommendedMemory: !hasConfiguredMemory);
+            var settings = JsonSerializer.Deserialize<AppSettings>(json, _options) ?? new AppSettings();
+            ApplyNetworkToolMigration(settings, json);
+            settings = ApplyFallbacks(settings, useRecommendedMemory: !hasConfiguredMemory);
             TryPersistSafeDefaults(settings);
             return settings;
         }
@@ -72,8 +72,6 @@ public sealed class SettingsService
 
         settings.LocalIdentityId = settings.LocalIdentityId?.Trim() ?? "";
         settings.LocalIdentityName = settings.LocalIdentityName?.Trim() ?? "";
-        settings.AdapterId = string.IsNullOrWhiteSpace(settings.AdapterId) ? null : settings.AdapterId.Trim();
-
         if (source is null || useRecommendedMemory ||
             settings.MaxMemoryGb < MemorySizingService.MinMemoryGb ||
             settings.MaxMemoryGb > MemorySizingService.MaxMemoryGb)
@@ -94,8 +92,11 @@ public sealed class SettingsService
         }
 
         settings.ClientRelativePath = settings.ClientRelativePath?.Trim() ?? "";
-        settings.RadminNetworkName = settings.RadminNetworkName?.Trim() ?? "";
-        settings.RadminNetworkPassword = settings.RadminNetworkPassword?.Trim() ?? "";
+        settings.NetworkName = settings.NetworkName?.Trim() ?? "";
+        settings.NetworkPassword = settings.NetworkPassword?.Trim() ?? "";
+        settings.NetworkToolId = string.IsNullOrWhiteSpace(settings.NetworkToolId)
+            ? "hamachi"
+            : settings.NetworkToolId.Trim().ToLowerInvariant();
         settings.SkinPath = settings.SkinPath?.Trim() ?? "";
         settings.SelectedWorldRelativePath = settings.SelectedWorldRelativePath?.Trim() ?? "";
         settings.VoiceInputDeviceId = settings.VoiceInputDeviceId?.Trim() ?? "";
@@ -143,6 +144,51 @@ public sealed class SettingsService
         return document.RootElement.ValueKind == JsonValueKind.Object &&
                document.RootElement.EnumerateObject().Any(property =>
                    string.Equals(property.Name, propertyName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void ApplyNetworkToolMigration(AppSettings settings, string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            settings.NetworkName = "";
+            settings.NetworkPassword = "";
+            settings.NetworkToolId = "hamachi";
+            return;
+        }
+
+        var root = document.RootElement;
+        if (!TryGetPropertyIgnoreCase(root, "networkToolAutoLaunch", out _) &&
+            TryGetPropertyIgnoreCase(root, "radminAutoLaunch", out var legacyAutoLaunch) &&
+            legacyAutoLaunch.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            settings.NetworkToolAutoLaunch = legacyAutoLaunch.GetBoolean();
+        }
+
+        var alreadyMigrated = TryGetPropertyIgnoreCase(root, "networkToolId", out var toolId) &&
+                              toolId.ValueKind == JsonValueKind.String &&
+                              string.Equals(toolId.GetString(), "hamachi", StringComparison.OrdinalIgnoreCase);
+        if (!alreadyMigrated)
+        {
+            settings.NetworkName = "";
+            settings.NetworkPassword = "";
+        }
+        settings.NetworkToolId = "hamachi";
+    }
+
+    private static bool TryGetPropertyIgnoreCase(JsonElement element, string name, out JsonElement value)
+    {
+        foreach (var property in element.EnumerateObject())
+        {
+            if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                return true;
+            }
+        }
+
+        value = default;
+        return false;
     }
 
     private void TryPersistSafeDefaults(AppSettings settings)
