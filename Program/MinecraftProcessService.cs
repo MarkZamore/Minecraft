@@ -18,6 +18,9 @@ public sealed class MinecraftProcessService
     private readonly WorldPlayerProfileService _playerProfiles;
     private readonly PackInstanceService _packInstances;
     private readonly PackRuntimeService _packRuntimes;
+    private readonly WaypointSyncService _waypointSync;
+    private readonly SkinService _skinService;
+    private readonly MinecraftWindowPlacementService _gameWindowPlacement;
     private readonly ConcurrentDictionary<int, byte> _activeClientProcesses = new();
 
     public bool IsClientRunning => !_activeClientProcesses.IsEmpty;
@@ -30,7 +33,9 @@ public sealed class MinecraftProcessService
         PortableIdentityAdapterService identityAdapter,
         WorldPlayerProfileService playerProfiles,
         PackInstanceService packInstances,
-        PackRuntimeService packRuntimes)
+        PackRuntimeService packRuntimes,
+        WaypointSyncService waypointSync,
+        SkinService skinService)
     {
         _paths = paths;
         _logger = logger;
@@ -39,6 +44,9 @@ public sealed class MinecraftProcessService
         _playerProfiles = playerProfiles;
         _packInstances = packInstances;
         _packRuntimes = packRuntimes;
+        _waypointSync = waypointSync;
+        _skinService = skinService;
+        _gameWindowPlacement = new MinecraftWindowPlacementService(paths, logger);
     }
 
     public async Task StartClientAsync(
@@ -66,6 +74,7 @@ public sealed class MinecraftProcessService
             throw new InvalidOperationException("Pack manifest changed while its runtime was being prepared. Start the game again.");
         }
         var identityJvmArguments = await _identityAdapter.PrepareJvmArgumentsAsync(runtime, token);
+        var skinRegistryPath = _skinService.PrepareRegistry(settings, identityContext);
 
         var instance = await _packInstances.PrepareAsync(settings.ClientRelativePath, token);
         var gameDir = instance.GameDirectory;
@@ -73,6 +82,7 @@ public sealed class MinecraftProcessService
         ValidatePackCompatibility(packDir);
         EnsureModernFixShutdownWorkaround(gameDir);
         _playerProfiles.PrepareWorldsForLaunch(_paths.Worlds, identityContext);
+        await _waypointSync.PrepareForLaunchAsync(settings.ClientRelativePath, identityContext, token).ConfigureAwait(false);
 
         var launcher = _packRuntimes.CreateLocalLauncher(runtime);
         var profile = await launcher.GetVersionAsync(runtime.ProfileId, token);
@@ -101,7 +111,8 @@ public sealed class MinecraftProcessService
             new("-Dfile.encoding=UTF-8"),
             new("-Djava.net.preferIPv4Stack=true"),
             new("-Djava.net.preferIPv6Addresses=false"),
-            new($"-Djava.io.tmpdir={javaTempDir}")
+            new($"-Djava.io.tmpdir={javaTempDir}"),
+            new($"-Dminecraft.portable.skin.registry={skinRegistryPath}")
         };
         extraJvmArguments.AddRange(identityJvmArguments.Select(argument => new MArgument(argument)));
         var launchOption = new MLaunchOption
@@ -159,11 +170,23 @@ public sealed class MinecraftProcessService
         try
         {
             using var process = Process.GetProcessById(processId);
-            await process.WaitForExitAsync().ConfigureAwait(false);
+            using var placementCancellation = new CancellationTokenSource();
+            var placementTask = _gameWindowPlacement.TrackAsync(processId, placementCancellation.Token);
+            try
+            {
+                await process.WaitForExitAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                placementCancellation.Cancel();
+                await placementTask.ConfigureAwait(false);
+            }
+            await _waypointSync.FlushAsync().ConfigureAwait(false);
             await _packInstances.CleanupGeneratedLocalArtifactsAsync(packRelativePath, process.ExitCode == 0).ConfigureAwait(false);
         }
         catch (ArgumentException)
         {
+            await _waypointSync.FlushAsync().ConfigureAwait(false);
             await _packInstances.CleanupGeneratedLocalArtifactsAsync(packRelativePath, removeSessionLogs: false).ConfigureAwait(false);
         }
         catch (Exception ex)

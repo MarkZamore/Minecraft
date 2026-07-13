@@ -14,7 +14,7 @@ public sealed class WorldTransferService : IAsyncDisposable
 {
     public const int TransferPort = 35656;
     public const string ProtocolName = "MinecraftPortableWorld";
-    public const int ProtocolVersion = 3;
+    public const int ProtocolVersion = 4;
     public const string TransferMessageType = "Transfer";
     public const string ProbeMessageType = "Probe";
 
@@ -25,6 +25,9 @@ public sealed class WorldTransferService : IAsyncDisposable
     private readonly WorldMetadataService _worldMetadata;
     private readonly LocalIdentityService _identityService;
     private readonly WorldPlayerProfileService _playerProfiles;
+    private readonly WaypointSyncService _waypointSync;
+    private readonly SkinService _skinService;
+    private readonly VoiceNetworkCoordinator _voiceNetwork;
     private readonly WorldTransferRuntimeOptions _runtimeOptions;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly JsonSerializerOptions _indentedJsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
@@ -45,6 +48,9 @@ public sealed class WorldTransferService : IAsyncDisposable
         WorldMetadataService worldMetadata,
         LocalIdentityService identityService,
         WorldPlayerProfileService playerProfiles,
+        WaypointSyncService waypointSync,
+        SkinService skinService,
+        VoiceNetworkCoordinator voiceNetwork,
         WorldTransferRuntimeOptions? runtimeOptions = null)
     {
         _paths = paths;
@@ -54,6 +60,9 @@ public sealed class WorldTransferService : IAsyncDisposable
         _worldMetadata = worldMetadata;
         _identityService = identityService;
         _playerProfiles = playerProfiles;
+        _waypointSync = waypointSync;
+        _skinService = skinService;
+        _voiceNetwork = voiceNetwork;
         _runtimeOptions = runtimeOptions ?? new WorldTransferRuntimeOptions();
         _runtimeOptions.Validate();
         WorldTransferRecoveryService.Recover(paths, logger);
@@ -157,6 +166,8 @@ public sealed class WorldTransferService : IAsyncDisposable
 
                 var worldDir = ResolveWorldToSend(worldPath);
                 WorldAccessGuard.EnsureClosed(worldDir);
+                StatusChanged?.Invoke("Saving personal waypoints...");
+                await _waypointSync.FlushWorldAsync(worldDir, identity, token).ConfigureAwait(false);
                 var worldName = Path.GetFileName(worldDir);
                 var worldMetadata = _worldMetadata.Read(worldDir);
                 var ownerId = ResolveOwnerIdentity(worldMetadata?.OwnerIdentityId, worldMetadata?.OwnerIdentityName, settings, identity.IdentityId, identity.IdentityName);
@@ -183,6 +194,8 @@ public sealed class WorldTransferService : IAsyncDisposable
                     StatusChanged?.Invoke("Preparing player profiles...");
                     _playerProfiles.PrepareWorldForOutgoingTransfer(stagingWorld, identity);
                     var playerManifestSha = _playerProfiles.GetPlayerManifestHash(stagingWorld);
+                    _waypointSync.Store.EnsureManifest(stagingWorld);
+                    var waypointManifestSha = _waypointSync.Store.GetManifestHash(stagingWorld);
 
                     StatusChanged?.Invoke("Hashing world...");
                     var worldSha = HashDirectory(stagingWorld);
@@ -210,6 +223,7 @@ public sealed class WorldTransferService : IAsyncDisposable
                         Size = fileInfo.Length,
                         WorldSha256 = worldSha,
                         PlayerManifestSha256 = playerManifestSha,
+                        WaypointManifestSha256 = waypointManifestSha,
                         FileName = Path.GetFileName(archivePath),
                         WorldName = worldName
                     };
@@ -221,10 +235,11 @@ public sealed class WorldTransferService : IAsyncDisposable
                     await WriteJsonAsync(stream, header, token);
                     await using (var file = File.OpenRead(archivePath))
                     {
+                        var limiter = _voiceNetwork.CreateTransferLimiter();
                         await CopyWithProgressAsync(file, stream, fileInfo.Length, progress =>
                         {
                             RaiseProgress(progress, fileInfo.Length);
-                        }, token);
+                        }, limiter, token);
                     }
 
                     var ready = await ReadJsonAsync<WorldTransferAck>(stream, token);
@@ -232,6 +247,10 @@ public sealed class WorldTransferService : IAsyncDisposable
                         !ready.Ok || ready.Stage != "Ready" || ready.TransferId != transferId ||
                         !string.Equals(ready.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
                         !string.Equals(ready.PlayerManifestSha256, playerManifestSha, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException($"Receiver rejected world archive: {ready?.Message ?? "no ready acknowledgement"}");
+                    }
+                    if (!string.Equals(ready.WaypointManifestSha256, waypointManifestSha, StringComparison.OrdinalIgnoreCase))
                     {
                         throw new InvalidOperationException($"Receiver rejected world archive: {ready?.Message ?? "no ready acknowledgement"}");
                     }
@@ -254,7 +273,8 @@ public sealed class WorldTransferService : IAsyncDisposable
                     if (committed is null || !HasExpectedProtocol(committed.Protocol, committed.ProtocolVersion) ||
                         !committed.Ok || committed.Stage != "Committed" || committed.TransferId != transferId ||
                         !string.Equals(committed.WorldSha256, worldSha, StringComparison.OrdinalIgnoreCase) ||
-                        string.IsNullOrWhiteSpace(committed.PlayerManifestSha256))
+                        string.IsNullOrWhiteSpace(committed.PlayerManifestSha256) ||
+                        !string.Equals(committed.WaypointManifestSha256, waypointManifestSha, StringComparison.OrdinalIgnoreCase))
                     {
                         throw new InvalidOperationException(
                             "Transfer commit was not confirmed. The source world remains safely quarantined in Personal\\Transfers.");
@@ -309,7 +329,7 @@ public sealed class WorldTransferService : IAsyncDisposable
             {
                 var client = await listener.AcceptTcpClientAsync(token);
                 var id = Interlocked.Increment(ref _nextReceiveTaskId);
-                var receiveTask = ReceiveWorldAsync(client, settings, token);
+                var receiveTask = HandleIncomingClientAsync(client, settings, token);
                 _receiveTasks[id] = receiveTask;
                 _ = receiveTask.ContinueWith(
                     completedTask => _receiveTasks.TryRemove(id, out _),
@@ -332,10 +352,37 @@ public sealed class WorldTransferService : IAsyncDisposable
         }
     }
 
-    private async Task ReceiveWorldAsync(TcpClient client, AppSettings settings, CancellationToken token)
+    private async Task HandleIncomingClientAsync(TcpClient client, AppSettings settings, CancellationToken token)
     {
         using var clientScope = client;
-        await using var stream = client.GetStream();
+        try
+        {
+            await using var stream = client.GetStream();
+            var initialFrame = await PortableProtocol.ReadFrameAsync(stream, token).ConfigureAwait(false);
+            var protocol = PortableProtocol.ReadProtocol(initialFrame);
+            if (string.Equals(protocol, WaypointSyncService.ProtocolName, StringComparison.Ordinal))
+            {
+                await _waypointSync.HandleIncomingAsync(stream, initialFrame, token).ConfigureAwait(false);
+                return;
+            }
+            if (string.Equals(protocol, SkinService.ProtocolName, StringComparison.Ordinal))
+            {
+                await _skinService.HandleIncomingAsync(stream, initialFrame, token).ConfigureAwait(false);
+                return;
+            }
+            await ReceiveWorldAsync(stream, settings, initialFrame, token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or JsonException or InvalidDataException)
+        {
+            _logger.Warn($"Incoming portable protocol request was rejected: {ex.Message}");
+        }
+    }
+
+    private async Task ReceiveWorldAsync(Stream stream, AppSettings settings, byte[] initialFrame, CancellationToken token)
+    {
         var identity = ResolveIdentityContext(settings);
         WorldTransferHeader? header = null;
         string? transactionRoot = null;
@@ -346,7 +393,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         var progressStarted = false;
         try
         {
-            header = await ReadJsonAsync<WorldTransferHeader>(stream, token)
+            header = PortableProtocol.Deserialize<WorldTransferHeader>(initialFrame, _jsonOptions)
                 ?? throw new InvalidOperationException("Invalid transfer header.");
             if (!HasExpectedProtocol(header.Protocol, header.ProtocolVersion))
             {
@@ -354,14 +401,18 @@ public sealed class WorldTransferService : IAsyncDisposable
             }
             if (header.MessageType == ProbeMessageType)
             {
-                var available = _transferGate.CurrentCount > 0;
+                var available = _transferGate.CurrentCount > 0 && !_minecraft.IsClientRunning;
                 await WriteJsonAsync(stream, new WorldTransferAck
                 {
                     Protocol = ProtocolName,
                     ProtocolVersion = ProtocolVersion,
                     Ok = available,
                     Stage = "Probe",
-                    Message = available ? "ready" : "another world transfer is active"
+                    Message = available
+                        ? "ready"
+                        : _minecraft.IsClientRunning
+                            ? "Minecraft is running on the receiver"
+                            : "another world transfer is active"
                 }, token);
                 return;
             }
@@ -381,7 +432,8 @@ public sealed class WorldTransferService : IAsyncDisposable
             }
             if (header.Size <= 0 || header.Size > settings.MaxArchiveBytes ||
                 string.IsNullOrWhiteSpace(header.WorldSha256) ||
-                string.IsNullOrWhiteSpace(header.PlayerManifestSha256))
+                string.IsNullOrWhiteSpace(header.PlayerManifestSha256) ||
+                string.IsNullOrWhiteSpace(header.WaypointManifestSha256))
             {
                 throw new InvalidOperationException("Transfer header is incomplete or exceeds the configured limit.");
             }
@@ -399,10 +451,11 @@ public sealed class WorldTransferService : IAsyncDisposable
             progressStarted = true;
             await using (var file = new FileStream(receivedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
+                var limiter = _voiceNetwork.CreateTransferLimiter();
                 await CopyExactlyWithLimitWithProgressAsync(stream, file, header.Size, settings.MaxArchiveBytes, progress =>
                 {
                     RaiseProgress(progress, header.Size);
-                }, token);
+                }, limiter, token);
             }
 
             tempWorldPath = Path.Combine(transactionRoot, "staging-world");
@@ -423,6 +476,12 @@ public sealed class WorldTransferService : IAsyncDisposable
             if (!string.Equals(sourceManifestSha, header.PlayerManifestSha256, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("Player manifest SHA256 mismatch after extraction.");
+            }
+            _waypointSync.Store.ValidateManifest(tempWorldPath);
+            var waypointManifestSha = _waypointSync.Store.GetManifestHash(tempWorldPath);
+            if (!string.Equals(waypointManifestSha, header.WaypointManifestSha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Waypoint manifest SHA256 mismatch after extraction.");
             }
 
             StatusChanged?.Invoke("Preparing player profile...");
@@ -450,7 +509,8 @@ public sealed class WorldTransferService : IAsyncDisposable
                 TransferId = header.TransferId,
                 Message = "ready",
                 WorldSha256 = receivedWorldSha,
-                PlayerManifestSha256 = sourceManifestSha
+                PlayerManifestSha256 = sourceManifestSha,
+                WaypointManifestSha256 = waypointManifestSha
             }, token);
             var control = await ReadJsonAsync<WorldTransferControl>(stream, token);
             if (control is null || !HasExpectedProtocol(control.Protocol, control.ProtocolVersion) ||
@@ -475,17 +535,14 @@ public sealed class WorldTransferService : IAsyncDisposable
                 TransferId = header.TransferId,
                 Message = "accepted",
                 WorldSha256 = receivedWorldSha,
-                PlayerManifestSha256 = installedManifestSha
+                PlayerManifestSha256 = installedManifestSha,
+                WaypointManifestSha256 = waypointManifestSha
             }, token);
             journal.State = "Committed";
             WriteJournal(transactionRoot, journal);
             settings.SelectedWorldRelativePath = Path.GetRelativePath(_paths.Worlds, installedWorldPath);
             _settingsService.Save(settings);
             BecameHost?.Invoke();
-            if (_runtimeOptions.StartClientAfterReceive)
-            {
-                await _minecraft.StartClientAsync(settings, null, 0, runtimeProgress: null, token);
-            }
         }
         catch (Exception ex)
         {
@@ -500,7 +557,8 @@ public sealed class WorldTransferService : IAsyncDisposable
                     Stage = "Rejected",
                     TransferId = header?.TransferId ?? string.Empty,
                     Message = ex.Message,
-                    WorldSha256 = header?.WorldSha256 ?? string.Empty
+                    WorldSha256 = header?.WorldSha256 ?? string.Empty,
+                    WaypointManifestSha256 = header?.WaypointManifestSha256 ?? string.Empty
                 }, CancellationToken.None);
             }
             catch
@@ -886,9 +944,10 @@ public sealed class WorldTransferService : IAsyncDisposable
         long size,
         long maxSize,
         Action<long> progress,
+        VoiceTransferLimiter limiter,
         CancellationToken token)
     {
-        var buffer = new byte[1024 * 1024];
+        var buffer = new byte[VoiceTransferLimiter.TransferBlockSize];
         long total = 0;
         while (total < size)
         {
@@ -898,6 +957,7 @@ public sealed class WorldTransferService : IAsyncDisposable
             if (total > maxSize) throw new InvalidOperationException("Transfer size exceeds configured limit.");
             await output.WriteAsync(buffer.AsMemory(0, read), token);
             progress(total);
+            await limiter.ThrottleAsync(read, token).ConfigureAwait(false);
         }
     }
 
@@ -906,9 +966,10 @@ public sealed class WorldTransferService : IAsyncDisposable
         Stream output,
         long totalSize,
         Action<long> progress,
+        VoiceTransferLimiter limiter,
         CancellationToken token)
     {
-        var buffer = new byte[1024 * 1024];
+        var buffer = new byte[VoiceTransferLimiter.TransferBlockSize];
         long total = 0;
         while (true)
         {
@@ -918,6 +979,7 @@ public sealed class WorldTransferService : IAsyncDisposable
             if (total > totalSize) throw new InvalidOperationException("Transfer size exceeds expected archive size.");
             await output.WriteAsync(buffer.AsMemory(0, read), token);
             progress(total);
+            await limiter.ThrottleAsync(read, token).ConfigureAwait(false);
         }
 
         if (total != totalSize)
@@ -928,34 +990,13 @@ public sealed class WorldTransferService : IAsyncDisposable
 
     private async Task WriteJsonAsync<T>(Stream stream, T value, CancellationToken token)
     {
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(value, _jsonOptions));
-        var length = new byte[4];
-        BinaryPrimitives.WriteInt32BigEndian(length, bytes.Length);
-        await stream.WriteAsync(length, token);
-        await stream.WriteAsync(bytes, token);
-        await stream.FlushAsync(token);
+        await PortableProtocol.WriteJsonAsync(stream, value, _jsonOptions, token).ConfigureAwait(false);
     }
 
     private async Task<T?> ReadJsonAsync<T>(Stream stream, CancellationToken token)
     {
-        var lengthBytes = new byte[4];
-        await ReadExactAsync(stream, lengthBytes, token);
-        var length = BinaryPrimitives.ReadInt32BigEndian(lengthBytes);
-        if (length <= 0 || length > 1024 * 1024) throw new InvalidOperationException("Invalid JSON frame length.");
-        var bytes = new byte[length];
-        await ReadExactAsync(stream, bytes, token);
-        return JsonSerializer.Deserialize<T>(bytes, _jsonOptions);
-    }
-
-    private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken token)
-    {
-        var offset = 0;
-        while (offset < buffer.Length)
-        {
-            var read = await stream.ReadAsync(buffer.AsMemory(offset, buffer.Length - offset), token);
-            if (read == 0) throw new EndOfStreamException();
-            offset += read;
-        }
+        var bytes = await PortableProtocol.ReadFrameAsync(stream, token).ConfigureAwait(false);
+        return PortableProtocol.Deserialize<T>(bytes, _jsonOptions);
     }
 
     private static void DeleteFileIfExists(string? path)
@@ -987,8 +1028,6 @@ public sealed class WorldTransferRuntimeOptions
 {
     public int Port { get; init; } = WorldTransferService.TransferPort;
     public IPAddress ListenAddress { get; init; } = IPAddress.Any;
-    public bool StartClientAfterReceive { get; init; } = true;
-
     internal void Validate()
     {
         if (Port is < 1 or > 65535)

@@ -27,6 +27,7 @@ public final class PortableIdentityHooks {
             Class<?> profileType = Class.forName("com.mojang.authlib.GameProfile", true, loader);
             Constructor<?> constructor = profileType.getConstructor(UUID.class, String.class);
             Object profile = constructor.newInstance(profileId, name);
+            PortableSkinProfiles.apply(profile);
             PortableIdentityReflection.setField(
                 listener,
                 name,
@@ -45,6 +46,7 @@ public final class PortableIdentityHooks {
 
     public static boolean rejectDuplicateUuid(Object listener, Object profile) {
         try {
+            PortableSkinProfiles.apply(profile);
             UUID profileId = (UUID) PortableIdentityReflection.invoke(profile, "getId");
             Object server = PortableIdentityReflection.getField(listener, aliases("serverFields", "server", "f"));
             Object playerList = PortableIdentityReflection.invoke(

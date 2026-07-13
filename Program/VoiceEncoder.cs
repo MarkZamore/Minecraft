@@ -18,6 +18,16 @@ public sealed class VoiceEncoder : IDisposable
     {
         OpusCodecFactory.AttemptToUseNativeLibrary = false;
         _encoder = OpusCodecFactory.CreateEncoder(SampleRate, Channels, OpusApplication.OPUS_APPLICATION_VOIP, TextWriter.Null);
+        _encoder.UseDTX = true;
+        _encoder.UseInbandFEC = true;
+        _encoder.UseVBR = true;
+        ConfigureNetwork(64000, 0);
+    }
+
+    public void ConfigureNetwork(int bitrate, int packetLossPercent)
+    {
+        _encoder.Bitrate = Math.Clamp(bitrate, 32000, 64000);
+        _encoder.PacketLossPercent = Math.Clamp(packetLossPercent, 0, 30);
     }
 
     public byte[] Encode(short[] frame)
@@ -56,7 +66,7 @@ public sealed class VoiceDecoder : IDisposable
             TextWriter.Null);
     }
 
-    public short[] Decode(byte[] encoded)
+    public short[] Decode(byte[] encoded, bool useFec = false)
     {
         if (encoded is null || encoded.Length == 0)
         {
@@ -64,7 +74,7 @@ public sealed class VoiceDecoder : IDisposable
         }
 
         var decoded = new short[VoiceEncoder.FrameSamples * VoiceEncoder.Channels];
-        var decodedSamples = _decoder.Decode(encoded, decoded, VoiceEncoder.FrameSamples, false);
+        var decodedSamples = _decoder.Decode(encoded, decoded, VoiceEncoder.FrameSamples, useFec);
         var outputSamples = Math.Max(0, decodedSamples) * VoiceEncoder.Channels;
         if (outputSamples <= 0 || outputSamples > decoded.Length)
         {

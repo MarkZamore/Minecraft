@@ -8,7 +8,7 @@ namespace Minecraft;
 
 public sealed class PeerDiscoveryService : IAsyncDisposable
 {
-    public const int ProtocolVersion = 2;
+    public const int ProtocolVersion = 3;
     private const int DiscoveryPort = 35655;
     private const int MaxKnownPeers = 64;
     private const int MaxFullSubnetProbeSize = 512;
@@ -238,7 +238,6 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             return;
         }
 
-        var sendInterval = BaseSendInterval;
         var tick = 0;
         while (!token.IsCancellationRequested)
         {
@@ -248,11 +247,11 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             {
                 RefreshNeighborTargets();
             }
-            var encounteredFailure = false;
             try
             {
                 foreach (var entry in senderSnapshot)
                 {
+                    if (DateTimeOffset.UtcNow < entry.NextAttemptUtc) continue;
                     try
                     {
                         var announcement = createAnnouncement(entry.Adapter);
@@ -262,6 +261,8 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
                         {
                             await entry.Sender.SendAsync(bytes, target.Endpoint, token);
                         }
+                        entry.FailureDelay = BaseSendInterval;
+                        entry.NextAttemptUtc = DateTimeOffset.MinValue;
                     }
                     catch (OperationCanceledException) when (token.IsCancellationRequested)
                     {
@@ -277,8 +278,18 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
                     }
                     catch (Exception ex)
                     {
-                        encounteredFailure = true;
-                        _logger.Warn($"Peer discovery send failed for adapter '{entry.Adapter.Name}': {ex.Message}");
+                        entry.FailureDelay = TimeSpan.FromMilliseconds(Math.Min(
+                            MaxSendInterval.TotalMilliseconds,
+                            Math.Max(BaseSendInterval.TotalMilliseconds, entry.FailureDelay.TotalMilliseconds + 700)));
+                        entry.NextAttemptUtc = DateTimeOffset.UtcNow + entry.FailureDelay +
+                                               TimeSpan.FromMilliseconds(_random.Next(150, 450));
+                        if (DateTimeOffset.UtcNow - entry.LastWarningUtc >= TimeSpan.FromSeconds(15))
+                        {
+                            entry.LastWarningUtc = DateTimeOffset.UtcNow;
+                            _logger.Warn(
+                                $"Peer discovery send failed for adapter '{entry.Adapter.Name}'; " +
+                                $"retrying it in {entry.FailureDelay.TotalSeconds:0.0}s: {ex.Message}");
+                        }
                     }
                 }
             }
@@ -296,28 +307,16 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                encounteredFailure = true;
                 _logger.Warn($"Peer discovery send loop failed: {ex.Message}");
             }
 
-            if (encounteredFailure)
+            var jitter = TimeSpan.FromMilliseconds(_random.Next(-120, 180));
+            var delay = BaseSendInterval + jitter;
+            if (delay < TimeSpan.FromMilliseconds(600))
             {
-                var jitter = TimeSpan.FromMilliseconds(_random.Next(150, 450));
-                sendInterval = TimeSpan.FromMilliseconds(Math.Min(MaxSendInterval.TotalMilliseconds, sendInterval.TotalMilliseconds + 700));
-                _logger.Info($"Peer discovery send issue detected; slowing heartbeat to {sendInterval.TotalSeconds:0.0}s.");
-                await Task.Delay(sendInterval + jitter, token);
+                delay = TimeSpan.FromMilliseconds(600);
             }
-            else
-            {
-                sendInterval = BaseSendInterval;
-                var jitter = TimeSpan.FromMilliseconds(_random.Next(-120, 180));
-                var delay = sendInterval + jitter;
-                if (delay < TimeSpan.FromMilliseconds(600))
-                {
-                    delay = TimeSpan.FromMilliseconds(600);
-                }
-                await Task.Delay(delay, token);
-            }
+            await Task.Delay(delay, token);
         }
     }
 
@@ -594,7 +593,22 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         _lifecycleGate.Dispose();
     }
 
-    private sealed record SenderEntry(UdpClient Sender, NetworkAdapterInfo Adapter, IReadOnlyList<DiscoveryTarget> Targets);
+    private sealed class SenderEntry
+    {
+        public SenderEntry(UdpClient sender, NetworkAdapterInfo adapter, IReadOnlyList<DiscoveryTarget> targets)
+        {
+            Sender = sender;
+            Adapter = adapter;
+            Targets = targets;
+        }
+
+        public UdpClient Sender { get; }
+        public NetworkAdapterInfo Adapter { get; }
+        public IReadOnlyList<DiscoveryTarget> Targets { get; }
+        public TimeSpan FailureDelay { get; set; } = BaseSendInterval;
+        public DateTimeOffset NextAttemptUtc { get; set; }
+        public DateTimeOffset LastWarningUtc { get; set; } = DateTimeOffset.MinValue;
+    }
     private sealed record DiscoveryTarget(IPEndPoint Endpoint, bool IsProbe);
 
     private sealed class KnownPeerRecord

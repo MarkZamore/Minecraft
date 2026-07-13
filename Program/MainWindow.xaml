@@ -100,7 +100,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*" MinHeight="96"/>
+                <RowDefinition Height="*" MinHeight="72"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
@@ -142,18 +142,21 @@
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="68"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Button Grid.Column="0" x:Name="PlayButton" Content="Играть" Click="PlayButton_Click"
                         MinHeight="38" FontSize="16" FontWeight="SemiBold"/>
-                <TextBlock Grid.Column="1" Text="RAM" Margin="12,0,6,0"/>
-                <TextBox Grid.Column="2" x:Name="MemoryTextBox" TextAlignment="Center" FontSize="16"
+                <Button Grid.Column="1" x:Name="SkinButton" Content="Скин" Click="SkinButton_Click"
+                        MinHeight="38" MinWidth="68" Margin="8,0,0,0"/>
+                <TextBlock Grid.Column="2" Text="RAM" Margin="12,0,6,0"/>
+                <TextBox Grid.Column="3" x:Name="MemoryTextBox" TextAlignment="Center" FontSize="16"
                          PreviewTextInput="MemoryTextBox_PreviewTextInput"
                          TextChanged="MemoryTextBox_TextChanged"
                          DataObject.Pasting="MemoryTextBox_Pasting"
                          LostFocus="MemoryTextBox_LostFocus" KeyDown="MemoryTextBox_KeyDown"/>
-                <TextBlock Grid.Column="3" Text="GB" Margin="6,0,0,0"/>
+                <TextBlock Grid.Column="4" Text="GB" Margin="6,0,0,0"/>
             </Grid>
 
             <Grid Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
@@ -164,22 +167,25 @@
                 </Grid.RowDefinitions>
                 <TextBlock Grid.Row="0" Text="Голосовой чат" FontSize="13" FontWeight="SemiBold"
                            Margin="0,0,0,5"/>
-                <ListBox Grid.Row="1" x:Name="VoicePeersListBox"
-                         ScrollViewer.VerticalScrollBarVisibility="Auto"
-                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
-                         HorizontalContentAlignment="Stretch"
-                         ItemTemplate="{StaticResource VoicePeerTemplate}"/>
+                <Border Grid.Row="1" BorderBrush="{DynamicResource ControlBorderBrush}" BorderThickness="1">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <ItemsControl x:Name="VoicePeersItemsControl"
+                                      HorizontalContentAlignment="Stretch"
+                                      ItemTemplate="{StaticResource VoicePeerTemplate}"/>
+                    </ScrollViewer>
+                </Border>
                 <Grid Grid.Row="2" Margin="0,5,0,0">
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
-                        <Button x:Name="VoiceJoinButton" Content="+" Width="30" Height="28" Padding="0"
-                                FontSize="16" ToolTip="Войти в голосовой канал"
+                        <Button x:Name="VoiceJoinButton" Content="&#xE717;" Width="30" Height="28" Padding="0"
+                                FontFamily="Segoe Fluent Icons" FontSize="15" ToolTip="Войти в голосовой канал"
                                 Click="VoiceJoinButton_Click"/>
-                        <Button x:Name="VoiceMuteButton" Content="🎙" Width="30" Height="28" Padding="0"
-                                FontSize="14" ToolTip="Выключить микрофон" Margin="5,0,0,0"
+                        <Button x:Name="VoiceMuteButton" Content="&#xE720;" Width="30" Height="28" Padding="0"
+                                FontFamily="Segoe Fluent Icons" FontSize="14" ToolTip="Выключить микрофон" Margin="5,0,0,0"
                                 Click="VoiceMuteButton_Click"/>
                     </StackPanel>
-                    <Button x:Name="VoiceSettingsButton" Content="⚙" Width="30" Height="28"
+                    <Button x:Name="VoiceSettingsButton" Content="&#xE713;" Width="30" Height="28"
                             HorizontalAlignment="Right" Padding="0"
+                            FontFamily="Segoe Fluent Icons" FontSize="14"
                             ToolTip="Настройки голосового чата"
                             Click="VoiceSettingsButton_Click"/>
                 </Grid>
@@ -191,17 +197,37 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
                     <Button Grid.Column="0" x:Name="InstallRadminButton" Content="Установить"
                             Click="InstallRadminButton_Click" Margin="0,0,4,0"/>
-                    <Button Grid.Column="1" x:Name="GenerateRadminButton" Content="Сгенерировать"
-                            Click="GenerateRadminButton_Click" Margin="4,0"/>
-                    <Button Grid.Column="2" x:Name="CopyRadminButton" Content="Копировать"
-                            Click="CopyRadminButton_Click" Margin="4,0,0,0"/>
+                    <Button Grid.Column="1" x:Name="GenerateRadminButton" Content="Генерировать"
+                            Click="GenerateRadminButton_Click" Margin="4,0,0,0"/>
                 </Grid>
-                <TextBlock x:Name="RadminNetworkNameText" Text="Сеть: —" TextTrimming="CharacterEllipsis"/>
-                <TextBlock x:Name="RadminNetworkPasswordText" Text="Пароль: —" TextTrimming="CharacterEllipsis"/>
+                <Grid Margin="0,0,0,5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="70"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Сеть"/>
+                    <TextBox Grid.Column="1" x:Name="RadminNetworkNameTextBox" IsReadOnly="True"/>
+                    <Button Grid.Column="2" x:Name="CopyRadminNetworkButton" Content="Копировать"
+                            Click="CopyRadminNetworkButton_Click" Margin="8,0,0,0" MinWidth="88"/>
+                </Grid>
+                <Grid Margin="0,0,0,5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="70"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Пароль"/>
+                    <TextBox Grid.Column="1" x:Name="RadminNetworkPasswordTextBox" IsReadOnly="True"/>
+                    <Button Grid.Column="2" x:Name="CopyRadminPasswordButton" Content="Копировать"
+                            Click="CopyRadminPasswordButton_Click" Margin="8,0,0,0" MinWidth="88"/>
+                </Grid>
+                <CheckBox x:Name="RadminAutoLaunchCheckBox" Content="Автозапуск"
+                          Checked="RadminAutoLaunchCheckBox_Changed"
+                          Unchecked="RadminAutoLaunchCheckBox_Changed"/>
             </StackPanel>
 
             <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">

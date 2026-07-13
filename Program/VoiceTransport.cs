@@ -11,6 +11,7 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
     private UdpClient? _udp;
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
+    private VoiceQosSession? _qos;
     private DateTimeOffset _lastWarningAt = DateTimeOffset.MinValue;
 
     public VoiceTransport(Logger logger)
@@ -26,11 +27,15 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
         StopAsync().AsTask().GetAwaiter().GetResult();
         var cts = new CancellationTokenSource();
         var udp = new UdpClient(new IPEndPoint(listenAddress, port));
+        udp.Client.SendBufferSize = 512 * 1024;
+        udp.Client.ReceiveBufferSize = 512 * 1024;
+        var qos = VoiceQosSession.AttachBestEffort(udp.Client, _logger);
         lock (_gate)
         {
             _cts = cts;
             _udp = udp;
             _receiveTask = ReceiveLoopAsync(udp, onPacketReceived, cts.Token);
+            _qos = qos;
         }
     }
 
@@ -76,9 +81,11 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
     public async Task SendAsync(IEnumerable<IPEndPoint> targets, byte[] payload, CancellationToken token)
     {
         UdpClient? udp;
+        VoiceQosSession? qos;
         lock (_gate)
         {
             udp = _udp;
+            qos = _qos;
         }
         if (udp is null || payload.Length == 0) return;
 
@@ -86,6 +93,7 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
         {
             try
             {
+                qos?.AddDestination(target);
                 await udp.SendAsync(payload, target, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -104,6 +112,7 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
         CancellationTokenSource? cts;
         UdpClient? udp;
         Task? task;
+        VoiceQosSession? qos;
         lock (_gate)
         {
             cts = _cts;
@@ -112,9 +121,12 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
             _cts = null;
             _udp = null;
             _receiveTask = null;
+            qos = _qos;
+            _qos = null;
         }
 
         cts?.Cancel();
+        qos?.Dispose();
         udp?.Dispose();
         if (task is not null)
         {

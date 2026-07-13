@@ -27,6 +27,8 @@ public sealed class AppSettings
     public string ClientRelativePath { get; set; } = "";
     public string RadminNetworkName { get; set; } = "";
     public string RadminNetworkPassword { get; set; } = "";
+    public bool RadminAutoLaunch { get; set; } = true;
+    public string SkinPath { get; set; } = "";
     public string SelectedWorldRelativePath { get; set; } = "";
     public string VoiceInputDeviceId { get; set; } = "";
     public string VoiceOutputDeviceId { get; set; } = "";
@@ -90,6 +92,20 @@ public sealed class PeerAnnouncement
     public string State { get; set; } = "";
     public bool IsVoiceChannelActive { get; set; }
     public bool IsVoiceMuted { get; set; }
+    public bool IsMinecraftRunning { get; set; }
+    public bool IsSkinAvailable { get; set; }
+    public string SkinSha256 { get; set; } = "";
+    public string SkinModel { get; set; } = "classic";
+    public string HostedWorldId { get; set; } = "";
+    public int WaypointProtocolVersion { get; set; }
+    public List<WaypointProviderAnnouncement> WaypointProviders { get; set; } = [];
+}
+
+public sealed class WaypointProviderAnnouncement
+{
+    public string ProviderId { get; set; } = "";
+    public string ModVersion { get; set; } = "";
+    public string WorldContextId { get; set; } = "";
 }
 
 public sealed class PeerViewModel : INotifyPropertyChanged
@@ -106,6 +122,10 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private bool _isInVoiceChannel;
     private bool _isSpeaking;
     private bool _isVoiceMuted;
+    private bool _isMinecraftRunning;
+    private bool _isSkinAvailable;
+    private string _skinSha256 = "";
+    private string _skinModel = "classic";
     private double _voiceVolume = 1.0d;
     private string _state = "";
     private DateTimeOffset _lastSeen;
@@ -113,6 +133,9 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private int? _lastRttMs;
     private DateTimeOffset _lastRttAt;
     private bool _isLocalVoicePeer;
+    private string _hostedWorldId = "";
+    private int _waypointProtocolVersion;
+    private IReadOnlyList<WaypointProviderAnnouncement> _waypointProviders = Array.Empty<WaypointProviderAnnouncement>();
 
     public string PlayerName
     {
@@ -226,6 +249,30 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
     }
 
+    public bool IsMinecraftRunning
+    {
+        get => _isMinecraftRunning;
+        set => Set(ref _isMinecraftRunning, value);
+    }
+
+    public bool IsSkinAvailable
+    {
+        get => _isSkinAvailable;
+        set => Set(ref _isSkinAvailable, value);
+    }
+
+    public string SkinSha256
+    {
+        get => _skinSha256;
+        set => Set(ref _skinSha256, value ?? "");
+    }
+
+    public string SkinModel
+    {
+        get => _skinModel;
+        set => Set(ref _skinModel, string.Equals(value, "slim", StringComparison.OrdinalIgnoreCase) ? "slim" : "classic");
+    }
+
     public double VoiceVolume
     {
         get => _voiceVolume;
@@ -268,6 +315,13 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
     }
     public DateTimeOffset LastRttAt { get => _lastRttAt; set => Set(ref _lastRttAt, value); }
+    public string HostedWorldId { get => _hostedWorldId; set => Set(ref _hostedWorldId, value); }
+    public int WaypointProtocolVersion { get => _waypointProtocolVersion; set => Set(ref _waypointProtocolVersion, value); }
+    public IReadOnlyList<WaypointProviderAnnouncement> WaypointProviders
+    {
+        get => _waypointProviders;
+        set => Set(ref _waypointProviders, value ?? Array.Empty<WaypointProviderAnnouncement>());
+    }
 
     public string DisplayName
     {
@@ -333,6 +387,13 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         IdentityName = announcement.IdentityName;
         IsInVoiceChannel = announcement.IsVoiceChannelActive;
         IsVoiceMuted = announcement.IsVoiceMuted;
+        IsMinecraftRunning = announcement.IsMinecraftRunning;
+        IsSkinAvailable = announcement.IsSkinAvailable;
+        SkinSha256 = announcement.SkinSha256;
+        SkinModel = announcement.SkinModel;
+        HostedWorldId = announcement.HostedWorldId;
+        WaypointProtocolVersion = announcement.WaypointProtocolVersion;
+        WaypointProviders = announcement.WaypointProviders?.ToArray() ?? Array.Empty<WaypointProviderAnnouncement>();
         PackHash = announcement.PackHash;
         State = announcement.State;
         LocalPackHash = localPackHash;
@@ -492,6 +553,7 @@ public sealed class WorldTransferHeader
     public long Size { get; set; }
     public string WorldSha256 { get; set; } = "";
     public string PlayerManifestSha256 { get; set; } = "";
+    public string WaypointManifestSha256 { get; set; } = "";
     public string FileName { get; set; } = "world.zip";
     public string WorldName { get; set; } = "World";
 }
@@ -506,6 +568,7 @@ public sealed class WorldTransferAck
     public string Message { get; set; } = "";
     public string WorldSha256 { get; set; } = "";
     public string PlayerManifestSha256 { get; set; } = "";
+    public string WaypointManifestSha256 { get; set; } = "";
 }
 
 public sealed class WorldTransferControl
@@ -530,7 +593,8 @@ public sealed class WorldTransferJournal
 
 public sealed class WorldMetadata
 {
-    public int SchemaVersion { get; set; } = 4;
+    public int SchemaVersion { get; set; } = 5;
+    public string WorldId { get; set; } = "";
     public string BuildName { get; set; } = "";
     public string BuildRelativePath { get; set; } = "";
     public string PackHash { get; set; } = "";

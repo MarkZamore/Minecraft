@@ -4,6 +4,19 @@ namespace Minecraft;
 
 public static class WorldAccessGuard
 {
+    public static bool IsOpen(string worldPath)
+    {
+        try
+        {
+            EnsureClosed(worldPath);
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+    }
+
     public static void EnsureClosed(string worldPath)
     {
         var lockPath = Path.Combine(worldPath, "session.lock");

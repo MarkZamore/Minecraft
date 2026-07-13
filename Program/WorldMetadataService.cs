@@ -6,9 +6,10 @@ namespace Minecraft;
 public sealed class WorldMetadataService
 {
     public const string MetadataFileName = ".minecraft-portable-world.json";
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 5;
     private const string UnknownBuildName = "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u043E";
     private const string UnknownOwnerName = "\u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u043E";
+    private readonly object _gate = new();
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
 
     public WorldMetadata? Read(string worldPath)
@@ -31,15 +32,36 @@ public sealed class WorldMetadataService
 
     public WorldMetadata? EnsureMetadata(string worldPath, WorldMetadataContext? context)
     {
+        lock (_gate) return EnsureMetadataCore(worldPath, context);
+    }
+
+    private WorldMetadata? EnsureMetadataCore(string worldPath, WorldMetadataContext? context)
+    {
         var metadataPath = GetMetadataPath(worldPath);
         var existing = Read(worldPath);
-        if (existing is not null || File.Exists(metadataPath) || context is null)
+        if (existing is not null)
         {
+            if (EnsureWorldId(existing))
+            {
+                try
+                {
+                    AtomicFile.WriteAllText(metadataPath, JsonSerializer.Serialize(existing, _jsonOptions));
+                }
+                catch
+                {
+                    return null;
+                }
+            }
             return existing;
+        }
+        if (File.Exists(metadataPath) || context is null)
+        {
+            return null;
         }
 
         var metadata = new WorldMetadata
         {
+            WorldId = Guid.NewGuid().ToString("D"),
             BuildName = string.IsNullOrWhiteSpace(context.BuildName) ? UnknownBuildName : context.BuildName,
             BuildRelativePath = context.BuildRelativePath,
             PackHash = context.PackHash,
@@ -70,6 +92,11 @@ public sealed class WorldMetadataService
     }
 
     public bool TryWriteOwnerMetadata(string worldPath, string? ownerId, string? ownerName, bool overwriteExistingOwner = false)
+    {
+        lock (_gate) return TryWriteOwnerMetadataCore(worldPath, ownerId, ownerName, overwriteExistingOwner);
+    }
+
+    private bool TryWriteOwnerMetadataCore(string worldPath, string? ownerId, string? ownerName, bool overwriteExistingOwner)
     {
         var metadataPath = GetMetadataPath(worldPath);
         WorldMetadata metadata;
@@ -131,6 +158,7 @@ public sealed class WorldMetadataService
 
         metadata.OwnerIdentityId = normalizedOwnerId;
         metadata.OwnerIdentityName = normalizedOwnerName;
+        EnsureWorldId(metadata);
         if (metadata.SchemaVersion < CurrentSchemaVersion)
         {
             metadata.SchemaVersion = CurrentSchemaVersion;
@@ -153,6 +181,15 @@ public sealed class WorldMetadataService
         string? holderName,
         bool transferred)
     {
+        lock (_gate) return TryWriteCurrentHolderMetadataCore(worldPath, holderId, holderName, transferred);
+    }
+
+    private bool TryWriteCurrentHolderMetadataCore(
+        string worldPath,
+        string? holderId,
+        string? holderName,
+        bool transferred)
+    {
         var metadataPath = GetMetadataPath(worldPath);
         var metadata = Read(worldPath);
         if (metadata is null)
@@ -167,6 +204,7 @@ public sealed class WorldMetadataService
         }
 
         metadata.SchemaVersion = CurrentSchemaVersion;
+        EnsureWorldId(metadata);
         metadata.CurrentHolderIdentityId = string.IsNullOrWhiteSpace(holderId) ? string.Empty : holderId.Trim();
         metadata.CurrentHolderIdentityName = string.IsNullOrWhiteSpace(holderName) ? UnknownOwnerName : holderName.Trim();
         if (transferred) metadata.LastSuccessfulTransferUtc = DateTimeOffset.UtcNow;
@@ -184,5 +222,44 @@ public sealed class WorldMetadataService
     private static string GetMetadataPath(string worldPath)
     {
         return Path.Combine(worldPath, MetadataFileName);
+    }
+
+    public string EnsureWorldId(string worldPath, WorldMetadataContext? context = null)
+    {
+        lock (_gate)
+        {
+            var metadata = EnsureMetadataCore(worldPath, context)
+                ?? throw new InvalidDataException($"World metadata is missing or damaged: {Path.GetFileName(worldPath)}");
+            if (!Guid.TryParse(metadata.WorldId, out var worldId) || worldId == Guid.Empty)
+            {
+                throw new InvalidDataException($"World metadata has an invalid WorldId: {Path.GetFileName(worldPath)}");
+            }
+            return worldId.ToString("D");
+        }
+    }
+
+    private static bool EnsureWorldId(WorldMetadata metadata)
+    {
+        var changed = false;
+        if (!Guid.TryParse(metadata.WorldId, out var worldId) || worldId == Guid.Empty)
+        {
+            metadata.WorldId = Guid.NewGuid().ToString("D");
+            changed = true;
+        }
+        else
+        {
+            var normalized = worldId.ToString("D");
+            if (!string.Equals(metadata.WorldId, normalized, StringComparison.Ordinal))
+            {
+                metadata.WorldId = normalized;
+                changed = true;
+            }
+        }
+        if (metadata.SchemaVersion < CurrentSchemaVersion)
+        {
+            metadata.SchemaVersion = CurrentSchemaVersion;
+            changed = true;
+        }
+        return changed;
     }
 }

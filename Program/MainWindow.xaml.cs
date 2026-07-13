@@ -29,6 +29,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<WorldViewModel> _worlds = new();
     private readonly ObservableCollection<ClientBuildViewModel> _builds = new();
     private readonly ObservableCollection<PeerViewModel> _voicePeers = new();
+    private readonly Dictionary<string, VoicePresenceEntry> _voicePresence = new(StringComparer.OrdinalIgnoreCase);
     private readonly DispatcherTimer _uiTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly DispatcherTimer _secretTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly CancellationTokenSource _lifetimeCts = new();
@@ -46,12 +47,15 @@ public partial class MainWindow : Window
     private PortableIdentityAdapterService? _identityAdapter;
     private PackInstanceService? _packInstances;
     private PackRuntimeService? _packRuntimes;
+    private WaypointSyncService? _waypointSync;
+    private SkinService? _skinService;
     private PeerDiscoveryService? _discovery;
     private LanAdvertisementService? _lanAdvertisement;
     private MinecraftProcessService? _minecraft;
     private WorldTransferService? _transfer;
     private UpdateService? _updateService;
     private VoiceChannelService? _voiceChannel;
+    private VoiceNetworkCoordinator? _voiceNetwork;
     private VoiceSettingsWindow? _voiceSettingsWindow;
     private GlobalPttHotkeyService? _pttHotkey;
     private NetworkAdapterInfo? _adapter;
@@ -100,7 +104,7 @@ public partial class MainWindow : Window
         OnlinePlayerComboBox.ItemsSource = _peers;
         HostComboBox.ItemsSource = _hostPeers;
         WorldComboBox.ItemsSource = _worlds;
-        VoicePeersListBox.ItemsSource = _voicePeers;
+        VoicePeersItemsControl.ItemsSource = _voicePeers;
         _uiTimer.Tick += (_, _) =>
         {
             RefreshBuilds();
@@ -138,9 +142,13 @@ public partial class MainWindow : Window
             _worldPlayerProfiles = new WorldPlayerProfileService(_paths, _logger);
             _packInstances = new PackInstanceService(_paths, _logger);
             _packRuntimes = new PackRuntimeService(_paths, _logger);
-            _minecraft = new MinecraftProcessService(_paths, _logger, _identityService, _identityAdapter, _worldPlayerProfiles, _packInstances, _packRuntimes);
+            _waypointSync = new WaypointSyncService(_paths, _logger, _worldMetadata);
+            _skinService = new SkinService(_paths, _logger);
+            await _skinService.StartAsync(_lifetimeCts.Token);
+            _voiceNetwork = new VoiceNetworkCoordinator();
+            _minecraft = new MinecraftProcessService(_paths, _logger, _identityService, _identityAdapter, _worldPlayerProfiles, _packInstances, _packRuntimes, _waypointSync, _skinService);
             _minecraft.ClientRunningChanged += OnMinecraftClientRunningChanged;
-            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles);
+            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _voiceNetwork);
             _updateService = new UpdateService(_paths, _logger);
             _transfer.StatusChanged += message => Dispatcher.Invoke(() => SetState(message));
             _transfer.ProgressChanged += progress =>
@@ -157,9 +165,10 @@ public partial class MainWindow : Window
             _discovery.PeerUpdated += announcement => Dispatcher.Invoke(() => ApplyPeer(announcement));
             _lanAdvertisement = new LanAdvertisementService(_logger);
             _lanAdvertisement.Start();
-            _voiceChannel = new VoiceChannelService(_logger);
+            _voiceChannel = new VoiceChannelService(_logger, _voiceNetwork);
             _voiceChannel.Initialize(_settings);
             _voiceChannel.SpeakingStateChanged += OnVoiceSpeakingStateChanged;
+            _voiceChannel.PeerPresenceChanged += OnVoicePeerPresenceChanged;
             InitializePttHotkey();
 
             LoadSettingsIntoUi();
@@ -167,7 +176,10 @@ public partial class MainWindow : Window
             RefreshBuilds();
             RefreshAdapters();
             RefreshRadminSetupStatus();
-            _ = AutoLaunchInstalledRadminAsync();
+            if (_settings.RadminAutoLaunch)
+            {
+                _ = AutoLaunchInstalledRadminAsync();
+            }
             RefreshHostPeers();
             RefreshMemoryText(saveIfChanged: true);
             RefreshWorlds();
@@ -215,6 +227,8 @@ public partial class MainWindow : Window
             _voiceSettingsWindow?.Close();
             if (_voiceChannel is not null) await _voiceChannel.DisposeAsync();
             if (_transfer is not null) await _transfer.DisposeAsync();
+            if (_waypointSync is not null) await _waypointSync.DisposeAsync();
+            if (_skinService is not null) await _skinService.DisposeAsync();
             _packInstances?.Dispose();
             _packRuntimes?.Dispose();
             _identityAdapter?.Dispose();
@@ -240,6 +254,7 @@ public partial class MainWindow : Window
         {
             PlayerNameTextBox.Text = RequireSettings().PlayerName;
             RefreshRadminTicketText();
+            RadminAutoLaunchCheckBox.IsChecked = settings.RadminAutoLaunch;
             VoiceMasterVolumeSlider.Value = settings.VoiceOutputVolume;
             VoiceMuteButton.Content = "Микрофон";
             VoiceDeafenButton.Content = "Звук";
@@ -712,17 +727,16 @@ public partial class MainWindow : Window
 
     private void RefreshVoicePeers()
     {
-        var selected = VoicePeersListBox.SelectedItem as PeerViewModel;
-        var selectedId = ResolveVoicePeerId(selected);
+        var cutoff = DateTimeOffset.UtcNow - TimeSpan.FromSeconds(30);
+        foreach (var stale in _voicePresence.Where(pair => pair.Value.LastSeenUtc < cutoff).Select(pair => pair.Key).ToArray())
+        {
+            _voicePresence.Remove(stale);
+        }
 
-        var peers = _peers
-            .Where(peer => peer.IsInVoiceChannel)
-            .GroupBy(peer => ResolveVoicePeerId(peer))
-            .Select(group => group.OrderByDescending(item => item.LastSeen).FirstOrDefault())
-            .Where(peer => peer is not null)
-            .OrderByDescending(peer => peer!.LastSeen)
-            .ThenBy(peer => peer!.PlayerName, StringComparer.CurrentCultureIgnoreCase)
-            .Cast<PeerViewModel>()
+        var peers = _voicePresence.Values
+            .OrderByDescending(entry => entry.LastSeenUtc)
+            .ThenBy(entry => entry.Peer.PlayerName, StringComparer.CurrentCultureIgnoreCase)
+            .Select(entry => entry.Peer)
             .ToList();
         if (_voiceChannel is { IsJoined: true })
         {
@@ -755,18 +769,6 @@ public partial class MainWindow : Window
             {
                 _voicePeers.Add(peer);
             }
-
-            if (selected is not null)
-            {
-                var restored = _voicePeers.FirstOrDefault(peer =>
-                    string.Equals(ResolveVoicePeerId(peer), selectedId, StringComparison.OrdinalIgnoreCase));
-                VoicePeersListBox.SelectedItem = restored;
-            }
-
-            if (VoicePeersListBox.SelectedItem is null && _voicePeers.Count > 0)
-            {
-                VoicePeersListBox.SelectedItem = _voicePeers[0];
-            }
         }
 
         UpdateVoicePeersFromDiscovery();
@@ -790,10 +792,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        var peers = _peers
-            .Where(peer => peer.IsInVoiceChannel && !string.IsNullOrWhiteSpace(peer.VpnIp))
-            .SelectMany(peer => peer.NetworkEndpoints.Select(endpoint =>
-                (peerId: ResolveVoicePeerId(peer), ip: endpoint.Address)))
+        var peers = _voicePresence
+            .Where(pair => pair.Value.LastSeenUtc >= DateTimeOffset.UtcNow - TimeSpan.FromSeconds(30))
+            .SelectMany(pair => pair.Value.Endpoints.Select(ip =>
+                (peerId: pair.Key, ip)))
             .Where(peer => !string.IsNullOrWhiteSpace(peer.peerId))
             .Distinct()
             .ToArray();
@@ -903,6 +905,14 @@ public partial class MainWindow : Window
         var identity = ResolveActiveLocalIdentity();
         RefreshOpenToLanState();
         var openToLanPort = _openToLanPort;
+        var identityContext = RequireIdentityService().ResolveContext(settings);
+        RequireWaypointSync().UpdateHostingState(
+            openToLanPort.HasValue,
+            settings.ClientRelativePath,
+            _localPackHash,
+            identityContext);
+        var waypointHost = RequireWaypointSync().GetHostAdvertisement();
+        var skin = RequireSkinService().GetAnnouncement(settings, identity.id);
         return new PeerAnnouncement
         {
             ProtocolVersion = PeerDiscoveryService.ProtocolVersion,
@@ -916,7 +926,14 @@ public partial class MainWindow : Window
             ServerPort = openToLanPort ?? 0,
             State = openToLanPort.HasValue ? "LAN open" : "Minecraft",
             IsVoiceChannelActive = _voiceChannel?.IsJoined == true,
-            IsVoiceMuted = _voiceChannel?.IsMuted == true
+            IsVoiceMuted = _voiceChannel?.IsMuted == true,
+            IsMinecraftRunning = _minecraftRunning,
+            IsSkinAvailable = skin.IsAvailable,
+            SkinSha256 = skin.Sha256,
+            SkinModel = skin.Model,
+            HostedWorldId = waypointHost?.WorldId ?? string.Empty,
+            WaypointProtocolVersion = WaypointSyncService.ProtocolVersion,
+            WaypointProviders = waypointHost?.Providers.ToList() ?? []
         };
     }
 
@@ -933,6 +950,40 @@ public partial class MainWindow : Window
 
             peer.IsSpeaking = isSpeaking;
             RefreshVoiceSettingsWindow();
+        });
+    }
+
+    private void OnVoicePeerPresenceChanged(string peerId, bool isPresent, bool explicitLeave)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (isPresent)
+            {
+                if (_voicePresence.TryGetValue(peerId, out var existing))
+                {
+                    existing.LastSeenUtc = DateTimeOffset.UtcNow;
+                }
+                else
+                {
+                    var peer = _peers.FirstOrDefault(candidate =>
+                        string.Equals(ResolveVoicePeerId(candidate), peerId, StringComparison.OrdinalIgnoreCase));
+                    if (peer is not null)
+                    {
+                        _voicePresence[peerId] = new VoicePresenceEntry(
+                            peer,
+                            peer.GetCandidateIps().ToArray(),
+                            DateTimeOffset.UtcNow);
+                    }
+                }
+            }
+            else if (explicitLeave ||
+                     (_voicePresence.TryGetValue(peerId, out var existing) &&
+                      DateTimeOffset.UtcNow - existing.LastSeenUtc >= TimeSpan.FromSeconds(30)))
+            {
+                _voicePresence.Remove(peerId);
+            }
+            RefreshVoicePeers();
         });
     }
 
@@ -975,6 +1026,8 @@ public partial class MainWindow : Window
             return;
         }
 
+        RequireWaypointSync().ObservePeer(announcement);
+
         var peer = !string.IsNullOrWhiteSpace(announcement.IdentityId)
             ? _peers.FirstOrDefault(item =>
                 string.Equals(item.IdentityId, announcement.IdentityId, StringComparison.OrdinalIgnoreCase))
@@ -988,6 +1041,22 @@ public partial class MainWindow : Window
         }
 
         peer.Apply(announcement, _localPackHash);
+        RequireSkinService().ObservePeer(peer);
+        var voicePeerId = ResolveVoicePeerId(peer);
+        if (!string.IsNullOrWhiteSpace(voicePeerId))
+        {
+            if (announcement.IsVoiceChannelActive)
+            {
+                _voicePresence[voicePeerId] = new VoicePresenceEntry(
+                    peer,
+                    peer.GetCandidateIps().ToArray(),
+                    DateTimeOffset.UtcNow);
+            }
+            else
+            {
+                _voicePresence.Remove(voicePeerId);
+            }
+        }
         if (OnlinePlayerComboBox.SelectedItem is null)
         {
             OnlinePlayerComboBox.SelectedItem = peer;
@@ -1287,6 +1356,39 @@ public partial class MainWindow : Window
         });
     }
 
+    private void SkinButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_minecraftRunning || _settings is null || _skinService is null)
+        {
+            return;
+        }
+
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "Выберите скин Minecraft",
+            Filter = "PNG (*.png)|*.png",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        try
+        {
+            var identity = ResolveActiveLocalIdentity();
+            var skin = _skinService.SelectLocalSkin(_settings, identity.id, dialog.FileName);
+            RequireSettingsService().Save(_settings);
+            SetState($"Skin selected ({skin.Model})");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or NotSupportedException)
+        {
+            RequireLogger().Warn($"Skin selection failed: {ex.Message}");
+            MessageBox.Show(ex.Message, "Minecraft", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
     private async Task<(string Ip, int Port)?> GetSelectedHostAddressAsync(PeerViewModel? peer)
     {
         if (peer is null || peer.ServerPort <= 0)
@@ -1398,7 +1500,12 @@ public partial class MainWindow : Window
 
     private async void TransferButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunUiActionAsync(async () =>
+        if (_transferActive || _minecraftRunning)
+        {
+            return;
+        }
+
+        try
         {
             if (WorldComboBox.SelectedItem is not WorldViewModel world)
             {
@@ -1409,22 +1516,32 @@ public partial class MainWindow : Window
             {
                 throw new InvalidOperationException("Choose an online player.");
             }
+            if (peer.IsMinecraftRunning)
+            {
+                throw new InvalidOperationException("The selected player is currently in Minecraft.");
+            }
 
             var settings = RequireSettings();
-            try
-            {
-                SetState("Transferring world");
-                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(30));
-                await RequireTransfer().SendWorldAsync(peer, settings, world.Path, cts.Token);
-                RequireSettingsService().Save(settings);
-                RefreshWorlds();
-                SetState("World sent");
-            }
-            catch
-            {
-                throw;
-            }
-        });
+            SetState("Transferring world");
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCts.Token);
+            cts.CancelAfter(TimeSpan.FromMinutes(30));
+            await RequireTransfer().SendWorldAsync(peer, settings, world.Path, cts.Token);
+            RequireSettingsService().Save(settings);
+            RefreshWorlds();
+            SetState("World sent");
+        }
+        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            RequireLogger().Warn(ex.Message);
+            MessageBox.Show(ex.Message, "Minecraft", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            RefreshUi();
+        }
     }
 
     private void PlayerNameTextBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -1773,19 +1890,27 @@ public partial class MainWindow : Window
         });
     }
 
-    private void CopyRadminButton_Click(object sender, RoutedEventArgs e)
+    private void CopyRadminNetworkButton_Click(object sender, RoutedEventArgs e)
     {
-        var settings = RequireSettings();
-        if (string.IsNullOrWhiteSpace(settings.RadminNetworkName) ||
-            string.IsNullOrWhiteSpace(settings.RadminNetworkPassword))
+        CopyTextIfPossible(RequireSettings().RadminNetworkName);
+        SetState("Network name copied");
+    }
+
+    private void CopyRadminPasswordButton_Click(object sender, RoutedEventArgs e)
+    {
+        CopyTextIfPossible(RequireSettings().RadminNetworkPassword);
+        SetState("Network password copied");
+    }
+
+    private void RadminAutoLaunchCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_suppressTextPersistence || _settings is null || _settingsService is null)
         {
             return;
         }
 
-        CopyTextIfPossible(
-            $"Сеть: {settings.RadminNetworkName.Trim()}{Environment.NewLine}" +
-            $"Пароль: {settings.RadminNetworkPassword.Trim()}");
-        SetState("Network credentials copied");
+        _settings.RadminAutoLaunch = RadminAutoLaunchCheckBox.IsChecked == true;
+        _settingsService.Save(_settings);
     }
 
     private async void AdapterComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -2366,14 +2491,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        var networkName = string.IsNullOrWhiteSpace(_settings.RadminNetworkName)
-            ? "—"
-            : _settings.RadminNetworkName.Trim();
-        var password = string.IsNullOrWhiteSpace(_settings.RadminNetworkPassword)
-            ? "—"
-            : _settings.RadminNetworkPassword.Trim();
-        RadminNetworkNameText.Text = $"Сеть: {networkName}";
-        RadminNetworkPasswordText.Text = $"Пароль: {password}";
+        RadminNetworkNameTextBox.Text = _settings.RadminNetworkName?.Trim() ?? string.Empty;
+        RadminNetworkPasswordTextBox.Text = _settings.RadminNetworkPassword?.Trim() ?? string.Empty;
     }
 
     private void RefreshRadminSetupStatus()
@@ -2535,8 +2654,9 @@ public partial class MainWindow : Window
         RefreshPlayerIdentityDisplay();
         var interactiveEnabled = !_busy;
         var configurationEnabled = interactiveEnabled && !_transferActive && !_minecraftRunning;
-        var voiceEnabled = interactiveEnabled && !_voiceBusy && _voiceChannel is not null;
+        var voiceEnabled = !_voiceBusy && _voiceChannel is not null;
         var hasBuild = BuildComboBox.SelectedItem is ClientBuildViewModel;
+        var selectedRecipient = OnlinePlayerComboBox.SelectedItem as PeerViewModel;
         PlayerNameTextBox.IsEnabled = configurationEnabled;
         PlayerNameTextBox.IsReadOnly = !_isEditingPlayerName || !configurationEnabled;
         ChangePlayerNameButton.IsEnabled = configurationEnabled;
@@ -2545,47 +2665,48 @@ public partial class MainWindow : Window
         HostComboBox.IsEnabled = configurationEnabled && _hostPeers.Count > 0;
         PlayButton.Content = "Играть";
         PlayButton.IsEnabled = configurationEnabled && hasBuild && !_isEditingPlayerName;
+        SkinButton.IsEnabled = !_minecraftRunning;
         InstallRadminButton.IsEnabled = interactiveEnabled && !_radminInstalled;
         GenerateRadminButton.IsEnabled = interactiveEnabled;
-        CopyRadminButton.IsEnabled = interactiveEnabled &&
-                                          !string.IsNullOrWhiteSpace(_settings.RadminNetworkName) &&
-                                          !string.IsNullOrWhiteSpace(_settings.RadminNetworkPassword);
-        WorldComboBox.IsEnabled = configurationEnabled && _worlds.Count > 0;
-        OnlinePlayerComboBox.IsEnabled = configurationEnabled && _peers.Count > 0;
+        CopyRadminNetworkButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.RadminNetworkName);
+        CopyRadminPasswordButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.RadminNetworkPassword);
+        RadminAutoLaunchCheckBox.IsEnabled = interactiveEnabled;
+        WorldComboBox.IsEnabled = interactiveEnabled && _worlds.Count > 0;
+        OnlinePlayerComboBox.IsEnabled = interactiveEnabled && _peers.Count > 0;
         WorldPlaceholderText.Visibility = _worlds.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         OnlinePlayerPlaceholderText.Visibility = _peers.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        TransferButton.IsEnabled = configurationEnabled &&
+        TransferButton.IsEnabled = interactiveEnabled && !_transferActive && !_minecraftRunning &&
                                    WorldComboBox.SelectedItem is WorldViewModel &&
-                                   OnlinePlayerComboBox.SelectedItem is PeerViewModel;
+                                   selectedRecipient is not null &&
+                                   !selectedRecipient.IsMinecraftRunning;
         MemoryTextBox.IsEnabled = configurationEnabled;
         UpdateButton.IsEnabled = interactiveEnabled && !_updateBusy && _preparedUpdate is not null;
         SecretOpenButton.IsEnabled = interactiveEnabled &&
                                      SecretExtendedProgressBar.Visibility != Visibility.Visible &&
                                      SecretProgressBar.Value >= SecretProgressBar.Maximum;
 
-        VoiceJoinButton.IsEnabled = interactiveEnabled && !_voiceBusy && _voiceChannel is not null;
+        VoiceJoinButton.IsEnabled = !_voiceBusy && _voiceChannel is not null;
         VoiceSettingsButton.IsEnabled = voiceEnabled;
-        VoicePttButton.IsEnabled = _voiceChannel is { IsJoined: true } && interactiveEnabled;
+        VoicePttButton.IsEnabled = _voiceChannel is { IsJoined: true };
         VoiceInputComboBox.IsEnabled = voiceEnabled;
         VoiceOutputComboBox.IsEnabled = voiceEnabled;
         VoiceMasterVolumeSlider.IsEnabled = voiceEnabled;
-        VoiceMuteButton.IsEnabled = _voiceChannel is { IsJoined: true } && interactiveEnabled && !_voiceBusy;
-        VoiceDeafenButton.IsEnabled = _voiceChannel is not null && interactiveEnabled;
-        VoicePeersListBox.IsEnabled = interactiveEnabled;
+        VoiceMuteButton.IsEnabled = _voiceChannel is { IsJoined: true } && !_voiceBusy;
+        VoiceDeafenButton.IsEnabled = _voiceChannel is not null;
         if (_voiceChannel is not null)
         {
-            VoiceJoinButton.Content = _voiceChannel.IsJoined ? "−" : "+";
+            VoiceJoinButton.Content = _voiceChannel.IsJoined ? "\uE778" : "\uE717";
             VoiceJoinButton.ToolTip = _voiceChannel.IsJoined
                 ? "Выйти из голосового канала"
                 : "Войти в голосовой канал";
-            VoiceMuteButton.Content = _voiceChannel.IsMuted ? "⊘" : "🎙";
+            VoiceMuteButton.Content = _voiceChannel.IsMuted ? "\uE198" : "\uE720";
             VoiceMuteButton.ToolTip = _voiceChannel.IsMuted ? "Включить микрофон" : "Выключить микрофон";
             VoiceDeafenButton.Content = "Звук";
         }
         else
         {
-            VoiceJoinButton.Content = "+";
-            VoiceMuteButton.Content = "🎙";
+            VoiceJoinButton.Content = "\uE717";
+            VoiceMuteButton.Content = "\uE720";
             VoiceDeafenButton.Content = "Звук";
         }
         VoiceStatusText.Text = string.Empty;
@@ -2617,5 +2738,21 @@ public partial class MainWindow : Window
     private PeerDiscoveryService RequireDiscovery() => _discovery ?? throw new InvalidOperationException("Peer discovery is not initialized.");
     private MinecraftProcessService RequireMinecraft() => _minecraft ?? throw new InvalidOperationException("Minecraft service is not initialized.");
     private WorldTransferService RequireTransfer() => _transfer ?? throw new InvalidOperationException("World transfer service is not initialized.");
+    private WaypointSyncService RequireWaypointSync() => _waypointSync ?? throw new InvalidOperationException("Waypoint sync service is not initialized.");
+    private SkinService RequireSkinService() => _skinService ?? throw new InvalidOperationException("Skin service is not initialized.");
+
+    private sealed class VoicePresenceEntry
+    {
+        public VoicePresenceEntry(PeerViewModel peer, IReadOnlyList<string> endpoints, DateTimeOffset lastSeenUtc)
+        {
+            Peer = peer;
+            Endpoints = endpoints;
+            LastSeenUtc = lastSeenUtc;
+        }
+
+        public PeerViewModel Peer { get; }
+        public IReadOnlyList<string> Endpoints { get; set; }
+        public DateTimeOffset LastSeenUtc { get; set; }
+    }
     private UpdateService RequireUpdateService() => _updateService ?? throw new InvalidOperationException("Update service is not initialized.");
 }
