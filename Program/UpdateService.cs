@@ -1,11 +1,11 @@
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using BsDiff;
 
 namespace Minecraft;
@@ -22,7 +22,7 @@ public sealed class UpdateService
     public const string DeltaPatchAlgorithm = "bsdiff";
     public const int DeltaPatchAlgorithmVersion = 1;
 
-    private static readonly Uri LatestReleaseApiUri = new($"https://api.github.com/repos/{RepositoryOwner}/{RepositoryName}/releases/tags/{ReleaseTag}");
+    private const int UpdateCheckAttempts = 3;
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly HttpClient _httpClient;
@@ -49,7 +49,7 @@ public sealed class UpdateService
         _logger = logger;
         _httpClient = httpClient ?? PortableHttpClient.Shared;
         _currentCommitSha = string.IsNullOrWhiteSpace(currentCommitSha) ? CurrentCommitSha : NormalizeSha(currentCommitSha);
-        _checkTimeout = checkTimeout ?? TimeSpan.FromSeconds(5);
+        _checkTimeout = checkTimeout ?? TimeSpan.FromSeconds(20);
         _currentExecutablePath = string.IsNullOrWhiteSpace(currentExecutablePath)
             ? null
             : Path.GetFullPath(currentExecutablePath);
@@ -104,63 +104,56 @@ public sealed class UpdateService
 
     public async Task<UpdateCheckResult> CheckAsync(CancellationToken token)
     {
-        try
+        Exception? lastError = null;
+        for (var attempt = 1; attempt <= UpdateCheckAttempts; attempt++)
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            timeout.CancelAfter(_checkTimeout);
-            var release = await GetLatestReleaseAsync(timeout.Token);
-            var manifestAsset = release.FindAsset(ManifestAssetName);
-            var executableAsset = release.FindAsset(ExecutableAssetName);
-            if (manifestAsset is null || executableAsset is null)
+            try
             {
-                return UpdateCheckResult.UpToDate("Release assets are incomplete.");
-            }
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                timeout.CancelAfter(_checkTimeout);
+                var manifest = await DownloadManifestAsync(
+                    BuildReleaseAssetUri(ManifestAssetName, preventCaching: true),
+                    timeout.Token).ConfigureAwait(false);
+                ValidateManifest(manifest);
+                var evaluation = EvaluateManifest(manifest, _currentCommitSha);
+                if (!evaluation.IsUpdateAvailable)
+                {
+                    return evaluation;
+                }
 
-            var manifest = await DownloadManifestAsync(manifestAsset.BrowserDownloadUrl, timeout.Token);
-            ValidateManifest(manifest);
-            if (executableAsset.Size > 0 && executableAsset.Size != manifest.SizeBytes)
-            {
-                throw new InvalidOperationException("Release asset size does not match update manifest.");
-            }
-            var evaluation = EvaluateManifest(manifest, _currentCommitSha);
-            if (!evaluation.IsUpdateAvailable)
-            {
-                return evaluation;
-            }
+                Uri? deltaPatchDownloadUrl = null;
+                if (manifest.DeltaPatch is not null &&
+                    string.Equals(
+                        NormalizeSha(manifest.DeltaPatch.BaseCommitSha),
+                        _currentCommitSha,
+                        StringComparison.OrdinalIgnoreCase) &&
+                    await CurrentExecutableMatchesBaseAsync(manifest.DeltaPatch, token).ConfigureAwait(false))
+                {
+                    deltaPatchDownloadUrl = BuildReleaseAssetUri(manifest.DeltaPatch.AssetName);
+                }
 
-            Uri? deltaPatchDownloadUrl = null;
-            if (manifest.DeltaPatch is not null &&
-                string.Equals(NormalizeSha(manifest.DeltaPatch.BaseCommitSha), _currentCommitSha, StringComparison.OrdinalIgnoreCase))
+                return UpdateCheckResult.Available(
+                    manifest,
+                    BuildReleaseAssetUri(manifest.AssetName),
+                    deltaPatchDownloadUrl);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
-                var deltaAsset = release.FindAsset(manifest.DeltaPatch.AssetName);
-                if (deltaAsset is null)
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                _logger.Warn($"Update check attempt {attempt}/{UpdateCheckAttempts} failed: {ex.Message}");
+                if (attempt < UpdateCheckAttempts)
                 {
-                    _logger.Warn("Delta patch asset is missing; the full update will be downloaded.");
-                }
-                else if (deltaAsset.Size > 0 && deltaAsset.Size != manifest.DeltaPatch.SizeBytes)
-                {
-                    _logger.Warn("Delta patch asset size does not match the manifest; the full update will be downloaded.");
-                }
-                else if (await CurrentExecutableMatchesBaseAsync(manifest.DeltaPatch, token).ConfigureAwait(false))
-                {
-                    deltaPatchDownloadUrl = deltaAsset.BrowserDownloadUrl;
-                }
-                else
-                {
-                    _logger.Info("The current executable does not match the delta base; the full update will be downloaded.");
+                    await Task.Delay(TimeSpan.FromSeconds(attempt), token).ConfigureAwait(false);
                 }
             }
-
-            return UpdateCheckResult.Available(
-                manifest,
-                executableAsset.BrowserDownloadUrl,
-                deltaPatchDownloadUrl);
         }
-        catch (Exception ex)
-        {
-            _logger.Warn($"Update check failed: {ex.Message}");
-            return UpdateCheckResult.UpToDate(ex.Message);
-        }
+
+        var message = lastError?.Message ?? "The update service is unavailable.";
+        return UpdateCheckResult.UpToDate(message);
     }
 
     public async Task<PreparedUpdate> DownloadUpdateAsync(
@@ -564,21 +557,34 @@ public sealed class UpdateService
         return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 
-    private async Task<GitHubRelease> GetLatestReleaseAsync(CancellationToken token)
-    {
-        using var response = await _httpClient.GetAsync(LatestReleaseApiUri, token);
-        response.EnsureSuccessStatusCode();
-        await using var stream = await response.Content.ReadAsStreamAsync(token);
-        return await JsonSerializer.DeserializeAsync<GitHubRelease>(stream, _jsonOptions, token) ??
-               throw new InvalidOperationException("GitHub release response was empty.");
-    }
-
     private async Task<UpdateManifest> DownloadManifestAsync(Uri manifestUri, CancellationToken token)
     {
         ValidateGitHubDownloadUri(manifestUri);
-        await using var stream = await _httpClient.GetStreamAsync(manifestUri, token);
+        using var request = new HttpRequestMessage(HttpMethod.Get, manifestUri);
+        request.Headers.CacheControl = new CacheControlHeaderValue
+        {
+            NoCache = true,
+            NoStore = true
+        };
+        using var response = await _httpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            token).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
         return await JsonSerializer.DeserializeAsync<UpdateManifest>(stream, _jsonOptions, token) ??
                throw new InvalidOperationException("Update manifest was empty.");
+    }
+
+    private static Uri BuildReleaseAssetUri(string assetName, bool preventCaching = false)
+    {
+        var uri =
+            $"https://github.com/{RepositoryOwner}/{RepositoryName}/releases/download/{ReleaseTag}/{Uri.EscapeDataString(assetName)}";
+        if (preventCaching)
+        {
+            uri += $"?cache={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+        }
+        return new Uri(uri, UriKind.Absolute);
     }
 
     private async Task CopyWithProgressAsync(
@@ -805,27 +811,4 @@ public sealed class UpdateCheckResult
         UpdateManifest manifest,
         Uri? executableDownloadUrl,
         Uri? deltaPatchDownloadUrl = null) => new(true, manifest, executableDownloadUrl, deltaPatchDownloadUrl, "");
-}
-
-public sealed class GitHubRelease
-{
-    [JsonPropertyName("assets")]
-    public List<GitHubReleaseAsset> Assets { get; set; } = new();
-
-    public GitHubReleaseAsset? FindAsset(string name)
-    {
-        return Assets.FirstOrDefault(asset => string.Equals(asset.Name, name, StringComparison.OrdinalIgnoreCase));
-    }
-}
-
-public sealed class GitHubReleaseAsset
-{
-    [JsonPropertyName("name")]
-    public string Name { get; set; } = "";
-
-    [JsonPropertyName("browser_download_url")]
-    public Uri BrowserDownloadUrl { get; set; } = new("https://github.com/");
-
-    [JsonPropertyName("size")]
-    public long Size { get; set; }
 }
