@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Collections.Concurrent;
 using CmlLib.Core;
 using CmlLib.Core.Files;
 using CmlLib.Core.Installers;
@@ -16,18 +17,27 @@ public sealed class PortableGameInstaller : IGameInstaller
     private readonly string _runtimeRoot;
     private readonly string _temporaryRoot;
     private readonly IProgress<RuntimePreparationProgress>? _runtimeProgress;
+    private readonly int _phaseIndex;
+    private readonly int _phaseCount;
+    private readonly VoiceNetworkCoordinator? _networkCoordinator;
     private long _lastRuntimeProgressTimestamp;
 
     public PortableGameInstaller(
         HttpClient httpClient,
         string runtimeRoot,
         string temporaryRoot,
-        IProgress<RuntimePreparationProgress>? runtimeProgress)
+        IProgress<RuntimePreparationProgress>? runtimeProgress,
+        int phaseIndex,
+        int phaseCount,
+        VoiceNetworkCoordinator? networkCoordinator = null)
     {
         _httpClient = httpClient;
         _runtimeRoot = Path.GetFullPath(runtimeRoot);
         _temporaryRoot = Path.GetFullPath(temporaryRoot);
         _runtimeProgress = runtimeProgress;
+        _phaseIndex = phaseIndex;
+        _phaseCount = phaseCount;
+        _networkCoordinator = networkCoordinator;
     }
 
     public async ValueTask Install(
@@ -49,8 +59,10 @@ public sealed class PortableGameInstaller : IGameInstaller
 
         var pending = files.Where(NeedsUpdate).ToArray();
         var totalBytes = pending.Where(file => file.Size > 0).Sum(file => file.Size);
+        var discoveredSizes = new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         long downloadedBytes = 0;
         var completedFiles = 0;
+        using var bandwidthLimiter = _networkCoordinator?.CreateTransferLimiter();
         Interlocked.Exchange(ref _lastRuntimeProgressTimestamp, 0);
         Directory.CreateDirectory(_temporaryRoot);
 
@@ -69,11 +81,21 @@ public sealed class PortableGameInstaller : IGameInstaller
                     file.Name,
                     InstallerEventType.Queued));
 
-                await DownloadWithRetryAsync(file, bytesRead =>
-                {
-                    var current = Interlocked.Add(ref downloadedBytes, bytesRead);
-                    ReportBytes(current, totalBytes, byteProgress);
-                }, token);
+                await DownloadWithRetryAsync(
+                    file,
+                    bytesRead =>
+                    {
+                        var current = Interlocked.Add(ref downloadedBytes, bytesRead);
+                        ReportBytes(current, Interlocked.Read(ref totalBytes), byteProgress);
+                    },
+                    discoveredSize =>
+                    {
+                        if (file.Size > 0 || discoveredSize <= 0 ||
+                            !discoveredSizes.TryAdd(file.Path!, discoveredSize)) return;
+                        Interlocked.Add(ref totalBytes, discoveredSize);
+                    },
+                    bandwidthLimiter,
+                    token);
 
                 var completed = Interlocked.Increment(ref completedFiles);
                 fileProgress?.Report(new InstallerProgressChangedEventArgs(
@@ -89,11 +111,25 @@ public sealed class PortableGameInstaller : IGameInstaller
             await file.ExecuteUpdateTask(cancellationToken);
         }
 
-        ReportBytes(totalBytes, totalBytes, byteProgress, force: true);
+        if (pending.Length > 0)
+        {
+            var finalDownloaded = Interlocked.Read(ref downloadedBytes);
+            var finalTotal = Interlocked.Read(ref totalBytes);
+            ReportBytes(finalDownloaded, finalTotal, byteProgress, force: true);
+        }
+        else
+        {
+            byteProgress?.Report(new ByteProgress(0, 0));
+        }
         TryDeleteDirectoryIfEmpty(_temporaryRoot);
     }
 
-    private async Task DownloadWithRetryAsync(GameFile file, Action<long> reportBytes, CancellationToken token)
+    private async Task DownloadWithRetryAsync(
+        GameFile file,
+        Action<long> reportBytes,
+        Action<long> reportDiscoveredSize,
+        VoiceTransferLimiter? bandwidthLimiter,
+        CancellationToken token)
     {
         if (string.IsNullOrWhiteSpace(file.Url))
         {
@@ -116,6 +152,10 @@ public sealed class PortableGameInstaller : IGameInstaller
                 var uri = NormalizeDownloadUri(file.Url);
                 using var response = await _httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, token);
                 response.EnsureSuccessStatusCode();
+                if (response.Content.Headers.ContentLength is > 0 and var contentLength)
+                {
+                    reportDiscoveredSize(contentLength);
+                }
                 await using (var input = await response.Content.ReadAsStreamAsync(token))
                 await using (var output = new FileStream(
                                  temporaryPath,
@@ -125,12 +165,16 @@ public sealed class PortableGameInstaller : IGameInstaller
                                  1024 * 1024,
                                  FileOptions.Asynchronous | FileOptions.SequentialScan))
                 {
-                    var buffer = new byte[1024 * 1024];
+                    var buffer = new byte[VoiceTransferLimiter.TransferBlockSize];
                     while (true)
                     {
                         var read = await input.ReadAsync(buffer.AsMemory(), token);
                         if (read == 0) break;
                         await output.WriteAsync(buffer.AsMemory(0, read), token);
+                        if (bandwidthLimiter is not null)
+                        {
+                            await bandwidthLimiter.ThrottleAsync(read, token).ConfigureAwait(false);
+                        }
                         attemptBytes += read;
                         reportBytes(read);
                     }
@@ -176,7 +220,9 @@ public sealed class PortableGameInstaller : IGameInstaller
             "Скачивание файлов",
             fraction,
             boundedDownloaded,
-            total));
+            total,
+            _phaseIndex,
+            _phaseCount));
     }
 
     private bool TryAcquireProgressUpdate()

@@ -11,6 +11,13 @@ public static class LogCleanupService
         CleanupLauncherLog(paths.LogFile);
         CleanupMinecraftGeneratedFiles(paths.Personal);
         CleanupInstanceGeneratedFiles(paths.Instances);
+        try
+        {
+            PackInstanceService.CleanupEmptyWorldPlaceholders(paths.Worlds);
+        }
+        catch
+        {
+        }
         CleanupDotNetExtractionCache();
     }
 
@@ -149,6 +156,13 @@ public static class LogCleanupService
             foreach (var directoryName in generatedDirectories)
             {
                 DeleteDirectory(Path.Combine(instanceDir, directoryName));
+            }
+            try
+            {
+                PackInstanceService.CleanupDisposableInstancePlaceholders(instanceDir);
+            }
+            catch
+            {
             }
         }
     }

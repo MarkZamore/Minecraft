@@ -48,6 +48,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
         _worldMetadata = worldMetadata;
         _providerRegistry = new WaypointProviderRegistry(logger);
         _store = new WaypointStoreService(worldMetadata, _providerRegistry, logger);
+        MigrateLegacyState();
         _localState = LoadLocalState();
         _syncLoopTask = Task.Run(() => SyncLoopAsync(_shutdownCts.Token));
     }
@@ -838,7 +839,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
         try
         {
             var safeReason = string.Concat(reason.Where(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_'));
-            var directory = Path.Combine(_paths.WaypointSync, "Conflicts", worldId, playerUuid, providerId);
+            var directory = Path.Combine(_paths.WaypointConflicts, worldId, playerUuid, providerId);
             _paths.EnsureUnderRoot(directory);
             Directory.CreateDirectory(directory);
             var path = Path.Combine(directory, $"{DateTime.UtcNow:yyyyMMdd-HHmmss-fffffff}-{safeReason}.json");
@@ -850,7 +851,53 @@ public sealed class WaypointSyncService : IAsyncDisposable
         }
     }
 
-    private string GetLocalStatePath() => Path.Combine(_paths.WaypointSync, "state.json");
+    private string GetLocalStatePath() => _paths.WaypointSyncStateFile;
+
+    private void MigrateLegacyState()
+    {
+        var legacyRoot = Path.Combine(_paths.Personal, "WaypointSync");
+        if (!Directory.Exists(legacyRoot)) return;
+        try
+        {
+            var legacyState = Path.Combine(legacyRoot, "state.json");
+            if (File.Exists(legacyState))
+            {
+                if (!File.Exists(_paths.WaypointSyncStateFile))
+                {
+                    File.Move(legacyState, _paths.WaypointSyncStateFile);
+                }
+                else
+                {
+                    File.Delete(legacyState);
+                }
+            }
+
+            var legacyConflicts = Path.Combine(legacyRoot, "Conflicts");
+            if (Directory.Exists(legacyConflicts))
+            {
+                foreach (var source in Directory.EnumerateFiles(legacyConflicts, "*", SearchOption.AllDirectories))
+                {
+                    var relative = Path.GetRelativePath(legacyConflicts, source);
+                    var destination = Path.Combine(_paths.WaypointConflicts, relative);
+                    Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                    if (File.Exists(destination))
+                    {
+                        destination += $".legacy-{Guid.NewGuid():N}";
+                    }
+                    File.Move(source, destination);
+                }
+            }
+
+            if (!Directory.EnumerateFiles(legacyRoot, "*", SearchOption.AllDirectories).Any())
+            {
+                Directory.Delete(legacyRoot, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.Warn($"Legacy waypoint state could not be flattened: {ex.Message}");
+        }
+    }
 
     private string[] EnumerateWorlds()
     {

@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 public final class PortableSkinProfiles {
     private static volatile long registryModified = Long.MIN_VALUE;
@@ -46,6 +47,60 @@ public final class PortableSkinProfiles {
         } catch (ReflectiveOperationException exception) {
             throw new IllegalStateException("Portable skin could not be attached to GameProfile.", exception);
         }
+    }
+
+    public static Object selectSkin(Object future, Object defaultSkin, boolean requireSecure) {
+        if (!(future instanceof CompletableFuture<?> completableFuture)) {
+            return defaultSkin;
+        }
+
+        Object candidate = completableFuture.getNow(null);
+        if (candidate == null) {
+            return defaultSkin;
+        }
+        if (!requireSecure) {
+            return candidate;
+        }
+
+        try {
+            if (Boolean.TRUE.equals(PortableIdentityReflection.invoke(
+                candidate,
+                aliases("skinSecureMethods", "secure", "f")))) {
+                return candidate;
+            }
+            Object textureUrl = PortableIdentityReflection.invoke(
+                candidate,
+                aliases("skinTextureUrlMethods", "textureUrl", "b"));
+            if (textureUrl instanceof String url && isRegisteredUrl(url)) {
+                return candidate;
+            }
+        } catch (ReflectiveOperationException exception) {
+            System.err.println("[PortableIdentity] Portable skin validation failed: " + exception.getMessage());
+        }
+        return defaultSkin;
+    }
+
+    private static boolean isRegisteredUrl(String url) {
+        if (!url.startsWith("http://127.0.0.1:")) {
+            return false;
+        }
+        for (SkinEntry entry : loadEntries().values()) {
+            if (entry.url().equals(url)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String[] aliases(String propertyName, String... defaults) {
+        String value = System.getProperty("minecraft.portable.identity." + propertyName);
+        if (value == null || value.isBlank()) {
+            return defaults;
+        }
+        return java.util.Arrays.stream(value.split(","))
+            .map(String::trim)
+            .filter(candidate -> !candidate.isEmpty())
+            .toArray(String[]::new);
     }
 
     private static Map<UUID, SkinEntry> loadEntries() {

@@ -26,6 +26,7 @@ public sealed class PackRuntimeService : IDisposable
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly HttpClient _httpClient;
+    private readonly VoiceNetworkCoordinator? _voiceNetwork;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<PackLoaderKind, IPackLoaderProvider> _providers;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
@@ -34,11 +35,16 @@ public sealed class PackRuntimeService : IDisposable
         WriteIndented = true
     };
 
-    public PackRuntimeService(AppPaths paths, Logger logger, HttpClient? httpClient = null)
+    public PackRuntimeService(
+        AppPaths paths,
+        Logger logger,
+        HttpClient? httpClient = null,
+        VoiceNetworkCoordinator? networkCoordinator = null)
     {
         _paths = paths;
         _logger = logger;
         _httpClient = httpClient ?? PortableHttpClient.Shared;
+        _voiceNetwork = networkCoordinator;
         IPackLoaderProvider[] providers =
         [
             new VanillaLoaderProvider(),
@@ -62,6 +68,7 @@ public sealed class PackRuntimeService : IDisposable
         }
         finally
         {
+            CleanupTemporaryFiles(packRelativePath);
             _gate.Release();
         }
     }
@@ -102,7 +109,15 @@ public sealed class PackRuntimeService : IDisposable
         }
 
         Directory.CreateDirectory(temporaryRoot);
-        var launcher = CreateLauncher(runtimeRoot, temporaryRoot, progress, localOnly: false);
+        var phaseCount = descriptor.Loader.Type == PackLoaderKind.Vanilla ? 1 : 2;
+        var loaderPhase = phaseCount;
+        var launcher = CreateLauncher(
+            runtimeRoot,
+            temporaryRoot,
+            progress,
+            localOnly: false,
+            phaseIndex: 1,
+            phaseCount: phaseCount);
         IVersion baseVersion;
         try
         {
@@ -132,11 +147,21 @@ public sealed class PackRuntimeService : IDisposable
 
         progress?.Report(new RuntimePreparationProgress(
             RuntimePreparationStage.InstallingLoader,
-            $"Подготовка {LoaderDisplayName(descriptor.Loader.Type)}"));
+            $"Подготовка {LoaderDisplayName(descriptor.Loader.Type)}",
+            PhaseIndex: loaderPhase,
+            PhaseCount: phaseCount));
         if (!_providers.TryGetValue(descriptor.Loader.Type, out var provider))
         {
             throw new NotSupportedException($"Unsupported loader: {descriptor.Loader.Type}");
         }
+
+        launcher = CreateLauncher(
+            runtimeRoot,
+            temporaryRoot,
+            progress,
+            localOnly: false,
+            phaseIndex: loaderPhase,
+            phaseCount: phaseCount);
 
         var context = new PackLoaderInstallationContext(
             descriptor,
@@ -150,7 +175,13 @@ public sealed class PackRuntimeService : IDisposable
             _logger);
         var profileId = await provider.InstallAsync(context, token).ConfigureAwait(false);
 
-        launcher = CreateLauncher(runtimeRoot, temporaryRoot, progress, localOnly: true);
+        launcher = CreateLauncher(
+            runtimeRoot,
+            temporaryRoot,
+            progress,
+            localOnly: true,
+            phaseIndex: loaderPhase,
+            phaseCount: phaseCount);
         var profile = await RuntimeRetry.RunAsync(
             retryToken => launcher.GetVersionAsync(profileId, retryToken).AsTask(),
             token).ConfigureAwait(false);
@@ -173,9 +204,6 @@ public sealed class PackRuntimeService : IDisposable
         AtomicFile.WriteAllText(statePath, JsonSerializer.Serialize(newState, _jsonOptions));
         CleanupLegacyRuntimeFiles(runtimeRoot, newState);
         CleanupLegacyLauncherRoot();
-        TryDeleteDirectory(temporaryRoot);
-        TryDeleteDirectoryIfEmpty(Path.GetDirectoryName(temporaryRoot)!);
-
         progress?.Report(new RuntimePreparationProgress(RuntimePreparationStage.Ready, "Сборка готова", 1));
         _logger.Info(
             $"Runtime prepared for {packRelativePath}: Minecraft {descriptor.MinecraftVersion}, " +
@@ -183,17 +211,36 @@ public sealed class PackRuntimeService : IDisposable
         return new PreparedRuntime(runtimeRoot, profileId, javaPath, clientFile.Path!, descriptor);
     }
 
+    private void CleanupTemporaryFiles(string packRelativePath)
+    {
+        var runtimeDownloads = Path.Combine(_paths.Personal, "Temp", "RuntimeDownloads");
+        var temporaryRoot = Path.Combine(runtimeDownloads, SafePackName(packRelativePath));
+        TryDeleteDirectory(temporaryRoot);
+        TryDeleteDirectoryIfEmpty(runtimeDownloads);
+        TryDeleteDirectoryIfEmpty(Path.Combine(_paths.Personal, "Temp"));
+    }
+
     public MinecraftLauncher CreateLocalLauncher(PreparedRuntime runtime)
     {
         var temporaryRoot = Path.Combine(_paths.Personal, "Temp", "RuntimeDownloads", "launch");
-        return CreateLauncher(runtime.RuntimeRoot, temporaryRoot, progress: null, localOnly: true);
+        return CreateLauncher(runtime.RuntimeRoot, temporaryRoot, progress: null, localOnly: true, phaseIndex: 0, phaseCount: 0);
+    }
+
+    internal void CleanupLaunchTemporaryFiles()
+    {
+        var runtimeDownloads = Path.Combine(_paths.Personal, "Temp", "RuntimeDownloads");
+        TryDeleteDirectory(Path.Combine(runtimeDownloads, "launch"));
+        TryDeleteDirectoryIfEmpty(runtimeDownloads);
+        TryDeleteDirectoryIfEmpty(Path.Combine(_paths.Personal, "Temp"));
     }
 
     private MinecraftLauncher CreateLauncher(
         string runtimeRoot,
         string temporaryRoot,
         IProgress<RuntimePreparationProgress>? progress,
-        bool localOnly)
+        bool localOnly,
+        int phaseIndex,
+        int phaseCount)
     {
         var minecraftPath = new MinecraftPath(runtimeRoot);
         minecraftPath.CreateDirs();
@@ -203,7 +250,14 @@ public sealed class PackRuntimeService : IDisposable
         {
             extractors.Remove(extractor);
         }
-        parameters.GameInstaller = new PortableGameInstaller(_httpClient, runtimeRoot, temporaryRoot, progress);
+        parameters.GameInstaller = new PortableGameInstaller(
+            _httpClient,
+            runtimeRoot,
+            temporaryRoot,
+            progress,
+            phaseIndex,
+            phaseCount,
+            _voiceNetwork);
         if (localOnly)
         {
             parameters.VersionLoader = new LocalJsonVersionLoader(minecraftPath);

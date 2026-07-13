@@ -94,6 +94,7 @@ public sealed class PeerEndpointInfo
 {
     public required string Address { get; init; }
     public string ProviderId { get; set; } = "";
+    public string InterfaceId { get; set; } = "";
     public string AddressFamily { get; set; } = "";
     public string NetworkType { get; set; } = "Unknown";
     public bool IsHost { get; set; }
@@ -111,6 +112,7 @@ public sealed class PeerAnnouncement
     [JsonPropertyName("vpnIp")]
     public string NetworkAddress { get; set; } = "";
     public string NetworkProviderId { get; set; } = "";
+    public string NetworkInterfaceId { get; set; } = "";
     public string NetworkAddressFamily { get; set; } = "";
     public string NetworkType { get; set; } = "";
     public bool IsHost { get; set; }
@@ -120,6 +122,7 @@ public sealed class PeerAnnouncement
     public bool IsVoiceChannelActive { get; set; }
     public bool IsVoiceMuted { get; set; }
     public bool IsMinecraftRunning { get; set; }
+    public bool IsMinecraftPreparing { get; set; }
     public bool IsSkinAvailable { get; set; }
     public string SkinSha256 { get; set; } = "";
     public string SkinModel { get; set; } = "classic";
@@ -142,6 +145,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private string _networkAddress = "";
     private string _networkType = "";
     private string _preferredProviderId = "";
+    private string _primaryEndpointKey = "";
     private string _identityId = "";
     private string _identityName = "";
     private bool _isHost;
@@ -151,6 +155,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private bool _isSpeaking;
     private bool _isVoiceMuted;
     private bool _isMinecraftRunning;
+    private bool _isMinecraftPreparing;
     private bool _isSkinAvailable;
     private string _skinSha256 = "";
     private string _skinModel = "classic";
@@ -283,6 +288,12 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         set => Set(ref _isMinecraftRunning, value);
     }
 
+    public bool IsMinecraftPreparing
+    {
+        get => _isMinecraftPreparing;
+        set => Set(ref _isMinecraftPreparing, value);
+    }
+
     public bool IsSkinAvailable
     {
         get => _isSkinAvailable;
@@ -356,7 +367,8 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         get
         {
             var name = string.IsNullOrWhiteSpace(PlayerName) ? "Неизвестный игрок" : PlayerName;
-            return string.IsNullOrWhiteSpace(NetworkAddress) ? name : $"{name} - {NetworkAddress}";
+            var address = AddressDisplay;
+            return string.IsNullOrWhiteSpace(address) ? name : $"{name} - {address}";
         }
     }
 
@@ -366,8 +378,26 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         {
             var name = string.IsNullOrWhiteSpace(PlayerName) ? "Неизвестный игрок" : PlayerName;
             var localSuffix = IsLocalVoicePeer ? " (Вы)" : string.Empty;
-            var address = string.IsNullOrWhiteSpace(NetworkAddress) ? "—" : NetworkAddress;
+            var address = string.IsNullOrWhiteSpace(AddressDisplay) ? "—" : AddressDisplay;
             return $"{name}{localSuffix} - {address}";
+        }
+    }
+
+    public string AddressDisplay
+    {
+        get
+        {
+            _endpoints.TryGetValue(_primaryEndpointKey, out var primary);
+            if (primary is null) return NetworkAddress;
+
+            var grouped = _endpoints.Values
+                .Where(endpoint => IsSameDisplayGroup(endpoint, primary))
+                .OrderByDescending(endpoint => endpoint.LastSeen)
+                .ToArray();
+            var ipv4 = grouped.FirstOrDefault(endpoint => IsAddressFamily(endpoint, AddressFamily.InterNetwork))?.Address;
+            var ipv6 = grouped.FirstOrDefault(endpoint => IsAddressFamily(endpoint, AddressFamily.InterNetworkV6))?.Address;
+            if (!string.IsNullOrWhiteSpace(ipv4) && !string.IsNullOrWhiteSpace(ipv6)) return $"{ipv4} ({ipv6})";
+            return ipv4 ?? ipv6 ?? NetworkAddress;
         }
     }
 
@@ -416,6 +446,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         IsInVoiceChannel = announcement.IsVoiceChannelActive;
         IsVoiceMuted = announcement.IsVoiceMuted;
         IsMinecraftRunning = announcement.IsMinecraftRunning;
+        IsMinecraftPreparing = announcement.IsMinecraftPreparing;
         IsSkinAvailable = announcement.IsSkinAvailable;
         SkinSha256 = announcement.SkinSha256;
         SkinModel = announcement.SkinModel;
@@ -430,13 +461,18 @@ public sealed class PeerViewModel : INotifyPropertyChanged
 
         if (!string.IsNullOrWhiteSpace(announcement.NetworkAddress))
         {
-            if (!_endpoints.TryGetValue(announcement.NetworkAddress, out var endpoint))
+            var endpointKey = GetEndpointKey(
+                announcement.NetworkAddress,
+                announcement.NetworkProviderId,
+                announcement.NetworkInterfaceId);
+            if (!_endpoints.TryGetValue(endpointKey, out var endpoint))
             {
                 endpoint = new PeerEndpointInfo { Address = announcement.NetworkAddress };
-                _endpoints[announcement.NetworkAddress] = endpoint;
+                _endpoints[endpointKey] = endpoint;
             }
 
             endpoint.ProviderId = announcement.NetworkProviderId?.Trim() ?? "";
+            endpoint.InterfaceId = announcement.NetworkInterfaceId?.Trim() ?? "";
             endpoint.AddressFamily = announcement.NetworkAddressFamily?.Trim() ?? "";
             endpoint.NetworkType = NormalizeNetworkType(announcement.NetworkType);
             endpoint.IsHost = announcement.IsHost;
@@ -445,6 +481,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
 
         SelectPrimaryEndpoint();
+        NotifyAddressDisplayChanged();
     }
 
     public bool PruneEndpoints(DateTimeOffset cutoff)
@@ -455,7 +492,42 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
 
         SelectPrimaryEndpoint();
+        NotifyAddressDisplayChanged();
         return _endpoints.Count > 0;
+    }
+
+    public void SetLocalEndpoints(
+        IEnumerable<NetworkEndpointInfo> endpoints,
+        NetworkEndpointInfo? preferredEndpoint)
+    {
+        _endpoints.Clear();
+        var now = DateTimeOffset.Now;
+        foreach (var endpoint in endpoints)
+        {
+            var item = new PeerEndpointInfo
+            {
+                Address = endpoint.NetworkAddress,
+                ProviderId = endpoint.ProviderId,
+                InterfaceId = endpoint.InterfaceId,
+                AddressFamily = endpoint.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
+                NetworkType = endpoint.NetworkType,
+                LastSeen = now
+            };
+            _endpoints[GetEndpointKey(item.Address, item.ProviderId, item.InterfaceId)] = item;
+        }
+
+        _preferredProviderId = preferredEndpoint?.ProviderId?.Trim() ?? "";
+        SelectPrimaryEndpoint();
+        if (preferredEndpoint is not null &&
+            _endpoints.Values.FirstOrDefault(endpoint =>
+                string.Equals(endpoint.Address, preferredEndpoint.NetworkAddress, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(endpoint.ProviderId, preferredEndpoint.ProviderId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(endpoint.InterfaceId, preferredEndpoint.InterfaceId, StringComparison.OrdinalIgnoreCase)) is { } preferred)
+        {
+            _primaryEndpointKey = GetEndpointKey(preferred.Address, preferred.ProviderId, preferred.InterfaceId);
+            NetworkAddress = preferred.Address;
+        }
+        NotifyAddressDisplayChanged();
     }
 
     public IReadOnlyList<string> GetCandidateAddresses(bool requireHost = false, string? preferredProviderId = null)
@@ -478,6 +550,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     {
         _preferredProviderId = providerId?.Trim() ?? "";
         SelectPrimaryEndpoint();
+        NotifyAddressDisplayChanged();
     }
 
     private void SelectPrimaryEndpoint()
@@ -490,6 +563,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
             .FirstOrDefault();
         if (primary is null)
         {
+            _primaryEndpointKey = "";
             NetworkAddress = "";
             NetworkType = "";
             IsHost = false;
@@ -497,6 +571,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
             return;
         }
 
+        _primaryEndpointKey = GetEndpointKey(primary.Address, primary.ProviderId, primary.InterfaceId);
         NetworkAddress = primary.Address;
         NetworkType = primary.NetworkType;
         IsHost = _endpoints.Values.Any(endpoint => endpoint.IsHost);
@@ -525,6 +600,36 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
 
         return "VPN";
+    }
+
+    private static bool IsSameDisplayGroup(PeerEndpointInfo left, PeerEndpointInfo right)
+    {
+        if (!string.IsNullOrWhiteSpace(left.InterfaceId) || !string.IsNullOrWhiteSpace(right.InterfaceId))
+        {
+            return string.Equals(left.InterfaceId, right.InterfaceId, StringComparison.OrdinalIgnoreCase) &&
+                   string.Equals(left.ProviderId, right.ProviderId, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return string.Equals(left.ProviderId, right.ProviderId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAddressFamily(PeerEndpointInfo endpoint, AddressFamily family)
+    {
+        if (IPAddress.TryParse(endpoint.Address, out var parsed)) return parsed.AddressFamily == family;
+        return family == AddressFamily.InterNetworkV6
+            ? string.Equals(endpoint.AddressFamily, "IPv6", StringComparison.OrdinalIgnoreCase)
+            : string.Equals(endpoint.AddressFamily, "IPv4", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetEndpointKey(string address, string? providerId, string? interfaceId) =>
+        $"{providerId?.Trim()}|{interfaceId?.Trim()}|{address.Trim()}";
+
+    private void NotifyAddressDisplayChanged()
+    {
+        OnPropertyChanged(nameof(AddressDisplay));
+        OnPropertyChanged(nameof(DisplayName));
+        OnPropertyChanged(nameof(VoiceDisplayName));
+        OnPropertyChanged(nameof(HostDisplayName));
     }
 
     private static string AddressBelongsToNetwork(string ip)

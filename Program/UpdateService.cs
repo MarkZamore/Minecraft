@@ -29,6 +29,7 @@ public sealed class UpdateService
     private readonly string _currentCommitSha;
     private readonly string? _currentExecutablePath;
     private readonly TimeSpan _checkTimeout;
+    private readonly VoiceNetworkCoordinator? _voiceNetwork;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
@@ -41,7 +42,8 @@ public sealed class UpdateService
         HttpClient? httpClient = null,
         string? currentCommitSha = null,
         TimeSpan? checkTimeout = null,
-        string? currentExecutablePath = null)
+        string? currentExecutablePath = null,
+        VoiceNetworkCoordinator? networkCoordinator = null)
     {
         _paths = paths;
         _logger = logger;
@@ -51,6 +53,7 @@ public sealed class UpdateService
         _currentExecutablePath = string.IsNullOrWhiteSpace(currentExecutablePath)
             ? null
             : Path.GetFullPath(currentExecutablePath);
+        _voiceNetwork = networkCoordinator;
     }
 
     public static string CurrentCommitSha => ResolveCurrentCommitSha();
@@ -301,7 +304,7 @@ public sealed class UpdateService
             throw new InvalidOperationException($"Downloaded {description} size does not match the manifest.");
         }
 
-        progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.Downloading, 0d));
+        progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.Downloading, 0d, 0, expectedSize));
         await using (var input = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false))
         await using (var output = new FileStream(
                          destinationPath,
@@ -578,14 +581,16 @@ public sealed class UpdateService
                throw new InvalidOperationException("Update manifest was empty.");
     }
 
-    private static async Task CopyWithProgressAsync(
+    private async Task CopyWithProgressAsync(
         Stream input,
         Stream output,
         long expectedSize,
         IProgress<UpdatePreparationProgress>? progress,
         CancellationToken token)
     {
-        var buffer = new byte[1024 * 1024];
+        var buffer = new byte[VoiceTransferLimiter.TransferBlockSize];
+        using var limiter = _voiceNetwork?.CreateTransferLimiter();
+        var lastReportTimestamp = Stopwatch.GetTimestamp();
         long total = 0;
         while (true)
         {
@@ -593,15 +598,26 @@ public sealed class UpdateService
             if (read <= 0) break;
             await output.WriteAsync(buffer.AsMemory(0, read), token);
             total += read;
-            if (expectedSize > 0)
+            if (limiter is not null) await limiter.ThrottleAsync(read, token).ConfigureAwait(false);
+            var now = Stopwatch.GetTimestamp();
+            if (expectedSize > 0 &&
+                (total >= expectedSize ||
+                 now - lastReportTimestamp >= Stopwatch.Frequency / 10))
             {
+                lastReportTimestamp = now;
                 progress?.Report(new UpdatePreparationProgress(
                     UpdatePreparationStage.Downloading,
-                    Math.Clamp(total / (double)expectedSize, 0d, 1d)));
+                    Math.Clamp(total / (double)expectedSize, 0d, 1d),
+                    total,
+                    expectedSize));
             }
         }
 
-        progress?.Report(new UpdatePreparationProgress(UpdatePreparationStage.Downloading, 1d));
+        progress?.Report(new UpdatePreparationProgress(
+            UpdatePreparationStage.Downloading,
+            1d,
+            total,
+            expectedSize));
     }
 
     private static void ValidateGitHubDownloadUri(Uri uri)
@@ -753,7 +769,11 @@ public enum UpdatePreparationStage
     Ready
 }
 
-public sealed record UpdatePreparationProgress(UpdatePreparationStage Stage, double? Fraction);
+public sealed record UpdatePreparationProgress(
+    UpdatePreparationStage Stage,
+    double? Fraction,
+    long DownloadedBytes = 0,
+    long TotalBytes = 0);
 
 public sealed record PreparedUpdate(UpdateManifest Manifest, string ExecutablePath);
 

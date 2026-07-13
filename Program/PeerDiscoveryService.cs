@@ -8,7 +8,7 @@ namespace Minecraft;
 
 public sealed class PeerDiscoveryService : IAsyncDisposable
 {
-    public const int ProtocolVersion = 3;
+    public const int ProtocolVersion = 4;
     private const int DiscoveryPort = 35655;
     private const int MaxKnownPeers = 64;
     private const int MaxFullSubnetProbeSize = 512;

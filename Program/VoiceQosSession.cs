@@ -14,6 +14,7 @@ internal sealed class VoiceQosSession : IDisposable
     private uint _flowId;
     private readonly HashSet<string> _destinations = new(StringComparer.OrdinalIgnoreCase);
     private bool _qosUnavailable;
+    private bool _enabled;
 
     private VoiceQosSession(Socket socket, Logger logger)
     {
@@ -21,11 +22,30 @@ internal sealed class VoiceQosSession : IDisposable
         _logger = logger;
     }
 
-    public static VoiceQosSession AttachBestEffort(Socket socket, Logger logger)
+    public static VoiceQosSession AttachBestEffort(Socket socket, Logger logger, bool enabled)
     {
         var session = new VoiceQosSession(socket, logger);
-        session.TryConfigure();
+        session.SetEnabled(enabled);
         return session;
+    }
+
+    public void SetEnabled(bool enabled)
+    {
+        lock (_gate)
+        {
+            if (_enabled == enabled) return;
+            _enabled = enabled;
+            if (enabled)
+            {
+                TryConfigure();
+            }
+            else
+            {
+                TryClearSocketPriority();
+                DisposeNative();
+                _qosUnavailable = false;
+            }
+        }
     }
 
     private void TryConfigure()
@@ -60,6 +80,21 @@ internal sealed class VoiceQosSession : IDisposable
         }
     }
 
+    private void TryClearSocketPriority()
+    {
+        try
+        {
+            var level = _socket.AddressFamily == AddressFamily.InterNetworkV6
+                ? SocketOptionLevel.IPv6
+                : SocketOptionLevel.IP;
+            _socket.SetSocketOption(level, SocketOptionName.TypeOfService, 0);
+        }
+        catch (Exception ex) when (ex is SocketException or ArgumentException or ObjectDisposedException)
+        {
+            _logger.Info($"Voice socket priority could not be reset: {ex.Message}");
+        }
+    }
+
     public void AddDestination(IPEndPoint endpoint)
     {
         lock (_gate)
@@ -70,7 +105,7 @@ internal sealed class VoiceQosSession : IDisposable
 
     private void AddDestinationCore(IPEndPoint endpoint)
     {
-        if (_handle == IntPtr.Zero || _qosUnavailable || endpoint.AddressFamily != AddressFamily.InterNetwork) return;
+        if (!_enabled || _handle == IntPtr.Zero || _qosUnavailable || endpoint.AddressFamily != AddressFamily.InterNetwork) return;
         var key = endpoint.ToString();
         if (!_destinations.Add(key)) return;
         var nativeAddress = IntPtr.Zero;
@@ -111,6 +146,8 @@ internal sealed class VoiceQosSession : IDisposable
     {
         lock (_gate)
         {
+            _enabled = false;
+            TryClearSocketPriority();
             DisposeNative();
         }
         GC.SuppressFinalize(this);

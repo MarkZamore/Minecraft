@@ -183,11 +183,16 @@
                                 FontFamily="Segoe Fluent Icons" FontSize="14" ToolTip="Выключить микрофон" Margin="5,0,0,0"
                                 Click="VoiceMuteButton_Click"/>
                     </StackPanel>
-                    <Button x:Name="VoiceSettingsButton" Content="&#xE713;" Width="30" Height="28"
-                            HorizontalAlignment="Right" Padding="0"
-                            FontFamily="Segoe Fluent Icons" FontSize="14"
-                            ToolTip="Настройки голосового чата"
-                            Click="VoiceSettingsButton_Click"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button x:Name="VoiceProtectionButton" Content="&#xE83D;" Width="30" Height="28"
+                                Padding="0" FontFamily="Segoe Fluent Icons" FontSize="14"
+                                ToolTip="Буфер включён" Click="VoiceProtectionButton_Click"/>
+                        <Button x:Name="VoiceSettingsButton" Content="&#xE713;" Width="30" Height="28"
+                                Padding="0" Margin="5,0,0,0"
+                                FontFamily="Segoe Fluent Icons" FontSize="14"
+                                ToolTip="Настройки голосового чата"
+                                Click="VoiceSettingsButton_Click"/>
+                    </StackPanel>
                 </Grid>
             </Grid>
 

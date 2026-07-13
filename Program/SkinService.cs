@@ -34,6 +34,7 @@ public sealed class SkinService : IAsyncDisposable
     {
         _paths = paths;
         _logger = logger;
+        MigrateLegacyRegistry();
     }
 
     public SkinAnnouncement GetAnnouncement(AppSettings settings, string identityId)
@@ -370,6 +371,11 @@ public sealed class SkinService : IAsyncDisposable
                     pair.Value.Model,
                     $"http://127.0.0.1:{HttpPort}/skin/{pair.Key}/{pair.Value.Hash}"));
             var contents = string.Join(Environment.NewLine, lines);
+            if (contents.Length == 0)
+            {
+                if (File.Exists(_paths.SkinRegistryFile)) File.Delete(_paths.SkinRegistryFile);
+                return;
+            }
             if (File.Exists(_paths.SkinRegistryFile) &&
                 string.Equals(File.ReadAllText(_paths.SkinRegistryFile), contents, StringComparison.Ordinal))
             {
@@ -380,6 +386,34 @@ public sealed class SkinService : IAsyncDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _logger.Warn($"Skin registry could not be updated: {ex.Message}");
+        }
+    }
+
+    private void MigrateLegacyRegistry()
+    {
+        var legacyDirectory = Path.Combine(_paths.Personal, "Skin");
+        var legacyPath = Path.Combine(legacyDirectory, "profiles.properties");
+        try
+        {
+            if (File.Exists(legacyPath))
+            {
+                if (!File.Exists(_paths.SkinRegistryFile))
+                {
+                    File.Move(legacyPath, _paths.SkinRegistryFile);
+                }
+                else
+                {
+                    File.Delete(legacyPath);
+                }
+            }
+            if (Directory.Exists(legacyDirectory) && !Directory.EnumerateFileSystemEntries(legacyDirectory).Any())
+            {
+                Directory.Delete(legacyDirectory);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.Warn($"Legacy skin registry could not be flattened: {ex.Message}");
         }
     }
 

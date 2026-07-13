@@ -35,7 +35,11 @@ public final class PortableIdentityPreflight {
                 throw new IllegalStateException("Portable identity transformer did not modify " + className + ".");
             }
             new ClassReader(transformed);
-            verifyHookTargets(archive, className);
+            if (isAlias("loginClasses", className)) {
+                verifyHookTargets(archive, className);
+            } else if (!isAlias("playerInfoClasses", className)) {
+                throw new IllegalStateException("Unexpected portable identity target: " + className);
+            }
         }
         System.out.println("Portable identity preflight passed: " + className + " in " + jarPath);
     }
@@ -123,6 +127,10 @@ public final class PortableIdentityPreflight {
     private static String alias(String propertyName, int index) {
         String[] values = aliases(propertyName);
         return values[Math.min(index, values.length - 1)];
+    }
+
+    private static boolean isAlias(String propertyName, String value) {
+        return Arrays.asList(aliases(propertyName)).contains(value);
     }
 
     private static String[] aliases(String propertyName) {

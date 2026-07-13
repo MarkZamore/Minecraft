@@ -93,6 +93,8 @@ public sealed class PackInstanceService : IDisposable
                     DeleteDirectoryIfPresent(Path.Combine(gameDir, "debug"));
                     DeleteDirectoryIfPresent(Path.Combine(gameDir, "crash-reports"));
                 }
+                CleanupDisposableInstancePlaceholders(gameDir);
+                CleanupEmptyWorldPlaceholders(_paths.Worlds);
             }
         }
         finally
@@ -104,6 +106,90 @@ public sealed class PackInstanceService : IDisposable
     private static void DeleteDirectoryIfPresent(string path)
     {
         if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+    }
+
+    internal static void CleanupEmptyWorldPlaceholders(string worldsRoot)
+    {
+        if (!Directory.Exists(worldsRoot)) return;
+        foreach (var world in Directory.EnumerateDirectories(worldsRoot, "*", SearchOption.TopDirectoryOnly))
+        {
+            foreach (var name in new[] { "datapacks", "EnderStorage" })
+            {
+                var path = Path.Combine(world, name);
+                if (Directory.Exists(path) && !Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).Any())
+                {
+                    Directory.Delete(path, recursive: true);
+                }
+            }
+        }
+    }
+
+    internal static void CleanupDisposableInstancePlaceholders(string gameDir)
+    {
+        DeleteDefaultOnlyXaeroData(gameDir);
+        PruneEmptyDirectories(gameDir);
+    }
+
+    private static void DeleteDefaultOnlyXaeroData(string gameDir)
+    {
+        var root = Path.Combine(gameDir, "xaero");
+        if (!Directory.Exists(root)) return;
+        var files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).ToArray();
+        if (files.Length == 0)
+        {
+            Directory.Delete(root, recursive: true);
+            return;
+        }
+        if (files.Any(file => !string.Equals(Path.GetFileName(file), "config.txt", StringComparison.OrdinalIgnoreCase)) ||
+            files.Any(file => !IsDefaultOnlyXaeroConfig(file)))
+        {
+            return;
+        }
+        Directory.Delete(root, recursive: true);
+    }
+
+    private static bool IsDefaultOnlyXaeroConfig(string path)
+    {
+        var allowed = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "usingMultiworldDetection:false",
+            "ignoreServerLevelId:false",
+            "teleportationEnabled:true",
+            "usingDefaultTeleportCommand:true",
+            "sortType:NONE",
+            "sortReversed:false",
+            "ignoreHeightmaps:false"
+        };
+        foreach (var rawLine in File.ReadLines(path))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith("//", StringComparison.Ordinal) ||
+                line.StartsWith("dimensionType:", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (!allowed.Contains(line)) return false;
+        }
+        return true;
+    }
+
+    private static void PruneEmptyDirectories(string root)
+    {
+        foreach (var directory in Directory.EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly).ToArray())
+        {
+            PruneEmptyDirectoryTree(directory);
+        }
+    }
+
+    private static void PruneEmptyDirectoryTree(string directory)
+    {
+        var info = new DirectoryInfo(directory);
+        if ((info.Attributes & FileAttributes.ReparsePoint) != 0) return;
+        foreach (var child in Directory.EnumerateDirectories(directory, "*", SearchOption.TopDirectoryOnly).ToArray())
+        {
+            PruneEmptyDirectoryTree(child);
+        }
+        if (!Directory.EnumerateFileSystemEntries(directory).Any()) Directory.Delete(directory);
     }
 
     private PackInstanceContext PrepareCore(string packRelativePath, CancellationToken token)

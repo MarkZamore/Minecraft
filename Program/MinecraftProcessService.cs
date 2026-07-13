@@ -22,9 +22,12 @@ public sealed class MinecraftProcessService
     private readonly SkinService _skinService;
     private readonly MinecraftWindowPlacementService _gameWindowPlacement;
     private readonly ConcurrentDictionary<int, byte> _activeClientProcesses = new();
+    private int _clientPreparing;
 
     public bool IsClientRunning => !_activeClientProcesses.IsEmpty;
+    public bool IsClientPreparing => Volatile.Read(ref _clientPreparing) != 0;
     public event Action<bool>? ClientRunningChanged;
+    public event Action<bool>? ClientPreparingChanged;
 
     public MinecraftProcessService(
         AppPaths paths,
@@ -55,6 +58,35 @@ public sealed class MinecraftProcessService
         int targetPort,
         IProgress<RuntimePreparationProgress>? runtimeProgress = null,
         CancellationToken token = default)
+    {
+        if (IsClientRunning)
+        {
+            throw new InvalidOperationException("Minecraft is already running from this application.");
+        }
+        if (Interlocked.CompareExchange(ref _clientPreparing, 1, 0) != 0)
+        {
+            throw new InvalidOperationException("Minecraft is already being prepared.");
+        }
+
+        NotifyClientPreparingChanged(true);
+        try
+        {
+            await StartClientCoreAsync(settings, targetHost, targetPort, runtimeProgress, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            _packRuntimes.CleanupLaunchTemporaryFiles();
+            Interlocked.Exchange(ref _clientPreparing, 0);
+            NotifyClientPreparingChanged(false);
+        }
+    }
+
+    private async Task StartClientCoreAsync(
+        AppSettings settings,
+        string? targetHost,
+        int targetPort,
+        IProgress<RuntimePreparationProgress>? runtimeProgress,
+        CancellationToken token)
     {
         if (IsClientRunning)
         {
@@ -195,11 +227,38 @@ public sealed class MinecraftProcessService
         }
         finally
         {
+            CleanupJavaTemporaryDirectory(packRelativePath);
             if (_activeClientProcesses.TryRemove(processId, out _) && _activeClientProcesses.IsEmpty)
             {
                 NotifyClientRunningChanged(false);
             }
         }
+    }
+
+    private void CleanupJavaTemporaryDirectory(string packRelativePath)
+    {
+        try
+        {
+            var tempRoot = Path.GetFullPath(Path.Combine(_paths.Personal, "Temp"));
+            var javaRoot = Path.GetFullPath(Path.Combine(tempRoot, "Java"));
+            var target = Path.GetFullPath(Path.Combine(javaRoot, packRelativePath));
+            if (!target.StartsWith(javaRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+            if (Directory.Exists(target)) Directory.Delete(target, recursive: true);
+            TryDeleteDirectoryIfEmpty(javaRoot);
+            TryDeleteDirectoryIfEmpty(tempRoot);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.Warn($"Minecraft temporary files could not be removed: {ex.Message}");
+        }
+    }
+
+    private static void TryDeleteDirectoryIfEmpty(string path)
+    {
+        if (Directory.Exists(path) && !Directory.EnumerateFileSystemEntries(path).Any()) Directory.Delete(path);
     }
 
     private void NotifyClientRunningChanged(bool isRunning)
@@ -211,6 +270,18 @@ public sealed class MinecraftProcessService
         catch (Exception ex)
         {
             _logger.Warn($"Minecraft process state listener failed: {ex.Message}");
+        }
+    }
+
+    private void NotifyClientPreparingChanged(bool isPreparing)
+    {
+        try
+        {
+            ClientPreparingChanged?.Invoke(isPreparing);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Minecraft preparation state listener failed: {ex.Message}");
         }
     }
 

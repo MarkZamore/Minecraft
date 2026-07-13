@@ -8,6 +8,8 @@ namespace Minecraft;
 public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
 {
     private const int ProtocolVersion = 3;
+    private const byte ProtectionPayloadVersion = 1;
+    private const int ProtectionPayloadLength = 1 + 1 + sizeof(long) + 16;
     private const int SpeakingThreshold = 300;
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan SpeakingHold = TimeSpan.FromMilliseconds(250);
@@ -24,6 +26,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     private readonly object _stateLock = new();
     private readonly object _captureLock = new();
     private readonly object _encoderLock = new();
+    private readonly object _protectionEffectsLock = new();
 
     private VoiceCapture? _capture;
     private VoicePlayback? _playback;
@@ -42,6 +45,10 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     private bool _disposed;
     private bool _captureStarted;
     private bool _localSpeaking;
+    private bool _trafficProtectionEnabled = true;
+    private long _trafficProtectionRevision;
+    private long _maxTrafficProtectionRevision;
+    private string _trafficProtectionOriginId = Guid.Empty.ToString("D");
     private DateTimeOffset _localSpeakingUntil;
     private double _inputVolume = 1d;
     private double _outputVolume = 1d;
@@ -64,10 +71,18 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     public bool IsJoined => _isJoined;
     public bool IsMuted => _isMuted;
     public bool IsDeafened => _isDeafened;
+    public bool IsTrafficProtectionEnabled
+    {
+        get
+        {
+            lock (_stateLock) return _trafficProtectionEnabled;
+        }
+    }
     public string SelfPeerId => _selfPeerId;
     public string LastPacketError => _lastPacketError;
     public event Action<string, bool>? SpeakingStateChanged;
     public event Action<string, bool, bool>? PeerPresenceChanged;
+    public event Action<bool>? TrafficProtectionChanged;
 
     public IReadOnlyList<VoiceAudioDevice> GetInputDevices() => _deviceManager.GetInputDevices();
     public IReadOnlyList<VoiceAudioDevice> GetOutputDevices() => _deviceManager.GetOutputDevices();
@@ -150,6 +165,28 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         else StopCapture();
     }
 
+    public bool ToggleTrafficProtection()
+    {
+        bool enabled;
+        long revision;
+        var origin = NormalizeOriginId(_selfPeerId);
+        lock (_stateLock)
+        {
+            if (!_isJoined || _disposed) return _trafficProtectionEnabled;
+            enabled = !_trafficProtectionEnabled;
+            revision = Math.Max(_maxTrafficProtectionRevision, _trafficProtectionRevision) + 1;
+            _trafficProtectionEnabled = enabled;
+            _trafficProtectionRevision = revision;
+            _maxTrafficProtectionRevision = revision;
+            _trafficProtectionOriginId = origin;
+        }
+
+        ApplyCurrentProtectionEffects();
+        TrafficProtectionChanged?.Invoke(enabled);
+        _ = BroadcastProtectionStateAsync();
+        return enabled;
+    }
+
     public void UpdatePeers(IEnumerable<(string peerId, string ip)> peers)
     {
         var incoming = peers
@@ -214,6 +251,10 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _nextHeartbeatSequence = 0;
             _captureStarted = false;
             _isPttActive = false;
+            _trafficProtectionEnabled = true;
+            _trafficProtectionRevision = 0;
+            _maxTrafficProtectionRevision = 0;
+            _trafficProtectionOriginId = NormalizeOriginId(_selfPeerId);
             _playback = new VoicePlayback(
                 _receiver,
                 _deviceManager.OpenOutputDevice(_outputDeviceId),
@@ -223,13 +264,19 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             foreach (var pair in _peerVolumes) _playback.SetPeerVolume(pair.Key, pair.Value);
             _playback.Start();
 
-            _transport.StartListening(_runtimeOptions.ListenAddress, _runtimeOptions.Port, OnVoicePacketAsync);
+            _transport.StartListening(
+                _runtimeOptions.ListenAddress,
+                _runtimeOptions.Port,
+                OnVoicePacketAsync,
+                _trafficProtectionEnabled);
             _isJoined = true;
             _networkCoordinator.SetJoined(true);
+            _networkCoordinator.SetTrafficProtectionEnabled(true);
             _heartbeatCts = new CancellationTokenSource();
             _heartbeatTask = HeartbeatLoopAsync(_heartbeatCts.Token);
             _speakingTimer = new Timer(CheckLocalSpeakingTimeout, null, 100, 100);
         }
+        TrafficProtectionChanged?.Invoke(true);
         _logger.Info($"Voice channel joined on UDP {_runtimeOptions.Port}.");
     }
 
@@ -271,7 +318,12 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             if (!_isJoined) return;
             _isJoined = false;
             _networkCoordinator.SetJoined(false);
+            _networkCoordinator.SetTrafficProtectionEnabled(true);
             _isPttActive = false;
+            _trafficProtectionEnabled = true;
+            _trafficProtectionRevision = 0;
+            _maxTrafficProtectionRevision = 0;
+            _trafficProtectionOriginId = NormalizeOriginId(_selfPeerId);
             heartbeatCts = _heartbeatCts;
             heartbeatTask = _heartbeatTask;
             _heartbeatCts = null;
@@ -303,6 +355,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         await _transport.StopAsync().ConfigureAwait(false);
         _receiver.Reset();
         SetLocalSpeaking(false);
+        TrafficProtectionChanged?.Invoke(true);
         _logger.Info("Voice channel left.");
     }
 
@@ -332,7 +385,11 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             }
             foreach (var send in sends)
             {
-                var packet = BuildPacket(VoicePacketType.Hello, _selfPeerId, send.Nonce, Array.Empty<byte>());
+                var packet = BuildPacket(
+                    VoicePacketType.Hello,
+                    _selfPeerId,
+                    send.Nonce,
+                    BuildProtectionPayload());
                 await _transport.SendAsync(send.Targets, packet, token).ConfigureAwait(false);
             }
             UpdateNetworkQuality();
@@ -457,12 +514,18 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
 
             if (type == VoicePacketType.Hello)
             {
-                var ack = BuildPacket(VoicePacketType.Ack, _selfPeerId, sequence, Array.Empty<byte>());
+                TryApplyProtectionPayload(payload);
+                var ack = BuildPacket(
+                    VoicePacketType.Ack,
+                    _selfPeerId,
+                    sequence,
+                    BuildProtectionPayload());
                 await _transport.SendAsync([remote], ack, CancellationToken.None).ConfigureAwait(false);
                 return;
             }
             if (type == VoicePacketType.Ack)
             {
+                TryApplyProtectionPayload(payload);
                 lock (_stateLock)
                 {
                     if (_routes.TryGetValue(peerId, out route) && route.PendingHeartbeatSequence == sequence)
@@ -589,6 +652,126 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         if (now - _lastPacketWarningAt < TimeSpan.FromSeconds(15)) return;
         _lastPacketWarningAt = now;
         _logger.Warn(message);
+    }
+
+    private async Task BroadcastProtectionStateAsync()
+    {
+        try
+        {
+            List<(IPEndPoint[] Targets, int Nonce)> sends;
+            var now = DateTimeOffset.UtcNow;
+            lock (_stateLock)
+            {
+                if (!_isJoined) return;
+                sends = _routes.Values.Select(route =>
+                {
+                    var nonce = Interlocked.Increment(ref _nextHeartbeatSequence);
+                    route.PendingHeartbeatSequence = nonce;
+                    route.PendingHeartbeatSentUtc = now;
+                    return (route.Candidates.Distinct().ToArray(), nonce);
+                }).ToList();
+            }
+
+            var payload = BuildProtectionPayload();
+            foreach (var send in sends)
+            {
+                var packet = BuildPacket(VoicePacketType.Hello, _selfPeerId, send.Nonce, payload);
+                await _transport.SendAsync(send.Targets, packet, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            WarnPacketError("Voice protection sync failed: " + ex.Message);
+        }
+    }
+
+    private byte[] BuildProtectionPayload()
+    {
+        bool enabled;
+        long revision;
+        Guid origin;
+        lock (_stateLock)
+        {
+            enabled = _trafficProtectionEnabled;
+            revision = _trafficProtectionRevision;
+            _ = Guid.TryParse(_trafficProtectionOriginId, out origin);
+        }
+
+        var payload = new byte[ProtectionPayloadLength];
+        payload[0] = ProtectionPayloadVersion;
+        payload[1] = enabled ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(2, sizeof(long)), revision);
+        origin.TryWriteBytes(payload.AsSpan(2 + sizeof(long), 16));
+        return payload;
+    }
+
+    private void TryApplyProtectionPayload(byte[] payload)
+    {
+        if (payload.Length != ProtectionPayloadLength || payload[0] != ProtectionPayloadVersion) return;
+        if (payload[1] > 1) return;
+        var revision = BinaryPrimitives.ReadInt64BigEndian(payload.AsSpan(2, sizeof(long)));
+        if (revision < 0) return;
+        var origin = new Guid(payload.AsSpan(2 + sizeof(long), 16)).ToString("D");
+        var enabled = payload[1] == 1;
+
+        var changed = false;
+        lock (_stateLock)
+        {
+            _maxTrafficProtectionRevision = Math.Max(_maxTrafficProtectionRevision, revision);
+            if (revision < _trafficProtectionRevision ||
+                (revision == _trafficProtectionRevision &&
+                 string.CompareOrdinal(origin, _trafficProtectionOriginId) <= 0))
+            {
+                return;
+            }
+
+            changed = _trafficProtectionEnabled != enabled;
+            _trafficProtectionEnabled = enabled;
+            _trafficProtectionRevision = revision;
+            _trafficProtectionOriginId = origin;
+        }
+
+        ApplyCurrentProtectionEffects();
+        if (changed) TrafficProtectionChanged?.Invoke(enabled);
+    }
+
+    private void ApplyCurrentProtectionEffects()
+    {
+        lock (_protectionEffectsLock)
+        {
+            while (true)
+            {
+                bool enabled;
+                long revision;
+                string origin;
+                lock (_stateLock)
+                {
+                    enabled = _trafficProtectionEnabled;
+                    revision = _trafficProtectionRevision;
+                    origin = _trafficProtectionOriginId;
+                }
+
+                _networkCoordinator.SetTrafficProtectionEnabled(enabled);
+                _transport.SetTrafficProtectionEnabled(enabled);
+
+                lock (_stateLock)
+                {
+                    if (enabled == _trafficProtectionEnabled &&
+                        revision == _trafficProtectionRevision &&
+                        string.Equals(origin, _trafficProtectionOriginId, StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    private static string NormalizeOriginId(string? originId)
+    {
+        return Guid.TryParse(originId, out var parsed)
+            ? parsed.ToString("D")
+            : Guid.Empty.ToString("D");
     }
 
     private static byte[] BuildPacket(VoicePacketType type, string peerId, int sequence, byte[] payload)

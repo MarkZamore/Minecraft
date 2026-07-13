@@ -34,6 +34,9 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _secretTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly DispatcherTimer _networkRefreshTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly CancellationTokenSource _lifetimeCts = new();
+    private readonly TransferRateTracker _transferRate = new();
+    private readonly TransferRateTracker _updateRate = new();
+    private readonly TransferRateTracker _runtimeRate = new();
 
     private AppPaths? _paths;
     private AppSettings? _settings;
@@ -71,6 +74,7 @@ public partial class MainWindow : Window
     private bool _networkToolInstalled;
     private bool _networkRefreshInProgress;
     private bool _networkChangeSubscribed;
+    private bool _networkToolInstallBusy;
     private bool _busy;
     private bool _voiceBusy;
     private bool _suppressTextPersistence;
@@ -84,9 +88,7 @@ public partial class MainWindow : Window
     private bool _voicePttToggleActive;
     private long _transferBytesCurrent;
     private long _transferBytesTotal;
-    private long _lastTransferBytesForSpeed;
     private double _lastTransferSpeedBytesPerSecond;
-    private DateTimeOffset? _transferProgressUpdatedAt;
     private bool _transferActive;
     private DateTimeOffset? _secretLoadingStartedAt;
     private bool _hostRttScanInProgress;
@@ -94,6 +96,7 @@ public partial class MainWindow : Window
     private bool _isEditingPlayerName;
     private bool _startupComplete;
     private bool _minecraftRunning;
+    private bool _minecraftPreparing;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
     private PreparedUpdate? _preparedUpdate;
@@ -149,16 +152,23 @@ public partial class MainWindow : Window
             ResolveAndPersistLocalIdentity();
             _worldPlayerProfiles = new WorldPlayerProfileService(_paths, _logger);
             _packInstances = new PackInstanceService(_paths, _logger);
-            _packRuntimes = new PackRuntimeService(_paths, _logger);
+            _voiceNetwork = new VoiceNetworkCoordinator();
+            _packRuntimes = new PackRuntimeService(
+                _paths,
+                _logger,
+                networkCoordinator: _voiceNetwork);
             _waypointSync = new WaypointSyncService(_paths, _logger, _worldMetadata);
             _skinService = new SkinService(_paths, _logger);
             await _skinService.StartAsync(_lifetimeCts.Token);
-            _voiceNetwork = new VoiceNetworkCoordinator();
             _lanRelay = new LanRelayService(_logger);
             _minecraft = new MinecraftProcessService(_paths, _logger, _identityService, _identityAdapter, _worldPlayerProfiles, _packInstances, _packRuntimes, _waypointSync, _skinService);
             _minecraft.ClientRunningChanged += OnMinecraftClientRunningChanged;
+            _minecraft.ClientPreparingChanged += OnMinecraftClientPreparingChanged;
             _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _lanRelay, _voiceNetwork);
-            _updateService = new UpdateService(_paths, _logger);
+            _updateService = new UpdateService(
+                _paths,
+                _logger,
+                networkCoordinator: _voiceNetwork);
             _transfer.StatusChanged += message => Dispatcher.Invoke(() => SetState(message));
             _transfer.ProgressChanged += progress =>
             {
@@ -178,6 +188,7 @@ public partial class MainWindow : Window
             _voiceChannel.Initialize(_settings);
             _voiceChannel.SpeakingStateChanged += OnVoiceSpeakingStateChanged;
             _voiceChannel.PeerPresenceChanged += OnVoicePeerPresenceChanged;
+            _voiceChannel.TrafficProtectionChanged += OnVoiceTrafficProtectionChanged;
             InitializePttHotkey();
 
             LoadSettingsIntoUi();
@@ -814,7 +825,7 @@ public partial class MainWindow : Window
             _localVoicePeer.PlayerName = identity.name;
             _localVoicePeer.IdentityName = identity.name;
             _localVoicePeer.IdentityId = identity.id;
-            _localVoicePeer.NetworkAddress = _primaryEndpoint?.NetworkAddress ?? _networkEndpoints.FirstOrDefault()?.NetworkAddress ?? string.Empty;
+            _localVoicePeer.SetLocalEndpoints(_networkEndpoints, _primaryEndpoint);
             _localVoicePeer.IsInVoiceChannel = true;
             _localVoicePeer.IsVoiceMuted = _voiceChannel.IsMuted;
             _localVoicePeer.LastSeen = DateTimeOffset.Now;
@@ -989,6 +1000,7 @@ public partial class MainWindow : Window
             IdentityName = identity.name,
             NetworkAddress = endpoint.NetworkAddress,
             NetworkProviderId = endpoint.ProviderId,
+            NetworkInterfaceId = endpoint.InterfaceId,
             NetworkAddressFamily = endpoint.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
             NetworkType = VirtualNetworkService.DetectNetworkType(endpoint),
             IsHost = openToLanPort.HasValue,
@@ -998,6 +1010,7 @@ public partial class MainWindow : Window
             IsVoiceChannelActive = _voiceChannel?.IsJoined == true,
             IsVoiceMuted = _voiceChannel?.IsMuted == true,
             IsMinecraftRunning = _minecraftRunning,
+            IsMinecraftPreparing = _minecraftPreparing,
             IsSkinAvailable = skin.IsAvailable,
             SkinSha256 = skin.Sha256,
             SkinModel = skin.Model,
@@ -1055,6 +1068,12 @@ public partial class MainWindow : Window
             }
             RefreshVoicePeers();
         });
+    }
+
+    private void OnVoiceTrafficProtectionChanged(bool enabled)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+        Dispatcher.BeginInvoke(RefreshUi);
     }
 
     internal double GetCurrentUiScale()
@@ -1376,9 +1395,22 @@ public partial class MainWindow : Window
         });
     }
 
+    private void OnMinecraftClientPreparingChanged(bool isPreparing)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            _minecraftPreparing = isPreparing;
+            RefreshUi();
+        });
+    }
+
     private async void PlayButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunUiActionAsync(async () =>
+        if (_minecraftPreparing || _minecraftRunning) return;
+        _minecraftPreparing = true;
+        RefreshUi();
+        try
         {
             if (RequireTransfer().IsOperationActive)
             {
@@ -1420,7 +1452,20 @@ public partial class MainWindow : Window
                 throw;
             }
             SetState("Minecraft");
-        });
+        }
+        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            RequireLogger().Warn(ex.Message);
+            MessageBox.Show(ex.Message, "Minecraft", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            _minecraftPreparing = _minecraft?.IsClientPreparing == true;
+            RefreshUi();
+        }
     }
 
     private void SkinButton_Click(object sender, RoutedEventArgs e)
@@ -1571,7 +1616,7 @@ public partial class MainWindow : Window
 
     private async void TransferButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_transferActive || _minecraftRunning)
+        if (_transferActive || _minecraftRunning || _minecraftPreparing)
         {
             return;
         }
@@ -1587,9 +1632,9 @@ public partial class MainWindow : Window
             {
                 throw new InvalidOperationException("Choose an online player.");
             }
-            if (peer.IsMinecraftRunning)
+            if (peer.IsMinecraftRunning || peer.IsMinecraftPreparing)
             {
-                throw new InvalidOperationException("The selected player is currently in Minecraft.");
+                throw new InvalidOperationException("The selected player is currently in Minecraft or preparing it.");
             }
 
             var settings = RequireSettings();
@@ -1930,7 +1975,10 @@ public partial class MainWindow : Window
 
     private async void InstallNetworkToolButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunUiActionAsync(async () =>
+        if (_networkToolInstallBusy) return;
+        _networkToolInstallBusy = true;
+        RefreshUi();
+        try
         {
             var setup = RequireNetworkToolSetup();
             if (setup.GetInstallInfo().IsInstalled)
@@ -1945,11 +1993,24 @@ public partial class MainWindow : Window
                 SetState(message);
                 RequireLogger().Info(message);
             });
-            var installer = await setup.DownloadInstallerAsync(progress, CancellationToken.None);
-            await setup.InstallAndCleanupAsync(installer, progress, CancellationToken.None);
+            var installer = await setup.DownloadInstallerAsync(progress, _lifetimeCts.Token);
+            await setup.InstallAndCleanupAsync(installer, progress, _lifetimeCts.Token);
             RefreshNetworkToolSetupStatus();
             await RefreshNetworkAdaptersAsync(forceRestart: true);
-        });
+        }
+        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            RequireLogger().Warn(ex.Message);
+            MessageBox.Show(ex.Message, "Minecraft", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            _networkToolInstallBusy = false;
+            RefreshUi();
+        }
     }
 
     private async void GenerateNetworkCredentialsButton_Click(object sender, RoutedEventArgs e)
@@ -2030,11 +2091,10 @@ public partial class MainWindow : Window
         SetProgressActivity(TransferProgressBar, progress.IsActive);
         if (!progress.IsActive)
         {
+            _transferRate.Reset();
             _transferBytesCurrent = 0;
             _transferBytesTotal = 0;
-            _lastTransferBytesForSpeed = 0;
             _lastTransferSpeedBytesPerSecond = 0;
-            _transferProgressUpdatedAt = null;
             SetTransferProgressVisible(0, 0);
             if (activeChanged) RefreshUi();
             return;
@@ -2042,19 +2102,7 @@ public partial class MainWindow : Window
 
         var current = progress.Current;
         var total = progress.Total;
-        var now = DateTimeOffset.Now;
-        if (_transferProgressUpdatedAt is not null)
-        {
-            var elapsed = (now - _transferProgressUpdatedAt.Value).TotalSeconds;
-            if (elapsed > 0.05d)
-            {
-                var delta = Math.Max(0, current - _lastTransferBytesForSpeed);
-                _lastTransferSpeedBytesPerSecond = delta / elapsed;
-            }
-        }
-
-        _lastTransferBytesForSpeed = Math.Max(0, current);
-        _transferProgressUpdatedAt = now;
+        _lastTransferSpeedBytesPerSecond = _transferRate.Update(current, "world");
         _transferBytesCurrent = Math.Max(0, current);
         _transferBytesTotal = total;
         SetTransferProgressVisible(_transferBytesCurrent, _transferBytesTotal);
@@ -2070,9 +2118,7 @@ public partial class MainWindow : Window
             TransferProgressText.Text = _transferActive ? "Передача..." : "В ожидании мира";
             if (!_transferActive)
             {
-                _lastTransferBytesForSpeed = 0;
                 _lastTransferSpeedBytesPerSecond = 0;
-                _transferProgressUpdatedAt = null;
             }
             return;
         }
@@ -2151,6 +2197,7 @@ public partial class MainWindow : Window
 
     private void InitializeUpdateUi()
     {
+        _updateRate.Reset();
         UpdateProgressBar.Value = 0;
         UpdateProgressBar.IsIndeterminate = false;
         SetProgressActivity(UpdateProgressBar, active: false);
@@ -2160,6 +2207,7 @@ public partial class MainWindow : Window
 
     private void InitializeRuntimeProgressUi()
     {
+        _runtimeRate.Reset();
         RuntimeProgressBar.Value = 0;
         RuntimeProgressBar.IsIndeterminate = false;
         SetProgressActivity(RuntimeProgressBar, active: false);
@@ -2174,9 +2222,23 @@ public partial class MainWindow : Window
                 RuntimePreparationStage.Downloading or
                 RuntimePreparationStage.InstallingLoader or
                 RuntimePreparationStage.Verifying);
-        RuntimeProgressText.Text = progress.Stage == RuntimePreparationStage.Downloading && progress.TotalBytes > 0
-            ? $"Скачивание файлов: {FormatBytes(progress.DownloadedBytes)} / {FormatBytes(progress.TotalBytes)}"
-            : progress.Message;
+        var phase = progress.PhaseCount > 1 &&
+                    progress.PhaseIndex > 0 &&
+                    progress.PhaseIndex <= progress.PhaseCount
+            ? $" {progress.PhaseIndex}/{progress.PhaseCount}"
+            : string.Empty;
+        var runtimeSpeed = progress.Stage == RuntimePreparationStage.Downloading && progress.TotalBytes > 0
+            ? _runtimeRate.Update(progress.DownloadedBytes, $"runtime:{progress.PhaseIndex}/{progress.PhaseCount}")
+            : 0;
+        if (progress.Stage != RuntimePreparationStage.Downloading) _runtimeRate.Reset();
+        RuntimeProgressText.Text = progress.Stage switch
+        {
+            RuntimePreparationStage.Downloading when progress.TotalBytes > 0 =>
+                $"Скачивание файлов{phase}: {FormatBytes(progress.DownloadedBytes)} / {FormatBytes(progress.TotalBytes)} ({FormatBytes((long)runtimeSpeed)}/с)",
+            RuntimePreparationStage.Downloading => $"Скачивание файлов{phase}",
+            RuntimePreparationStage.InstallingLoader => progress.Message + phase,
+            _ => progress.Message
+        };
         RuntimeProgressBar.IsIndeterminate = progress.Fraction is null &&
                                              progress.Stage is RuntimePreparationStage.Checking or
                                                  RuntimePreparationStage.Downloading or
@@ -2233,6 +2295,7 @@ public partial class MainWindow : Window
             await Dispatcher.InvokeAsync(() =>
             {
                 _updateBusy = true;
+                _updateRate.Reset();
                 _preparedUpdate = null;
                 UpdateProgressBar.IsIndeterminate = false;
                 UpdateProgressBar.Value = 0;
@@ -2247,6 +2310,17 @@ public partial class MainWindow : Window
                 if (value.Fraction is not null)
                 {
                     UpdateProgressBar.Value = Math.Clamp(value.Fraction.Value * 100d, 0d, 100d);
+                }
+                if (value.Stage == UpdatePreparationStage.Downloading && value.TotalBytes > 0)
+                {
+                    var speed = _updateRate.Update(value.DownloadedBytes, "update");
+                    UpdateProgressText.Text =
+                        $"Скачивается обновление: {FormatBytes(value.DownloadedBytes)} / {FormatBytes(value.TotalBytes)} ({FormatBytes((long)speed)}/с)";
+                }
+                else if (value.Stage == UpdatePreparationStage.ApplyingDelta)
+                {
+                    _updateRate.Reset();
+                    UpdateProgressText.Text = "Применение обновления";
                 }
             });
             prepared = await _updateService.DownloadUpdateAsync(result, progress, token);
@@ -2432,6 +2506,13 @@ public partial class MainWindow : Window
         if (_voiceChannel is null || _settings is null || _settingsService is null) return;
 
         ToggleVoiceMute();
+    }
+
+    private void VoiceProtectionButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_voiceChannel is not { IsJoined: true }) return;
+        _voiceChannel.ToggleTrafficProtection();
+        RefreshUi();
     }
 
     private void VoiceDeafenButton_Click(object sender, RoutedEventArgs e)
@@ -2678,7 +2759,10 @@ public partial class MainWindow : Window
 
         RefreshPlayerIdentityDisplay();
         var interactiveEnabled = !_busy;
-        var configurationEnabled = interactiveEnabled && !_transferActive && !_minecraftRunning;
+        var configurationEnabled = interactiveEnabled &&
+                                   !_transferActive &&
+                                   !_minecraftRunning &&
+                                   !_minecraftPreparing;
         var voiceEnabled = !_voiceBusy && _voiceChannel is not null;
         var hasBuild = BuildComboBox.SelectedItem is ClientBuildViewModel;
         var selectedRecipient = OnlinePlayerComboBox.SelectedItem as PeerViewModel;
@@ -2691,19 +2775,20 @@ public partial class MainWindow : Window
         PlayButton.Content = "Играть";
         PlayButton.IsEnabled = configurationEnabled && hasBuild && !_isEditingPlayerName;
         SkinButton.IsEnabled = !_minecraftRunning;
-        InstallNetworkToolButton.IsEnabled = interactiveEnabled && !_networkToolInstalled;
+        InstallNetworkToolButton.IsEnabled = !_networkToolInstallBusy && !_networkToolInstalled;
         GenerateNetworkCredentialsButton.IsEnabled = interactiveEnabled;
         CopyNetworkNameButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkName);
         CopyNetworkPasswordButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkPassword);
         NetworkToolAutoLaunchCheckBox.IsEnabled = interactiveEnabled;
-        WorldComboBox.IsEnabled = interactiveEnabled && _worlds.Count > 0;
-        OnlinePlayerComboBox.IsEnabled = interactiveEnabled && _peers.Count > 0;
+        WorldComboBox.IsEnabled = interactiveEnabled && !_minecraftPreparing && _worlds.Count > 0;
+        OnlinePlayerComboBox.IsEnabled = interactiveEnabled && !_minecraftPreparing && _peers.Count > 0;
         WorldPlaceholderText.Visibility = _worlds.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         OnlinePlayerPlaceholderText.Visibility = _peers.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        TransferButton.IsEnabled = interactiveEnabled && !_transferActive && !_minecraftRunning &&
+        TransferButton.IsEnabled = interactiveEnabled && !_transferActive && !_minecraftRunning && !_minecraftPreparing &&
                                    WorldComboBox.SelectedItem is WorldViewModel &&
                                    selectedRecipient is not null &&
-                                   !selectedRecipient.IsMinecraftRunning;
+                                   !selectedRecipient.IsMinecraftRunning &&
+                                   !selectedRecipient.IsMinecraftPreparing;
         MemoryTextBox.IsEnabled = configurationEnabled;
         UpdateButton.IsEnabled = interactiveEnabled && !_updateBusy && _preparedUpdate is not null;
         SecretOpenButton.IsEnabled = interactiveEnabled &&
@@ -2712,6 +2797,7 @@ public partial class MainWindow : Window
 
         VoiceJoinButton.IsEnabled = !_voiceBusy && _voiceChannel is not null;
         VoiceSettingsButton.IsEnabled = voiceEnabled;
+        VoiceProtectionButton.IsEnabled = _voiceChannel is { IsJoined: true } && !_voiceBusy;
         VoicePttButton.IsEnabled = _voiceChannel is { IsJoined: true };
         VoiceInputComboBox.IsEnabled = voiceEnabled;
         VoiceOutputComboBox.IsEnabled = voiceEnabled;
@@ -2726,12 +2812,18 @@ public partial class MainWindow : Window
                 : "Войти в голосовой канал";
             VoiceMuteButton.Content = _voiceChannel.IsMuted ? "\uE198" : "\uE720";
             VoiceMuteButton.ToolTip = _voiceChannel.IsMuted ? "Включить микрофон" : "Выключить микрофон";
+            VoiceProtectionButton.Content = _voiceChannel.IsTrafficProtectionEnabled ? "\uE83D" : "\uE711";
+            VoiceProtectionButton.ToolTip = _voiceChannel.IsTrafficProtectionEnabled
+                ? "Буфер включён"
+                : "Буфер выключен";
             VoiceDeafenButton.Content = "Звук";
         }
         else
         {
             VoiceJoinButton.Content = "\uE717";
             VoiceMuteButton.Content = "\uE720";
+            VoiceProtectionButton.Content = "\uE83D";
+            VoiceProtectionButton.ToolTip = "Буфер включён";
             VoiceDeafenButton.Content = "Звук";
         }
         VoiceStatusText.Text = string.Empty;

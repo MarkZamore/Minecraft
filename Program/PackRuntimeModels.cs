@@ -36,7 +36,9 @@ public sealed record RuntimePreparationProgress(
     string Message,
     double? Fraction = null,
     long DownloadedBytes = 0,
-    long TotalBytes = 0);
+    long TotalBytes = 0,
+    int PhaseIndex = 0,
+    int PhaseCount = 0);
 
 public sealed record PreparedRuntime(
     string RuntimeRoot,

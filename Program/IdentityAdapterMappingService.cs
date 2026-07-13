@@ -12,6 +12,8 @@ internal sealed class IdentityAdapterMappingService
     private const string Connection = "net/minecraft/network/Connection";
     private const string PlayerList = "net/minecraft/server/players/PlayerList";
     private const string Component = "net/minecraft/network/chat/Component";
+    private const string PlayerInfo = "net/minecraft/client/multiplayer/PlayerInfo";
+    private const string PlayerSkin = "net/minecraft/client/resources/PlayerSkin";
 
     public IdentityAdapterConfiguration Build(PreparedRuntime runtime)
     {
@@ -28,9 +30,17 @@ internal sealed class IdentityAdapterMappingService
         var connection = mappings.RequireClass(Connection);
         var playerList = mappings.RequireClass(PlayerList);
         var component = mappings.RequireClass(Component);
+        var playerInfo = mappings.RequireClass(PlayerInfo);
+        var playerSkin = mappings.RequireClass(PlayerSkin);
 
         var hello = listener.RequireMethod("handleHello", descriptor => descriptor.Contains($"L{packet.LeftName};", StringComparison.Ordinal));
         var verify = listener.RequireMethod("verifyLoginAndFinishConnectionSetup", descriptor => descriptor.Contains("Lcom/mojang/authlib/GameProfile;", StringComparison.Ordinal));
+        var skinLookup = playerInfo.RequireMethod(
+            "createSkinLookup",
+            descriptor => descriptor.StartsWith("(Lcom/mojang/authlib/GameProfile;)", StringComparison.Ordinal));
+        var skinSelection = playerInfo.RequireMethod(
+            "lambda$createSkinLookup$2",
+            descriptor => descriptor.StartsWith("(Ljava/util/concurrent/CompletableFuture;", StringComparison.Ordinal));
         var properties = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["loginClasses"] = JoinAliases(LoginListener, listener.LeftName),
@@ -55,13 +65,37 @@ internal sealed class IdentityAdapterMappingService
             ["getPlayerMethods"] = JoinAliases("getPlayer", playerList.RequireMethod("getPlayer", descriptor => descriptor.StartsWith("(Ljava/util/UUID;)", StringComparison.Ordinal)).LeftName),
             ["componentClasses"] = JoinAliases(Component.Replace('/', '.'), component.LeftName.Replace('/', '.')),
             ["componentLiteralMethods"] = JoinAliases("literal", component.RequireMethod("literal", descriptor => descriptor.StartsWith("(Ljava/lang/String;)", StringComparison.Ordinal)).LeftName),
-            ["disconnectMethods"] = JoinAliases("disconnect", listener.RequireMethod("disconnect", descriptor => descriptor.EndsWith(")V", StringComparison.Ordinal)).LeftName)
+            ["disconnectMethods"] = JoinAliases("disconnect", listener.RequireMethod("disconnect", descriptor => descriptor.EndsWith(")V", StringComparison.Ordinal)).LeftName),
+            ["playerInfoClasses"] = JoinAliases(PlayerInfo, playerInfo.LeftName),
+            ["skinLookupMethods"] = JoinAliases("createSkinLookup", skinLookup.LeftName),
+            ["skinLookupDescriptors"] = JoinAliases(
+                "(Lcom/mojang/authlib/GameProfile;)Ljava/util/function/Supplier;",
+                skinLookup.LeftDescriptor),
+            ["skinSelectionMethods"] = JoinAliases("lambda$createSkinLookup$2", skinSelection.LeftName),
+            ["skinSelectionDescriptors"] = JoinAliases(
+                "(Ljava/util/concurrent/CompletableFuture;Lnet/minecraft/client/resources/PlayerSkin;Z)Lnet/minecraft/client/resources/PlayerSkin;",
+                skinSelection.LeftDescriptor),
+            ["skinTextureUrlMethods"] = JoinAliases(
+                "textureUrl",
+                playerSkin.RequireMethod("textureUrl", descriptor => descriptor == "()Ljava/lang/String;").LeftName),
+            ["skinSecureMethods"] = JoinAliases(
+                "secure",
+                playerSkin.RequireMethod("secure", descriptor => descriptor == "()Z").LeftName)
         };
 
-        var targets = FindRuntimeTargets(runtime, listener.LeftName);
-        if (targets.Count == 0)
+        var requiredTargets = new HashSet<string>(StringComparer.Ordinal)
         {
-            throw Unsupported(runtime.Descriptor, "the mapped login class is absent from the prepared runtime");
+            LoginListener,
+            listener.LeftName,
+            PlayerInfo,
+            playerInfo.LeftName
+        };
+        var targets = FindRuntimeTargets(runtime, requiredTargets);
+        if (targets.Count != requiredTargets.Count)
+        {
+            var found = targets.Select(target => target.ClassName).ToHashSet(StringComparer.Ordinal);
+            var missing = string.Join(", ", requiredTargets.Where(target => !found.Contains(target)));
+            throw Unsupported(runtime.Descriptor, $"required runtime classes are absent: {missing}");
         }
 
         return new IdentityAdapterConfiguration(mappingPath, properties, targets);
@@ -87,13 +121,11 @@ internal sealed class IdentityAdapterMappingService
         return null;
     }
 
-    private static List<IdentityAdapterTarget> FindRuntimeTargets(PreparedRuntime runtime, string mappedLoginClass)
+    private static List<IdentityAdapterTarget> FindRuntimeTargets(
+        PreparedRuntime runtime,
+        IReadOnlySet<string> requiredTargets)
     {
-        var wanted = new HashSet<string>(StringComparer.Ordinal)
-        {
-            LoginListener,
-            mappedLoginClass
-        };
+        var wanted = new HashSet<string>(requiredTargets, StringComparer.Ordinal);
         var candidates = new List<string>();
         var minecraftLibraries = Path.Combine(runtime.RuntimeRoot, "libraries", "net", "minecraft", "client");
         if (Directory.Exists(minecraftLibraries))
@@ -160,7 +192,9 @@ internal sealed class IdentityAdapterMappingService
                 MinecraftServer,
                 Connection,
                 PlayerList,
-                Component
+                Component,
+                PlayerInfo,
+                PlayerSkin
             };
             var classes = new Dictionary<string, Tsrg2Class>(StringComparer.Ordinal);
             Tsrg2Class? current = null;

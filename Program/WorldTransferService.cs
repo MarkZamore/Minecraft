@@ -149,10 +149,7 @@ public sealed class WorldTransferService : IAsyncDisposable
     {
         using var operationCts = CancellationTokenSource.CreateLinkedTokenSource(token, _shutdownCts.Token);
         token = operationCts.Token;
-        if (_minecraft.IsClientRunning)
-        {
-            throw new InvalidOperationException("Close Minecraft before transferring a world.");
-        }
+        EnsureMinecraftAvailableForTransfer("sender");
         await _transferGate.WaitAsync(token).ConfigureAwait(false);
         try
         {
@@ -238,7 +235,7 @@ public sealed class WorldTransferService : IAsyncDisposable
                     await WriteJsonAsync(stream, header, token);
                     await using (var file = File.OpenRead(archivePath))
                     {
-                        var limiter = _voiceNetwork.CreateTransferLimiter();
+                        using var limiter = _voiceNetwork.CreateTransferLimiter();
                         await CopyWithProgressAsync(file, stream, fileInfo.Length, progress =>
                         {
                             RaiseProgress(progress, fileInfo.Length);
@@ -433,7 +430,9 @@ public sealed class WorldTransferService : IAsyncDisposable
             }
             if (header.MessageType == ProbeMessageType)
             {
-                var available = _transferGate.CurrentCount > 0 && !_minecraft.IsClientRunning;
+                var available = _transferGate.CurrentCount > 0 &&
+                                !_minecraft.IsClientRunning &&
+                                !_minecraft.IsClientPreparing;
                 await WriteJsonAsync(stream, new WorldTransferAck
                 {
                     Protocol = ProtocolName,
@@ -444,6 +443,8 @@ public sealed class WorldTransferService : IAsyncDisposable
                         ? "ready"
                         : _minecraft.IsClientRunning
                             ? "Minecraft is running on the receiver"
+                            : _minecraft.IsClientPreparing
+                                ? "Minecraft is being prepared on the receiver"
                             : "another world transfer is active"
                 }, token);
                 return;
@@ -458,10 +459,7 @@ public sealed class WorldTransferService : IAsyncDisposable
             {
                 throw new InvalidOperationException("Another world transfer is already active.");
             }
-            if (_minecraft.IsClientRunning)
-            {
-                throw new InvalidOperationException("Close Minecraft before receiving a world.");
-            }
+            EnsureMinecraftAvailableForTransfer("receiver");
             if (header.Size <= 0 || header.Size > settings.MaxArchiveBytes ||
                 string.IsNullOrWhiteSpace(header.WorldSha256) ||
                 string.IsNullOrWhiteSpace(header.PlayerManifestSha256) ||
@@ -483,7 +481,7 @@ public sealed class WorldTransferService : IAsyncDisposable
             progressStarted = true;
             await using (var file = new FileStream(receivedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
-                var limiter = _voiceNetwork.CreateTransferLimiter();
+                using var limiter = _voiceNetwork.CreateTransferLimiter();
                 await CopyExactlyWithLimitWithProgressAsync(stream, file, header.Size, settings.MaxArchiveBytes, progress =>
                 {
                     RaiseProgress(progress, header.Size);
@@ -530,6 +528,7 @@ public sealed class WorldTransferService : IAsyncDisposable
                 throw new InvalidOperationException("Could not update current world holder metadata.");
             }
 
+            EnsureMinecraftAvailableForTransfer("receiver");
             journal.State = "Ready";
             WriteJournal(transactionRoot, journal);
             await WriteJsonAsync(stream, new WorldTransferAck
@@ -553,6 +552,7 @@ public sealed class WorldTransferService : IAsyncDisposable
 
             journal.State = "CommitReceived";
             WriteJournal(transactionRoot, journal);
+            EnsureMinecraftAvailableForTransfer("receiver");
             var installedWorldPath = InstallReceivedWorld(tempWorldPath, header.WorldName);
             tempWorldPath = null;
             journal.State = "Installed";
@@ -684,6 +684,13 @@ public sealed class WorldTransferService : IAsyncDisposable
         catch
         {
         }
+    }
+
+    private void EnsureMinecraftAvailableForTransfer(string role)
+    {
+        if (!_minecraft.IsClientRunning && !_minecraft.IsClientPreparing) return;
+        throw new InvalidOperationException(
+            $"Minecraft is running or being prepared on the transfer {role}.");
     }
 
     private static bool HasExpectedProtocol(string? protocol, int version) =>

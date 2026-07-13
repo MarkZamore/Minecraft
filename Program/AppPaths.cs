@@ -36,8 +36,6 @@ public sealed class AppPaths
         Personal = CombineUnderService("Personal");
         Instances = Path.Combine(Personal, "Instances");
         PackConflicts = Path.Combine(Personal, "PackConflicts");
-        WaypointSync = Path.Combine(Personal, "WaypointSync");
-        Skin = Path.Combine(Personal, "Skin");
         Worlds = CombineUnderService("Worlds");
     }
 
@@ -50,8 +48,6 @@ public sealed class AppPaths
     public string Personal { get; }
     public string Instances { get; }
     public string PackConflicts { get; }
-    public string WaypointSync { get; }
-    public string Skin { get; }
     public string Worlds { get; }
     public string SettingsFile => Path.Combine(Personal, "settings.json");
     public string IdentityFile => Path.Combine(Personal, "UUID.json");
@@ -59,7 +55,9 @@ public sealed class AppPaths
     public string PackHashesFile => Path.Combine(Personal, "pack-hashes.json");
     public string WindowPlacementFile => Path.Combine(Personal, "window-placement.json");
     public string MinecraftWindowPlacementFile => Path.Combine(Personal, "minecraft-window-placement.json");
-    public string SkinRegistryFile => Path.Combine(Skin, "profiles.properties");
+    public string SkinRegistryFile => Path.Combine(Personal, "skin-profiles.properties");
+    public string WaypointSyncStateFile => Path.Combine(Personal, "waypoint-sync.json");
+    public string WaypointConflicts => Path.Combine(Personal, "WaypointConflicts");
     public string[] LegacySettingsFiles => new[]
     {
         Path.Combine(Service, "settings.json"),
