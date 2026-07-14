@@ -80,7 +80,7 @@ public final class PortableSkinProfiles {
         return defaultSkin;
     }
 
-    private static boolean isRegisteredUrl(String url) {
+    public static boolean isRegisteredUrl(String url) {
         if (!url.startsWith("http://127.0.0.1:")) {
             return false;
         }

@@ -37,7 +37,8 @@ public final class PortableIdentityPreflight {
             new ClassReader(transformed);
             if (isAlias("loginClasses", className)) {
                 verifyHookTargets(archive, className);
-            } else if (!isAlias("playerInfoClasses", className)) {
+            } else if (!isAlias("playerInfoClasses", className) &&
+                !isAlias("textureUrlCheckerClasses", className)) {
                 throw new IllegalStateException("Unexpected portable identity target: " + className);
             }
         }

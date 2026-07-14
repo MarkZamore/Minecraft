@@ -28,6 +28,8 @@ public final class PortableIdentityTransformer implements ClassFileTransformer {
     private static final String PLAYER_INFO =
         "net/minecraft/client/multiplayer/PlayerInfo";
     private static final String OBFUSCATED_PLAYER_INFO = "fzq";
+    private static final String TEXTURE_URL_CHECKER =
+        "com/mojang/authlib/yggdrasil/TextureUrlChecker";
     private static final String SKIN_LOOKUP_DESCRIPTOR =
         "(Lcom/mojang/authlib/GameProfile;)Ljava/util/function/Supplier;";
     private static final String SKIN_SELECTION_DESCRIPTOR =
@@ -78,14 +80,21 @@ public final class PortableIdentityTransformer implements ClassFileTransformer {
         String playerInfoClasses = property(
             "playerInfoClasses",
             PLAYER_INFO + "," + OBFUSCATED_PLAYER_INFO);
+        String textureUrlCheckerClasses = property(
+            "textureUrlCheckerClasses",
+            TEXTURE_URL_CHECKER);
         boolean loginClass = contains(listeners, className);
         boolean playerInfoClass = contains(playerInfoClasses, className);
-        if (!loginClass && !playerInfoClass) {
+        boolean textureUrlCheckerClass = contains(textureUrlCheckerClasses, className);
+        if (!loginClass && !playerInfoClass && !textureUrlCheckerClass) {
             return null;
         }
 
         ClassNode node = new ClassNode(Opcodes.ASM9);
         new ClassReader(classfileBuffer).accept(node, 0);
+        if (textureUrlCheckerClass) {
+            return transformTextureUrlChecker(node, className);
+        }
         if (playerInfoClass) {
             return transformPlayerInfo(node, className);
         }
@@ -120,6 +129,47 @@ public final class PortableIdentityTransformer implements ClassFileTransformer {
         ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         node.accept(writer);
         System.out.println("[PortableIdentity] Patched login class " + className + ".");
+        return writer.toByteArray();
+    }
+
+    private static byte[] transformTextureUrlChecker(ClassNode node, String className) {
+        boolean checkerPatched = false;
+        for (MethodNode method : node.methods) {
+            if (!matchesMethod(
+                method,
+                "textureUrlCheckerMethods",
+                "isAllowedTextureDomain",
+                "textureUrlCheckerDescriptors",
+                "(Ljava/lang/String;)Z")) {
+                continue;
+            }
+
+            LabelNode continueLabel = new LabelNode();
+            InsnList prefix = new InsnList();
+            prefix.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            prefix.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                SKIN_PROFILES,
+                "isRegisteredUrl",
+                "(Ljava/lang/String;)Z",
+                false));
+            prefix.add(new JumpInsnNode(Opcodes.IFEQ, continueLabel));
+            prefix.add(new InsnNode(Opcodes.ICONST_1));
+            prefix.add(new InsnNode(Opcodes.IRETURN));
+            prefix.add(continueLabel);
+            prefix.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+            method.instructions.insert(prefix);
+            checkerPatched = true;
+        }
+
+        if (!checkerPatched) {
+            throw new IllegalStateException(
+                "Unsupported authlib texture URL checker: required method was not found.");
+        }
+
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        node.accept(writer);
+        System.out.println("[PortableIdentity] Patched texture URL checker " + className + ".");
         return writer.toByteArray();
     }
 

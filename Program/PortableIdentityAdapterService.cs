@@ -61,6 +61,16 @@ public sealed class PortableIdentityAdapterService : IDisposable
             {
                 await RunPreflightAsync(runtime.JavaPath, adapterPath, configuration.Properties, target, token)
                     .ConfigureAwait(false);
+                if (IsConfiguredAlias(configuration.Properties, "textureUrlCheckerClasses", target.ClassName))
+                {
+                    await RunSkinSemanticPreflightAsync(
+                            runtime.JavaPath,
+                            adapterPath,
+                            configuration.Properties,
+                            target,
+                            token)
+                        .ConfigureAwait(false);
+                }
             }
 
             var mappingInfo = new FileInfo(configuration.MappingPath);
@@ -192,6 +202,93 @@ public sealed class PortableIdentityAdapterService : IDisposable
                 $"Portable UUID bytecode preflight failed for {Path.GetFileName(target.JarPath)}::{target.ClassName}. " + details);
         }
     }
+
+    private static async Task RunSkinSemanticPreflightAsync(
+        string configuredJavaPath,
+        string adapterPath,
+        IReadOnlyDictionary<string, string> properties,
+        IdentityAdapterTarget target,
+        CancellationToken token)
+    {
+        const string playerUuid = "00000000-0000-4000-8000-000000000001";
+        const string skinHash = "1111111111111111111111111111111111111111111111111111111111111111";
+        const string otherHash = "2222222222222222222222222222222222222222222222222222222222222222";
+        var registeredUrl = $"http://127.0.0.1:{SkinService.HttpPort}/skin/{playerUuid}/{skinHash}";
+        var unregisteredUrl = $"http://127.0.0.1:{SkinService.HttpPort}/skin/{playerUuid}/{otherHash}";
+        const string officialUrl = "https://textures.minecraft.net/texture/portable-preflight";
+        var registryPath = Path.Combine(
+            Path.GetDirectoryName(adapterPath)!,
+            $".skin-preflight-{Guid.NewGuid():N}.properties");
+
+        try
+        {
+            File.WriteAllText(
+                registryPath,
+                $"{playerUuid}|{skinHash}|classic|{registeredUrl}",
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = ResolveConsoleJava(configuredJavaPath),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            startInfo.ArgumentList.Add("--add-exports=java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED");
+            startInfo.ArgumentList.Add("--add-exports=java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED");
+            startInfo.ArgumentList.Add("-Dminecraft.portable.identity.enabled=true");
+            startInfo.ArgumentList.Add($"-Dminecraft.portable.skin.registry={registryPath}");
+            foreach (var pair in properties.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+            {
+                startInfo.ArgumentList.Add($"-Dminecraft.portable.identity.{pair.Key}={pair.Value}");
+            }
+            startInfo.ArgumentList.Add($"-javaagent:{adapterPath}");
+            startInfo.ArgumentList.Add("-cp");
+            startInfo.ArgumentList.Add(adapterPath + Path.PathSeparator + target.JarPath);
+            startInfo.ArgumentList.Add("minecraft.portable.identity.PortableSkinPreflight");
+            startInfo.ArgumentList.Add(registeredUrl);
+            startInfo.ArgumentList.Add(unregisteredUrl);
+            startInfo.ArgumentList.Add(officialUrl);
+
+            using var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Portable skin preflight process could not be started.");
+            var standardOutput = process.StandardOutput.ReadToEndAsync(token);
+            var standardError = process.StandardError.ReadToEndAsync(token);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                TryKill(process);
+                throw;
+            }
+
+            var output = (await standardOutput.ConfigureAwait(false)).Trim();
+            var error = (await standardError.ConfigureAwait(false)).Trim();
+            if (process.ExitCode != 0)
+            {
+                var details = string.Join(Environment.NewLine, new[] { output, error }.Where(value => value.Length > 0));
+                if (details.Length > 2000) details = details[^2000..];
+                throw new NotSupportedException(
+                    $"Portable skin behavior preflight failed for {Path.GetFileName(target.JarPath)}. " + details);
+            }
+        }
+        finally
+        {
+            if (File.Exists(registryPath)) File.Delete(registryPath);
+        }
+    }
+
+    private static bool IsConfiguredAlias(
+        IReadOnlyDictionary<string, string> properties,
+        string propertyName,
+        string value) =>
+        properties.TryGetValue(propertyName, out var aliases) &&
+        aliases.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Contains(value, StringComparer.Ordinal);
 
     private static List<string> CreateJvmArguments(
         string adapterPath,

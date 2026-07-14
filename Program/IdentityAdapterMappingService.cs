@@ -14,6 +14,7 @@ internal sealed class IdentityAdapterMappingService
     private const string Component = "net/minecraft/network/chat/Component";
     private const string PlayerInfo = "net/minecraft/client/multiplayer/PlayerInfo";
     private const string PlayerSkin = "net/minecraft/client/resources/PlayerSkin";
+    private const string TextureUrlChecker = "com/mojang/authlib/yggdrasil/TextureUrlChecker";
 
     public IdentityAdapterConfiguration Build(PreparedRuntime runtime)
     {
@@ -80,7 +81,10 @@ internal sealed class IdentityAdapterMappingService
                 playerSkin.RequireMethod("textureUrl", descriptor => descriptor == "()Ljava/lang/String;").LeftName),
             ["skinSecureMethods"] = JoinAliases(
                 "secure",
-                playerSkin.RequireMethod("secure", descriptor => descriptor == "()Z").LeftName)
+                playerSkin.RequireMethod("secure", descriptor => descriptor == "()Z").LeftName),
+            ["textureUrlCheckerClasses"] = TextureUrlChecker,
+            ["textureUrlCheckerMethods"] = "isAllowedTextureDomain",
+            ["textureUrlCheckerDescriptors"] = "(Ljava/lang/String;)Z"
         };
 
         var requiredTargets = new HashSet<string>(StringComparer.Ordinal)
@@ -88,7 +92,8 @@ internal sealed class IdentityAdapterMappingService
             LoginListener,
             listener.LeftName,
             PlayerInfo,
-            playerInfo.LeftName
+            playerInfo.LeftName,
+            TextureUrlChecker
         };
         var targets = FindRuntimeTargets(runtime, requiredTargets);
         if (targets.Count != requiredTargets.Count)
