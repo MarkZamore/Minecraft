@@ -3,21 +3,25 @@
   "providers": [
     {
       "id": "hamachi",
+      "displayName": "Hamachi",
       "clientProcesses": ["hamachi-2-ui"],
       "adapterPatterns": ["Hamachi", "LogMeIn Hamachi"]
     },
     {
       "id": "radmin",
+      "displayName": "Radmin VPN",
       "clientProcesses": ["RadminVPN", "RvRvpnGui"],
       "adapterPatterns": ["Radmin VPN"]
     },
     {
       "id": "zerotier",
+      "displayName": "ZeroTier",
       "clientProcesses": ["zerotier_desktop_ui", "ZeroTier One"],
       "adapterPatterns": ["ZeroTier"]
     },
     {
       "id": "tailscale",
+      "displayName": "Tailscale",
       "clientProcesses": ["tailscale-ipn"],
       "adapterPatterns": ["Tailscale"],
       "peerSources": [
@@ -29,6 +33,7 @@
     },
     {
       "id": "netbird",
+      "displayName": "NetBird",
       "clientProcesses": ["netbird-ui"],
       "adapterPatterns": ["NetBird", "WireGuard Tunnel: netbird"],
       "peerSources": [
@@ -40,6 +45,7 @@
     },
     {
       "id": "easytier",
+      "displayName": "EasyTier",
       "clientProcesses": ["easytier-gui", "easytier-manager", "easytier-core"],
       "adapterPatterns": ["EasyTier"],
       "peerSources": [
@@ -51,11 +57,13 @@
     },
     {
       "id": "nord-meshnet",
+      "displayName": "NordVPN Meshnet",
       "clientProcesses": ["NordVPN"],
       "adapterPatterns": ["NordLynx", "NordVPN"]
     },
     {
       "id": "husarnet",
+      "displayName": "Husarnet",
       "clientProcesses": ["husarnet-daemon", "husarnet"],
       "adapterPatterns": ["Husarnet"],
       "peerSources": [

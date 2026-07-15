@@ -29,6 +29,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<WorldViewModel> _worlds = new();
     private readonly ObservableCollection<ClientBuildViewModel> _builds = new();
     private readonly ObservableCollection<PeerViewModel> _voicePeers = new();
+    private readonly ObservableCollection<NetworkProviderOption> _networkProviders = new();
     private readonly Dictionary<string, VoicePresenceEntry> _voicePresence = new(StringComparer.OrdinalIgnoreCase);
     private readonly DispatcherTimer _uiTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly DispatcherTimer _secretTimer = new() { Interval = TimeSpan.FromSeconds(1) };
@@ -81,6 +82,7 @@ public partial class MainWindow : Window
     private bool _suppressBuildPersistence;
     private bool _suppressMemoryTextChanged;
     private bool _suppressVoicePersistence;
+    private bool _suppressNetworkProviderSelection;
     private string _lastVoicePeerListSignature = "";
     private string _lastVoiceTransportPeerSignature = "";
     private PeerViewModel? _localVoicePeer;
@@ -112,6 +114,7 @@ public partial class MainWindow : Window
         HostComboBox.ItemsSource = _hostPeers;
         WorldComboBox.ItemsSource = _worlds;
         VoicePeersItemsControl.ItemsSource = _voicePeers;
+        NetworkProviderComboBox.ItemsSource = _networkProviders;
         _uiTimer.Tick += (_, _) =>
         {
             RefreshBuilds();
@@ -123,7 +126,6 @@ public partial class MainWindow : Window
             UpdateVoicePeersFromDiscovery();
             RefreshLanAdvertisementState();
             RefreshUi();
-            _ = RefreshNetworkAdaptersSafelyAsync(forceRestart: false);
         };
         _secretTimer.Tick += (_, _) => RefreshSecretLoadingProgress();
         _networkRefreshTimer.Tick += NetworkRefreshTimer_Tick;
@@ -194,12 +196,13 @@ public partial class MainWindow : Window
             LoadSettingsIntoUi();
             RefreshVoiceDevices();
             RefreshBuilds();
-            RefreshNetworkEnvironment();
             RefreshNetworkToolSetupStatus();
             if (_settings.NetworkToolAutoLaunch)
             {
-                _ = AutoLaunchInstalledNetworkToolAsync();
+                await AutoLaunchInstalledNetworkToolAsync();
             }
+            CaptureNetworkProviders();
+            RefreshNetworkEnvironment();
             RefreshHostPeers();
             RefreshMemoryText(saveIfChanged: true);
             RefreshWorlds();
@@ -301,6 +304,33 @@ public partial class MainWindow : Window
         foreach (var peer in _peers)
         {
             peer.SetPreferredProvider(preferredProvider);
+        }
+    }
+
+    private void CaptureNetworkProviders()
+    {
+        var providers = RequireNetwork().CaptureActiveProviders();
+        _suppressNetworkProviderSelection = true;
+        try
+        {
+            _networkProviders.Clear();
+            foreach (var provider in providers) _networkProviders.Add(provider);
+            NetworkProviderComboBox.SelectedItem = _networkProviders.FirstOrDefault();
+        }
+        finally
+        {
+            _suppressNetworkProviderSelection = false;
+        }
+        NetworkProviderPlaceholderText.Visibility = _networkProviders.Count == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        if (_networkProviders.Count > 0)
+        {
+            RequireLogger().Info($"Network provider selected for this session: {_networkProviders[0].DisplayName}.");
+        }
+        else
+        {
+            RequireLogger().Info("No running VPN client with a usable adapter was detected; physical LAN remains available.");
         }
     }
 
@@ -2052,6 +2082,19 @@ public partial class MainWindow : Window
         RefreshUi();
     }
 
+    private async void NetworkProviderComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressNetworkProviderSelection ||
+            NetworkProviderComboBox.SelectedItem is not NetworkProviderOption provider ||
+            !RequireNetwork().SelectProvider(provider.Id))
+        {
+            return;
+        }
+
+        RequireLogger().Info($"Network provider selected for this session: {provider.DisplayName}.");
+        await RefreshNetworkAdaptersSafelyAsync(forceRestart: true);
+    }
+
     private async void BuildComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_suppressBuildPersistence || _settings is null || _settingsService is null) return;
@@ -2258,27 +2301,109 @@ public partial class MainWindow : Window
     {
         if (_updateService is null) return;
 
+        PreparedUpdate? startupPrepared = null;
+        PreparedUpdate? readyUpdate = null;
+        var installAfterCheck = false;
         try
         {
-            var prepared = await Task.Run(_updateService.TryGetPreparedUpdate, token);
+            startupPrepared = await Task.Run(_updateService.TryGetPreparedUpdate, token);
+            readyUpdate = startupPrepared;
             token.ThrowIfCancellationRequested();
-            if (prepared is not null)
+            if (startupPrepared is not null)
             {
                 await Dispatcher.InvokeAsync(() =>
                 {
-                    _preparedUpdate = prepared;
+                    _updateBusy = true;
+                    _preparedUpdate = startupPrepared;
                     UpdateProgressBar.IsIndeterminate = false;
                     UpdateProgressBar.Value = 100;
                     SetProgressActivity(UpdateProgressBar, active: false);
                     UpdateProgressText.Text = "Обновление готово к установке";
                     RefreshUi();
                 });
-                return;
             }
 
-            var result = await _updateService.CheckAsync(token);
+            var result = startupPrepared is null
+                ? await _updateService.CheckAsync(token)
+                : await _updateService.CheckAsync(
+                    token,
+                    attempts: 1,
+                    attemptTimeout: TimeSpan.FromSeconds(5));
             token.ThrowIfCancellationRequested();
             if (!result.IsUpdateAvailable)
+            {
+                installAfterCheck = startupPrepared is not null;
+                if (startupPrepared is null)
+                {
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        _preparedUpdate = null;
+                        UpdateProgressBar.IsIndeterminate = false;
+                        UpdateProgressBar.Value = 0;
+                        SetProgressActivity(UpdateProgressBar, active: false);
+                        UpdateProgressText.Text = "Вы на последней версии";
+                    });
+                }
+            }
+            else if (result.Manifest is not null &&
+                     (startupPrepared is null || ShouldReplacePreparedUpdate(startupPrepared.Manifest, result.Manifest)))
+            {
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    _updateBusy = true;
+                    _updateRate.Reset();
+                    UpdateProgressBar.IsIndeterminate = false;
+                    UpdateProgressBar.Value = 0;
+                    SetProgressActivity(UpdateProgressBar, active: true);
+                    UpdateProgressText.Text = "Скачивается обновление";
+                    RefreshUi();
+                });
+
+                var progress = new Progress<UpdatePreparationProgress>(value =>
+                {
+                    UpdateProgressBar.IsIndeterminate = value.Fraction is null;
+                    if (value.Fraction is not null)
+                    {
+                        UpdateProgressBar.Value = Math.Clamp(value.Fraction.Value * 100d, 0d, 100d);
+                    }
+                    if (value.Stage == UpdatePreparationStage.Downloading && value.TotalBytes > 0)
+                    {
+                        var speed = _updateRate.Update(value.DownloadedBytes, "update");
+                        UpdateProgressText.Text =
+                            $"Скачивается обновление: {FormatBytes(value.DownloadedBytes)} / {FormatBytes(value.TotalBytes)} ({FormatBytes((long)speed)}/с)";
+                    }
+                    else if (value.Stage == UpdatePreparationStage.ApplyingDelta)
+                    {
+                        _updateRate.Reset();
+                        UpdateProgressText.Text = "Применение обновления";
+                    }
+                });
+                readyUpdate = await _updateService.DownloadUpdateAsync(result, progress, token);
+                token.ThrowIfCancellationRequested();
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    _preparedUpdate = readyUpdate;
+                    UpdateProgressBar.IsIndeterminate = false;
+                    UpdateProgressBar.Value = 100;
+                    SetProgressActivity(UpdateProgressBar, active: false);
+                    UpdateProgressText.Text = "Обновление готово к установке";
+                });
+                installAfterCheck = startupPrepared is not null;
+            }
+            else
+            {
+                installAfterCheck = startupPrepared is not null;
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger?.Warn($"Background update failed: {ex.Message}");
+            readyUpdate = startupPrepared;
+            installAfterCheck = startupPrepared is not null;
+            if (startupPrepared is null)
             {
                 await Dispatcher.InvokeAsync(() =>
                 {
@@ -2287,67 +2412,8 @@ public partial class MainWindow : Window
                     UpdateProgressBar.Value = 0;
                     SetProgressActivity(UpdateProgressBar, active: false);
                     UpdateProgressText.Text = "Вы на последней версии";
-                    RefreshUi();
                 });
-                return;
             }
-
-            await Dispatcher.InvokeAsync(() =>
-            {
-                _updateBusy = true;
-                _updateRate.Reset();
-                _preparedUpdate = null;
-                UpdateProgressBar.IsIndeterminate = false;
-                UpdateProgressBar.Value = 0;
-                SetProgressActivity(UpdateProgressBar, active: true);
-                UpdateProgressText.Text = "Скачивается обновление";
-                RefreshUi();
-            });
-
-            var progress = new Progress<UpdatePreparationProgress>(value =>
-            {
-                UpdateProgressBar.IsIndeterminate = value.Fraction is null;
-                if (value.Fraction is not null)
-                {
-                    UpdateProgressBar.Value = Math.Clamp(value.Fraction.Value * 100d, 0d, 100d);
-                }
-                if (value.Stage == UpdatePreparationStage.Downloading && value.TotalBytes > 0)
-                {
-                    var speed = _updateRate.Update(value.DownloadedBytes, "update");
-                    UpdateProgressText.Text =
-                        $"Скачивается обновление: {FormatBytes(value.DownloadedBytes)} / {FormatBytes(value.TotalBytes)} ({FormatBytes((long)speed)}/с)";
-                }
-                else if (value.Stage == UpdatePreparationStage.ApplyingDelta)
-                {
-                    _updateRate.Reset();
-                    UpdateProgressText.Text = "Применение обновления";
-                }
-            });
-            prepared = await _updateService.DownloadUpdateAsync(result, progress, token);
-            token.ThrowIfCancellationRequested();
-            await Dispatcher.InvokeAsync(() =>
-            {
-                _preparedUpdate = prepared;
-                UpdateProgressBar.IsIndeterminate = false;
-                UpdateProgressBar.Value = 100;
-                SetProgressActivity(UpdateProgressBar, active: false);
-                UpdateProgressText.Text = "Обновление готово к установке";
-            });
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            _logger?.Warn($"Background update failed: {ex.Message}");
-            await Dispatcher.InvokeAsync(() =>
-            {
-                _preparedUpdate = null;
-                UpdateProgressBar.IsIndeterminate = false;
-                UpdateProgressBar.Value = 0;
-                SetProgressActivity(UpdateProgressBar, active: false);
-                UpdateProgressText.Text = "Вы на последней версии";
-            });
         }
         finally
         {
@@ -2360,6 +2426,36 @@ public partial class MainWindow : Window
                 });
             }
         }
+
+        if (installAfterCheck && readyUpdate is not null && !token.IsCancellationRequested && !Dispatcher.HasShutdownStarted)
+        {
+            var installable = await Task.Run(_updateService.TryGetPreparedUpdate, token);
+            if (installable is null)
+            {
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    _preparedUpdate = null;
+                    UpdateProgressBar.Value = 0;
+                    SetProgressActivity(UpdateProgressBar, active: false);
+                    UpdateProgressText.Text = "Вы на последней версии";
+                    RefreshUi();
+                });
+                return;
+            }
+            await Dispatcher.InvokeAsync(() =>
+            {
+                _preparedUpdate = installable;
+                RequireUpdateService().StartInstallAndRestart(installable.ExecutablePath);
+                Application.Current.Shutdown();
+            });
+        }
+    }
+
+    private static bool ShouldReplacePreparedUpdate(UpdateManifest cached, UpdateManifest remote)
+    {
+        if (remote.ReleaseNumber < cached.ReleaseNumber) return false;
+        return !string.Equals(remote.CommitSha, cached.CommitSha, StringComparison.OrdinalIgnoreCase) ||
+               !string.Equals(remote.Sha256, cached.Sha256, StringComparison.OrdinalIgnoreCase);
     }
 
     private async void UpdateButton_Click(object sender, RoutedEventArgs e)
@@ -2560,13 +2656,14 @@ public partial class MainWindow : Window
 
     private async Task AutoLaunchInstalledNetworkToolAsync()
     {
-        await Task.Delay(1000, _lifetimeCts.Token);
         try
         {
             if (RequireNetworkToolSetup().Launch())
             {
-                await Task.Delay(TimeSpan.FromSeconds(2), _lifetimeCts.Token);
-                await RefreshNetworkAdaptersAsync(forceRestart: true);
+                await RequireNetwork().WaitForProviderAsync(
+                    RequireSettings().NetworkToolId,
+                    TimeSpan.FromSeconds(5),
+                    _lifetimeCts.Token);
             }
         }
         catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
@@ -2780,6 +2877,7 @@ public partial class MainWindow : Window
         CopyNetworkNameButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkName);
         CopyNetworkPasswordButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkPassword);
         NetworkToolAutoLaunchCheckBox.IsEnabled = interactiveEnabled;
+        NetworkProviderComboBox.IsEnabled = !_transferActive && _networkProviders.Count > 0;
         WorldComboBox.IsEnabled = interactiveEnabled && !_minecraftPreparing && _worlds.Count > 0;
         OnlinePlayerComboBox.IsEnabled = interactiveEnabled && !_minecraftPreparing && _peers.Count > 0;
         WorldPlaceholderText.Visibility = _worlds.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -2812,7 +2910,7 @@ public partial class MainWindow : Window
                 : "Войти в голосовой канал";
             VoiceMuteButton.Content = _voiceChannel.IsMuted ? "\uE198" : "\uE720";
             VoiceMuteButton.ToolTip = _voiceChannel.IsMuted ? "Включить микрофон" : "Выключить микрофон";
-            VoiceProtectionButton.Content = _voiceChannel.IsTrafficProtectionEnabled ? "\uE83D" : "\uE733";
+            VoiceProtectionButton.Content = _voiceChannel.IsTrafficProtectionEnabled ? "\uEA18" : "\uEB59";
             VoiceProtectionButton.ToolTip = _voiceChannel.IsTrafficProtectionEnabled
                 ? "Буфер включён"
                 : "Буфер выключен";
@@ -2822,7 +2920,7 @@ public partial class MainWindow : Window
         {
             VoiceJoinButton.Content = "\uE717";
             VoiceMuteButton.Content = "\uE720";
-            VoiceProtectionButton.Content = "\uE83D";
+            VoiceProtectionButton.Content = "\uEA18";
             VoiceProtectionButton.ToolTip = "Буфер включён";
             VoiceDeafenButton.Content = "Звук";
         }

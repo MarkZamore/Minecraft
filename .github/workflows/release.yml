@@ -38,58 +38,93 @@ jobs:
         run: |
           "HAS_PREVIOUS=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RELEASE_NUMBER=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $basesFile = Join-Path $env:RUNNER_TEMP 'minecraft-delta-bases.json'
+          '[]' | Set-Content -LiteralPath $basesFile -Encoding UTF8
+          "DELTA_BASES_FILE=$basesFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          function Get-ValidatedBase([string]$Tag, [string]$Directory) {
+            New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+            gh release download $Tag `
+              --pattern 'Minecraft.exe' `
+              --pattern 'update.json' `
+              --dir $Directory `
+              --clobber | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Release $Tag could not be downloaded." }
+
+            $exe = Join-Path $Directory 'Minecraft.exe'
+            $manifestPath = Join-Path $Directory 'update.json'
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+              throw "Release $Tag is incomplete."
+            }
+
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            $commit = ([string]$manifest.commitSha).ToLowerInvariant()
+            $sha = ([string]$manifest.sha256).ToLowerInvariant()
+            $size = [long]$manifest.sizeBytes
+            $releaseNumber = [int]$manifest.releaseNumber
+            if ($commit -notmatch '^[0-9a-f]{40}$' -or
+                $sha -notmatch '^[0-9a-f]{64}$' -or
+                $size -le 0 -or
+                $releaseNumber -lt 1) {
+              throw "Release $Tag manifest is invalid."
+            }
+            $file = Get-Item -LiteralPath $exe
+            $actualSha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($file.Length -ne $size -or $actualSha -ne $sha) {
+              throw "Release $Tag executable does not match its manifest."
+            }
+
+            return [pscustomobject]@{
+              tag = $Tag
+              executablePath = $exe
+              manifestPath = $manifestPath
+              releaseNumber = $releaseNumber
+              commitSha = $commit
+              sha256 = $sha
+              sizeBytes = $size
+            }
+          }
+
           gh release view latest --json tagName *> $null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "No previous latest release is available; a full-only release will be created."
             exit 0
           }
 
-          $previousDir = Join-Path $env:RUNNER_TEMP 'minecraft-previous-release'
-          New-Item -ItemType Directory -Path $previousDir -Force | Out-Null
-          gh release download latest `
-            --pattern 'Minecraft.exe' `
-            --pattern 'update.json' `
-            --dir $previousDir `
-            --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Previous release assets could not be downloaded." }
-
-          $previousExe = Join-Path $previousDir 'Minecraft.exe'
-          $previousManifestPath = Join-Path $previousDir 'update.json'
-          if (-not (Test-Path -LiteralPath $previousExe -PathType Leaf) -or
-              -not (Test-Path -LiteralPath $previousManifestPath -PathType Leaf)) {
-            throw "Previous latest release is incomplete."
-          }
-
-          $manifest = Get-Content -LiteralPath $previousManifestPath -Raw | ConvertFrom-Json
-          $commit = [string]$manifest.commitSha
-          $expectedSha = ([string]$manifest.sha256).ToLowerInvariant()
-          $expectedSize = [long]$manifest.sizeBytes
-          if ($commit -notmatch '^[0-9a-fA-F]{40}$' -or $expectedSha -notmatch '^[0-9a-f]{64}$' -or $expectedSize -le 0) {
-            throw "Previous update manifest is invalid."
-          }
-          $file = Get-Item -LiteralPath $previousExe
-          $actualSha = (Get-FileHash -LiteralPath $previousExe -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($file.Length -ne $expectedSize -or $actualSha -ne $expectedSha) {
-            throw "Previous Minecraft.exe does not match its update manifest."
-          }
-
-          $previousReleaseNumber = 0
-          if ($null -ne $manifest.releaseNumber) {
-            [int]::TryParse([string]$manifest.releaseNumber, [ref]$previousReleaseNumber) | Out-Null
-          }
+          $previousDir = Join-Path $env:RUNNER_TEMP 'minecraft-base-latest'
+          $previous = Get-ValidatedBase 'latest' $previousDir
           $currentCommit = '${{ github.sha }}'.ToLowerInvariant()
-          $releaseNumber = if ($commit.ToLowerInvariant() -eq $currentCommit) {
-            if ($previousReleaseNumber -gt 0) { $previousReleaseNumber } else { 1 }
-          } elseif ($previousReleaseNumber -gt 0) {
-            $previousReleaseNumber + 1
+          $releaseNumber = if ($previous.commitSha -eq $currentCommit) {
+            $previous.releaseNumber
           } else {
-            1
+            $previous.releaseNumber + 1
           }
+
+          $bases = [System.Collections.Generic.List[object]]::new()
+          if ($previous.commitSha -ne $currentCommit) { $bases.Add($previous) }
+          $releaseRows = gh release list --limit 100 --json tagName | ConvertFrom-Json
+          $archiveTags = $releaseRows.tagName |
+            Where-Object { $_ -match '^update-base-([1-9][0-9]*)$' } |
+            Sort-Object { [int]($_ -replace '^update-base-', '') } -Descending
+          foreach ($tag in $archiveTags) {
+            if ($bases.Count -ge 2) { break }
+            $number = [int]($tag -replace '^update-base-', '')
+            if ($number -ge $previous.releaseNumber) { continue }
+            $archive = Get-ValidatedBase $tag (Join-Path $env:RUNNER_TEMP "minecraft-$tag")
+            if (-not ($bases | Where-Object { $_.sha256 -eq $archive.sha256 })) {
+              $bases.Add($archive)
+            }
+          }
+          ConvertTo-Json -InputObject @($bases) -Depth 4 |
+            Set-Content -LiteralPath $basesFile -Encoding UTF8
 
           "HAS_PREVIOUS=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PREVIOUS_EXE=$previousExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PREVIOUS_COMMIT=$($commit.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PREVIOUS_SHA256=$expectedSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_EXE=$($previous.executablePath)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_MANIFEST=$($previous.manifestPath)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_COMMIT=$($previous.commitSha)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_SHA256=$($previous.sha256)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PREVIOUS_RELEASE_NUMBER=$($previous.releaseNumber)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RELEASE_NUMBER=$releaseNumber" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Restore
@@ -122,44 +157,56 @@ jobs:
 
           $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           $size = (Get-Item -LiteralPath $exe).Length
-          $deltaManifest = $null
+          $deltaManifests = [System.Collections.Generic.List[object]]::new()
+          $bases = @(
+            Get-Content -LiteralPath $env:DELTA_BASES_FILE -Raw | ConvertFrom-Json
+          ) | Select-Object -First 2
 
-          if ($env:HAS_PREVIOUS -eq 'true' -and $env:PREVIOUS_COMMIT -ne '${{ github.sha }}') {
-            $patch = Join-Path $artifactDir 'Minecraft.bsdiff'
-            $roundTrip = Join-Path $env:RUNNER_TEMP 'Minecraft.delta-roundtrip.exe'
+          for ($index = 0; $index -lt $bases.Count; $index++) {
+            $base = $bases[$index]
+            $assetName = if ($index -eq 0) {
+              'Minecraft.bsdiff'
+            } else {
+              "Minecraft.from-$($base.releaseNumber).bsdiff"
+            }
+            $patch = Join-Path $artifactDir $assetName
+            $roundTrip = Join-Path $env:RUNNER_TEMP "Minecraft.delta-roundtrip-$($base.releaseNumber).exe"
             dotnet run `
               --project Program\Patch\DeltaPatchTool.csproj `
               -c Release `
-              -- create $env:PREVIOUS_EXE $exe $patch
-            if ($LASTEXITCODE -ne 0) { throw "Delta patch generation failed." }
+              -- create $base.executablePath $exe $patch
+            if ($LASTEXITCODE -ne 0) { throw "Delta patch generation failed for release $($base.releaseNumber)." }
 
             dotnet run `
               --project Program\Patch\DeltaPatchTool.csproj `
               -c Release `
               --no-build `
               --no-restore `
-              -- apply $env:PREVIOUS_EXE $patch $roundTrip
-            if ($LASTEXITCODE -ne 0) { throw "Delta patch roundtrip failed." }
+              -- apply $base.executablePath $patch $roundTrip
+            if ($LASTEXITCODE -ne 0) { throw "Delta patch roundtrip failed for release $($base.releaseNumber)." }
 
             $roundTripHash = (Get-FileHash -LiteralPath $roundTrip -Algorithm SHA256).Hash.ToLowerInvariant()
             $roundTripSize = (Get-Item -LiteralPath $roundTrip).Length
             Remove-Item -LiteralPath $roundTrip -Force
             if ($roundTripHash -ne $hash -or $roundTripSize -ne $size) {
-              throw "Delta patch roundtrip does not reproduce the published executable."
+              throw "Delta patch from release $($base.releaseNumber) does not reproduce the published executable."
             }
 
             $patchHash = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
             $patchSize = (Get-Item -LiteralPath $patch).Length
-            $deltaManifest = [ordered]@{
+            $deltaManifests.Add([ordered]@{
               algorithm = 'bsdiff'
               algorithmVersion = 1
-              baseCommitSha = $env:PREVIOUS_COMMIT
-              baseSha256 = $env:PREVIOUS_SHA256
-              assetName = 'Minecraft.bsdiff'
+              baseReleaseNumber = [int]$base.releaseNumber
+              baseCommitSha = [string]$base.commitSha
+              baseSha256 = [string]$base.sha256
+              assetName = $assetName
               sha256 = $patchHash
               sizeBytes = $patchSize
-            }
+            })
           }
+
+          $legacyDelta = if ($deltaManifests.Count -gt 0) { $deltaManifests[0] } else { $null }
 
           $manifest = [ordered]@{
             schemaVersion = 2
@@ -170,36 +217,69 @@ jobs:
             assetName = 'Minecraft.exe'
             sha256 = $hash
             sizeBytes = $size
-            deltaPatch = $deltaManifest
+            deltaPatch = $legacyDelta
+            deltaPatches = @($deltaManifests)
           }
-          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $artifactDir 'update.json') -Encoding UTF8
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $artifactDir 'update.json') -Encoding UTF8
 
       - name: Verify release contents
         shell: pwsh
         run: |
           $artifactDir = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
           $files = Get-ChildItem -LiteralPath $artifactDir -File
-          $expected = @('Minecraft.exe', 'update.json')
-          if (Test-Path -LiteralPath (Join-Path $artifactDir 'Minecraft.bsdiff')) {
-            $expected += 'Minecraft.bsdiff'
+          $manifest = Get-Content -LiteralPath (Join-Path $artifactDir 'update.json') -Raw | ConvertFrom-Json
+          if ($manifest.schemaVersion -ne 2 -or $manifest.releaseNumber -lt 1 -or $manifest.assetName -ne 'Minecraft.exe') {
+            throw "Update manifest is invalid."
           }
+
+          $patches = @($manifest.deltaPatches)
+          if ($patches.Count -gt 2) { throw "More than two delta patches were published." }
+          $expected = @('Minecraft.exe', 'update.json')
+          foreach ($patch in $patches) {
+            if ($patch.algorithm -ne 'bsdiff' -or $patch.algorithmVersion -ne 1) {
+              throw "Delta manifest algorithm is invalid."
+            }
+            if ($patch.assetName -notmatch '^Minecraft(?:\.from-[1-9][0-9]*)?\.bsdiff$') {
+              throw "Delta asset name is invalid: $($patch.assetName)"
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $artifactDir $patch.assetName) -PathType Leaf)) {
+              throw "Delta manifest references a missing patch asset: $($patch.assetName)"
+            }
+            $expected += $patch.assetName
+          }
+          $expected = @($expected | Select-Object -Unique)
           $unexpected = $files.Name | Where-Object { $_ -notin $expected }
           $missing = $expected | Where-Object { $_ -notin $files.Name }
           if ($unexpected -or $missing -or $files.Count -ne $expected.Count) {
             throw "Release contents are invalid. Missing: $missing; unexpected: $unexpected"
           }
 
-          $manifest = Get-Content -LiteralPath (Join-Path $artifactDir 'update.json') -Raw | ConvertFrom-Json
-          if ($manifest.schemaVersion -ne 2 -or $manifest.releaseNumber -lt 1 -or $manifest.assetName -ne 'Minecraft.exe') {
-            throw "Update manifest is invalid."
+          if ($patches.Count -gt 0 -and
+              (-not $manifest.deltaPatch -or
+               $manifest.deltaPatch.assetName -ne 'Minecraft.bsdiff' -or
+               $manifest.deltaPatch.sha256 -ne $patches[0].sha256)) {
+            throw "Legacy deltaPatch does not match the first direct patch."
           }
-          if ($manifest.deltaPatch -and -not (Test-Path -LiteralPath (Join-Path $artifactDir $manifest.deltaPatch.assetName))) {
-            throw "Delta manifest references a missing patch asset."
+
+      - name: Archive previous base
+        if: env.HAS_PREVIOUS == 'true' && env.PREVIOUS_COMMIT != github.sha
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "update-base-$env:PREVIOUS_RELEASE_NUMBER"
+          if (gh release view $tag 2>$null) {
+            gh release delete $tag --cleanup-tag --yes
+            if ($LASTEXITCODE -ne 0) { throw "Could not replace archive $tag." }
           }
-          if ($manifest.deltaPatch -and
-              ($manifest.deltaPatch.algorithm -ne 'bsdiff' -or $manifest.deltaPatch.algorithmVersion -ne 1)) {
-            throw "Delta manifest algorithm is invalid."
-          }
+          gh release create $tag `
+            $env:PREVIOUS_EXE `
+            $env:PREVIOUS_MANIFEST `
+            --target $env:PREVIOUS_COMMIT `
+            --prerelease `
+            --title "Update base $env:PREVIOUS_RELEASE_NUMBER" `
+            --notes "Binary base retained for direct delta generation."
+          if ($LASTEXITCODE -ne 0) { throw "Could not create archive $tag." }
 
       - name: Publish latest release
         shell: pwsh
@@ -211,8 +291,9 @@ jobs:
             (Join-Path $artifactDir 'Minecraft.exe'),
             (Join-Path $artifactDir 'update.json')
           )
-          $patch = Join-Path $artifactDir 'Minecraft.bsdiff'
-          if (Test-Path -LiteralPath $patch) { $assets += $patch }
+          $assets += Get-ChildItem -LiteralPath $artifactDir -Filter '*.bsdiff' -File |
+            Sort-Object Name |
+            Select-Object -ExpandProperty FullName
 
           if (gh release view latest 2>$null) {
             gh release delete latest --cleanup-tag --yes
@@ -225,3 +306,12 @@ jobs:
             --latest `
             --title "Latest Minecraft.exe" `
             --notes "Automated build for commit ${{ github.sha }}"
+          if ($LASTEXITCODE -ne 0) { throw "Latest release could not be published." }
+
+          $archiveTags = (gh release list --limit 100 --json tagName | ConvertFrom-Json).tagName |
+            Where-Object { $_ -match '^update-base-([1-9][0-9]*)$' } |
+            Sort-Object { [int]($_ -replace '^update-base-', '') } -Descending
+          foreach ($tag in @($archiveTags | Select-Object -Skip 2)) {
+            gh release delete $tag --cleanup-tag --yes
+            if ($LASTEXITCODE -ne 0) { throw "Could not prune archive $tag." }
+          }

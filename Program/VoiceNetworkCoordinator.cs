@@ -4,13 +4,25 @@ namespace Minecraft;
 
 public sealed class VoiceNetworkCoordinator
 {
+    private const double InitialBulkBytesPerSecond = 512d * 1024d;
+    private const double MinimumBulkBytesPerSecond = 128d * 1024d;
+    private const double MaximumBulkBytesPerSecond = 64d * 1024d * 1024d;
+    private const double ReservedVoiceBitsPerSecondPerPeer = 128_000d;
+    private static readonly TimeSpan AdjustmentInterval = TimeSpan.FromSeconds(2);
     private readonly object _gate = new();
+    private readonly object _limiterGate = new();
+    private readonly Stopwatch _transferClock = Stopwatch.StartNew();
     private bool _joined;
     private bool _trafficProtectionEnabled = true;
     private int _connectedPeers;
     private double _lossPercent;
     private double _jitterMs;
     private double _rttMs;
+    private double _estimatedCapacityBytesPerSecond;
+    private TimeSpan _lastAdjustment;
+    private TimeSpan _nextWriteAt;
+    private bool _limiterActive;
+    private int _limiterResetRequested = 1;
 
     public bool ShouldProtectVoice
     {
@@ -41,6 +53,7 @@ public sealed class VoiceNetworkCoordinator
     {
         lock (_gate)
         {
+            if (_joined == joined) return;
             _joined = joined;
             if (!joined)
             {
@@ -50,14 +63,17 @@ public sealed class VoiceNetworkCoordinator
                 _rttMs = 0;
             }
         }
+        Interlocked.Exchange(ref _limiterResetRequested, 1);
     }
 
     public void SetTrafficProtectionEnabled(bool enabled)
     {
         lock (_gate)
         {
+            if (_trafficProtectionEnabled == enabled) return;
             _trafficProtectionEnabled = enabled;
         }
+        Interlocked.Exchange(ref _limiterResetRequested, 1);
     }
 
     public void ReportQuality(int connectedPeers, double lossPercent, double jitterMs, double rttMs)
@@ -72,6 +88,82 @@ public sealed class VoiceNetworkCoordinator
     }
 
     public VoiceTransferLimiter CreateTransferLimiter() => new(this);
+
+    internal async ValueTask ThrottleAsync(int bytes, CancellationToken token)
+    {
+        if (bytes <= 0) return;
+        TimeSpan scheduledAt;
+        lock (_limiterGate)
+        {
+            var now = _transferClock.Elapsed;
+            if (Interlocked.Exchange(ref _limiterResetRequested, 0) != 0)
+            {
+                ResetLimiter(now);
+            }
+
+            var snapshot = Snapshot;
+            if (!snapshot.IsJoined || !snapshot.IsTrafficProtectionEnabled || snapshot.ConnectedPeers == 0)
+            {
+                ResetLimiter(now);
+                return;
+            }
+
+            var reserve = ReservedVoiceBytesPerSecond(snapshot.ConnectedPeers);
+            if (!_limiterActive)
+            {
+                _estimatedCapacityBytesPerSecond = InitialBulkBytesPerSecond + reserve;
+                _lastAdjustment = now;
+                _nextWriteAt = now;
+                _limiterActive = true;
+            }
+            else if (now - _lastAdjustment >= AdjustmentInterval)
+            {
+                _estimatedCapacityBytesPerSecond = snapshot.IsDegraded
+                    ? Math.Max(MinimumBulkBytesPerSecond + reserve, _estimatedCapacityBytesPerSecond / 2d)
+                    : Math.Min(MaximumBulkBytesPerSecond + reserve, _estimatedCapacityBytesPerSecond * 1.25d);
+                _lastAdjustment = now;
+            }
+
+            var bulkRate = Math.Clamp(
+                _estimatedCapacityBytesPerSecond - reserve,
+                MinimumBulkBytesPerSecond,
+                MaximumBulkBytesPerSecond);
+            if (_nextWriteAt < now) _nextWriteAt = now;
+            _nextWriteAt += TimeSpan.FromSeconds(bytes / bulkRate);
+            scheduledAt = _nextWriteAt;
+        }
+
+        var delay = scheduledAt - _transferClock.Elapsed;
+        while (delay > TimeSpan.Zero)
+        {
+            var current = Snapshot;
+            if (!current.IsJoined || !current.IsTrafficProtectionEnabled || current.ConnectedPeers == 0)
+            {
+                lock (_limiterGate)
+                {
+                    ResetLimiter(_transferClock.Elapsed);
+                }
+                return;
+            }
+
+            await Task.Delay(
+                delay > TimeSpan.FromMilliseconds(100) ? TimeSpan.FromMilliseconds(100) : delay,
+                token).ConfigureAwait(false);
+            delay = scheduledAt - _transferClock.Elapsed;
+        }
+    }
+
+    private static double ReservedVoiceBytesPerSecond(int connectedPeers) =>
+        Math.Max(1, connectedPeers) * ReservedVoiceBitsPerSecondPerPeer / 8d;
+
+    private void ResetLimiter(TimeSpan now)
+    {
+        _limiterActive = false;
+        _estimatedCapacityBytesPerSecond = 0;
+        _lastAdjustment = now;
+        _nextWriteAt = now;
+    }
+
 }
 
 public readonly record struct VoiceNetworkSnapshot(
@@ -88,71 +180,18 @@ public readonly record struct VoiceNetworkSnapshot(
 public sealed class VoiceTransferLimiter : IDisposable
 {
     public const int TransferBlockSize = 64 * 1024;
-    private const double InitialBytesPerSecond = 1024d * 1024d;
-    private const double MinimumBytesPerSecond = 128d * 1024d;
-    private const double MaximumBytesPerSecond = 64d * 1024d * 1024d;
-    private static readonly TimeSpan AdjustmentInterval = TimeSpan.FromSeconds(2);
     private readonly VoiceNetworkCoordinator _coordinator;
-    private readonly SemaphoreSlim _gate = new(1, 1);
-    private readonly Stopwatch _clock = Stopwatch.StartNew();
-    private double _rate = InitialBytesPerSecond;
-    private TimeSpan _lastAdjustment;
-    private TimeSpan _nextWriteAt;
 
     internal VoiceTransferLimiter(VoiceNetworkCoordinator coordinator)
     {
         _coordinator = coordinator;
     }
 
-    public async ValueTask ThrottleAsync(int bytes, CancellationToken token)
-    {
-        if (bytes <= 0) return;
-        await _gate.WaitAsync(token).ConfigureAwait(false);
-        try
-        {
-            var snapshot = _coordinator.Snapshot;
-            if (!snapshot.IsJoined || !snapshot.IsTrafficProtectionEnabled || snapshot.ConnectedPeers == 0)
-            {
-                _nextWriteAt = _clock.Elapsed;
-                return;
-            }
-
-            var now = _clock.Elapsed;
-            if (now - _lastAdjustment >= AdjustmentInterval)
-            {
-                _rate = snapshot.IsDegraded
-                    ? Math.Max(MinimumBytesPerSecond, _rate / 2d)
-                    : Math.Min(MaximumBytesPerSecond, _rate * 1.25d);
-                _lastAdjustment = now;
-            }
-
-            if (_nextWriteAt < now) _nextWriteAt = now;
-            _nextWriteAt += TimeSpan.FromSeconds(bytes / _rate);
-            var delay = _nextWriteAt - _clock.Elapsed;
-            while (delay > TimeSpan.Zero)
-            {
-                var current = _coordinator.Snapshot;
-                if (!current.IsJoined || !current.IsTrafficProtectionEnabled || current.ConnectedPeers == 0)
-                {
-                    _nextWriteAt = _clock.Elapsed;
-                    return;
-                }
-
-                await Task.Delay(
-                    delay > TimeSpan.FromMilliseconds(100) ? TimeSpan.FromMilliseconds(100) : delay,
-                    token).ConfigureAwait(false);
-                delay = _nextWriteAt - _clock.Elapsed;
-            }
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
+    public ValueTask ThrottleAsync(int bytes, CancellationToken token) =>
+        _coordinator.ThrottleAsync(bytes, token);
 
     public void Dispose()
     {
-        _gate.Dispose();
         GC.SuppressFinalize(this);
     }
 }

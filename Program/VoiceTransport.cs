@@ -20,8 +20,7 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
     public void StartListening(
         IPAddress listenAddress,
         int port,
-        Func<IPEndPoint, byte[], Task> onPacketReceived,
-        bool trafficProtectionEnabled = true)
+        Func<IPEndPoint, byte[], Task> onPacketReceived)
     {
         StopAsync().AsTask().GetAwaiter().GetResult();
         var cts = new CancellationTokenSource();
@@ -40,7 +39,7 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
                     udp.Client.Bind(new IPEndPoint(address, port));
                     udp.Client.SendBufferSize = 512 * 1024;
                     udp.Client.ReceiveBufferSize = 512 * 1024;
-                    var qos = VoiceQosSession.AttachBestEffort(udp.Client, _logger, trafficProtectionEnabled);
+                    var qos = VoiceQosSession.AttachBestEffort(udp.Client, _logger);
                     var receiveTask = ReceiveLoopAsync(udp, onPacketReceived, cts.Token);
                     configured.Add(new TransportSocket(udp, qos, receiveTask));
                 }
@@ -69,16 +68,6 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
             }
             cts.Dispose();
             throw;
-        }
-    }
-
-    public void SetTrafficProtectionEnabled(bool enabled)
-    {
-        TransportSocket[] sockets;
-        lock (_gate) sockets = _sockets.ToArray();
-        foreach (var socket in sockets)
-        {
-            socket.Qos.SetEnabled(enabled);
         }
     }
 

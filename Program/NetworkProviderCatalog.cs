@@ -326,7 +326,10 @@ public sealed class NetworkProviderCatalog
         var catalog = JsonSerializer.Deserialize<NetworkProviderCatalogDocument>(stream, CatalogJsonOptions)
             ?? throw new InvalidOperationException("Embedded network provider catalog is invalid.");
         if (catalog.SchemaVersion != 1 || catalog.Providers.Count == 0 ||
-            catalog.Providers.Any(provider => string.IsNullOrWhiteSpace(provider.Id) || provider.AdapterPatterns.Count == 0))
+            catalog.Providers.Any(provider =>
+                string.IsNullOrWhiteSpace(provider.Id) ||
+                string.IsNullOrWhiteSpace(provider.DisplayName) ||
+                provider.AdapterPatterns.Count == 0))
         {
             throw new InvalidOperationException("Embedded network provider catalog is incomplete.");
         }
@@ -337,6 +340,7 @@ public sealed class NetworkProviderCatalog
 public sealed class NetworkProviderDescriptor
 {
     public string Id { get; set; } = "";
+    public string DisplayName { get; set; } = "";
     public List<string> ClientProcesses { get; set; } = [];
     public List<string> AdapterPatterns { get; set; } = [];
     public List<NetworkPeerSourceDescriptor> PeerSources { get; set; } = [];

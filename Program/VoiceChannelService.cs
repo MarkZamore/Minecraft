@@ -26,7 +26,6 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     private readonly object _stateLock = new();
     private readonly object _captureLock = new();
     private readonly object _encoderLock = new();
-    private readonly object _protectionEffectsLock = new();
 
     private VoiceCapture? _capture;
     private VoicePlayback? _playback;
@@ -181,7 +180,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _trafficProtectionOriginId = origin;
         }
 
-        ApplyCurrentProtectionEffects();
+        _networkCoordinator.SetTrafficProtectionEnabled(enabled);
         TrafficProtectionChanged?.Invoke(enabled);
         _ = BroadcastProtectionStateAsync();
         return enabled;
@@ -267,8 +266,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _transport.StartListening(
                 _runtimeOptions.ListenAddress,
                 _runtimeOptions.Port,
-                OnVoicePacketAsync,
-                _trafficProtectionEnabled);
+                OnVoicePacketAsync);
             _isJoined = true;
             _networkCoordinator.SetJoined(true);
             _networkCoordinator.SetTrafficProtectionEnabled(true);
@@ -731,40 +729,8 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _trafficProtectionOriginId = origin;
         }
 
-        ApplyCurrentProtectionEffects();
+        _networkCoordinator.SetTrafficProtectionEnabled(enabled);
         if (changed) TrafficProtectionChanged?.Invoke(enabled);
-    }
-
-    private void ApplyCurrentProtectionEffects()
-    {
-        lock (_protectionEffectsLock)
-        {
-            while (true)
-            {
-                bool enabled;
-                long revision;
-                string origin;
-                lock (_stateLock)
-                {
-                    enabled = _trafficProtectionEnabled;
-                    revision = _trafficProtectionRevision;
-                    origin = _trafficProtectionOriginId;
-                }
-
-                _networkCoordinator.SetTrafficProtectionEnabled(enabled);
-                _transport.SetTrafficProtectionEnabled(enabled);
-
-                lock (_stateLock)
-                {
-                    if (enabled == _trafficProtectionEnabled &&
-                        revision == _trafficProtectionRevision &&
-                        string.Equals(origin, _trafficProtectionOriginId, StringComparison.Ordinal))
-                    {
-                        return;
-                    }
-                }
-            }
-        }
     }
 
     private static string NormalizeOriginId(string? originId)

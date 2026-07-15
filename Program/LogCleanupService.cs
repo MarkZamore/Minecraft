@@ -120,6 +120,10 @@ public static class LogCleanupService
             DeleteFile(Path.Combine(updatesRoot, fileName));
         }
 
+        foreach (var file in Directory.EnumerateFiles(updatesRoot, "*.bsdiff.download", SearchOption.TopDirectoryOnly))
+        {
+            DeleteFile(file);
+        }
         TryDeleteDirectoryIfEmpty(updatesRoot);
     }
 

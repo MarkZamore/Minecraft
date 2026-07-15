@@ -7,15 +7,118 @@ namespace Minecraft;
 public sealed class VirtualNetworkService
 {
     private readonly NetworkProviderCatalog _providers;
+    private readonly object _sessionGate = new();
+    private Dictionary<string, DateTimeOffset> _sessionProviders =
+        new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+    private string _selectedProviderId = "";
+    private bool _sessionCaptured;
 
     public VirtualNetworkService(Logger logger)
     {
         _providers = new NetworkProviderCatalog(logger);
     }
 
-    public NetworkEnvironmentSnapshot GetSnapshot()
+    public string SelectedProviderId
+    {
+        get
+        {
+            lock (_sessionGate) return _selectedProviderId;
+        }
+    }
+
+    public IReadOnlyList<NetworkProviderOption> CaptureActiveProviders()
     {
         var activeProviders = _providers.GetLatestClientStarts();
+        var endpoints = EnumerateEndpoints("");
+        var available = _providers.Providers
+            .Where(provider =>
+                activeProviders.ContainsKey(provider.Id) &&
+                endpoints.Any(endpoint => string.Equals(
+                    endpoint.ProviderId,
+                    provider.Id,
+                    StringComparison.OrdinalIgnoreCase)))
+            .Select(provider => new NetworkProviderOption(
+                provider.Id,
+                provider.DisplayName,
+                activeProviders[provider.Id]))
+            .OrderByDescending(provider => provider.StartedAtUtc)
+            .ThenBy(provider => provider.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToArray();
+
+        lock (_sessionGate)
+        {
+            _sessionProviders = available.ToDictionary(
+                provider => provider.Id,
+                provider => provider.StartedAtUtc,
+                StringComparer.OrdinalIgnoreCase);
+            _selectedProviderId = available.FirstOrDefault()?.Id ?? "";
+            _sessionCaptured = true;
+        }
+        return available;
+    }
+
+    public bool SelectProvider(string providerId)
+    {
+        providerId = providerId?.Trim() ?? "";
+        lock (_sessionGate)
+        {
+            if (!_sessionCaptured || !_sessionProviders.ContainsKey(providerId)) return false;
+            if (string.Equals(_selectedProviderId, providerId, StringComparison.OrdinalIgnoreCase)) return false;
+            _selectedProviderId = providerId;
+            return true;
+        }
+    }
+
+    public async Task<bool> WaitForProviderAsync(
+        string providerId,
+        TimeSpan timeout,
+        CancellationToken token)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            token.ThrowIfCancellationRequested();
+            var active = _providers.GetLatestClientStarts();
+            if (active.ContainsKey(providerId) && EnumerateEndpoints("").Any(endpoint =>
+                    string.Equals(endpoint.ProviderId, providerId, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+            await Task.Delay(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
+        }
+        return false;
+    }
+
+    public NetworkEnvironmentSnapshot GetSnapshot()
+    {
+        string selectedProviderId;
+        lock (_sessionGate) selectedProviderId = _selectedProviderId;
+        var endpoints = EnumerateEndpoints(selectedProviderId)
+            .Where(endpoint =>
+                endpoint.IsPhysical ||
+                (!string.IsNullOrWhiteSpace(selectedProviderId) &&
+                 string.Equals(endpoint.ProviderId, selectedProviderId, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+        var primary = SelectPrimaryEndpoint(endpoints, selectedProviderId);
+        var ordered = endpoints
+            .OrderByDescending(endpoint => primary is not null &&
+                                           endpoint.InterfaceId == primary.InterfaceId &&
+                                           endpoint.NetworkAddress == primary.NetworkAddress)
+            .ThenBy(endpoint => endpoint.SortPriority)
+            .ThenBy(endpoint => endpoint.InterfaceName, StringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+            .ThenBy(endpoint => endpoint.NetworkAddress, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return new NetworkEnvironmentSnapshot
+        {
+            CapturedAtUtc = DateTimeOffset.UtcNow,
+            Endpoints = ordered,
+            PrimaryEndpoint = primary
+        };
+    }
+
+    private List<NetworkEndpointInfo> EnumerateEndpoints(string selectedProviderId)
+    {
         var endpoints = new List<NetworkEndpointInfo>();
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
@@ -37,7 +140,8 @@ public sealed class VirtualNetworkService
 
             var provider = _providers.MatchAdapter(nic.Name, nic.Description);
             var isVirtual = provider is not null || IsGenericVirtualInterface(nic);
-            var isPhysical = nic.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211;
+            var isPhysical = !isVirtual &&
+                             nic.NetworkInterfaceType is (NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211);
             foreach (var unicast in properties.UnicastAddresses)
             {
                 var address = unicast.Address;
@@ -47,7 +151,10 @@ public sealed class VirtualNetworkService
                 if (interfaceIndex <= 0) continue;
                 var prefixLength = Math.Clamp(unicast.PrefixLength, 0, address.AddressFamily == AddressFamily.InterNetwork ? 32 : 128);
                 var hasDefaultRoute = HasDefaultRoute(properties, address.AddressFamily);
-                var providerIsOpen = provider is not null && activeProviders.ContainsKey(provider.Id);
+                var providerIsOpen = provider is not null && string.Equals(
+                    provider.Id,
+                    selectedProviderId,
+                    StringComparison.OrdinalIgnoreCase);
                 var networkType = isVirtual ? "VPN" : isPhysical ? "LAN" : "Unknown";
                 var broadcast = address.AddressFamily == AddressFamily.InterNetwork
                     ? CalculateBroadcast(address, PrefixToMask(prefixLength)).ToString()
@@ -70,49 +177,32 @@ public sealed class VirtualNetworkService
                 });
             }
         }
-
-        var primary = SelectPrimaryEndpoint(endpoints, activeProviders);
-
-        var ordered = endpoints
-            .OrderByDescending(endpoint => primary is not null &&
-                                           endpoint.InterfaceId == primary.InterfaceId &&
-                                           endpoint.NetworkAddress == primary.NetworkAddress)
-            .ThenBy(endpoint => endpoint.SortPriority)
-            .ThenBy(endpoint => endpoint.InterfaceName, StringComparer.CurrentCultureIgnoreCase)
-            .ThenBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
-            .ThenBy(endpoint => endpoint.NetworkAddress, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        return new NetworkEnvironmentSnapshot
-        {
-            CapturedAtUtc = DateTimeOffset.UtcNow,
-            Endpoints = ordered,
-            PrimaryEndpoint = primary
-        };
+        return endpoints;
     }
 
     internal static NetworkEndpointInfo? SelectPrimaryEndpoint(
         IReadOnlyList<NetworkEndpointInfo> endpoints,
-        IReadOnlyDictionary<string, DateTimeOffset> activeProviders)
+        string selectedProviderId)
     {
-        var selectedProvider = activeProviders
-            .Where(pair => endpoints.Any(endpoint => string.Equals(endpoint.ProviderId, pair.Key, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(pair => pair.Value)
-            .Select(pair => pair.Key)
-            .FirstOrDefault();
-        return !string.IsNullOrWhiteSpace(selectedProvider)
+        return !string.IsNullOrWhiteSpace(selectedProviderId)
             ? endpoints
-                .Where(endpoint => string.Equals(endpoint.ProviderId, selectedProvider, StringComparison.OrdinalIgnoreCase))
+                .Where(endpoint => string.Equals(endpoint.ProviderId, selectedProviderId, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
                 .ThenByDescending(endpoint => endpoint.HasDefaultRoute)
-                .FirstOrDefault()
+                .FirstOrDefault() ?? SelectPhysicalEndpoint(endpoints)
             : endpoints
-                .Where(endpoint => endpoint.IsPhysical && endpoint.HasDefaultRoute)
-                .OrderBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
-                .FirstOrDefault() ?? endpoints
-                .OrderBy(endpoint => endpoint.SortPriority)
+                .Where(endpoint => endpoint.IsPhysical)
+                .OrderByDescending(endpoint => endpoint.HasDefaultRoute)
                 .ThenBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
                 .FirstOrDefault();
     }
+
+    private static NetworkEndpointInfo? SelectPhysicalEndpoint(IEnumerable<NetworkEndpointInfo> endpoints) =>
+        endpoints
+            .Where(endpoint => endpoint.IsPhysical)
+            .OrderByDescending(endpoint => endpoint.HasDefaultRoute)
+            .ThenBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+            .FirstOrDefault();
 
     public Task<IReadOnlyList<IPAddress>> GetDynamicPeerTargetsAsync(
         NetworkEnvironmentSnapshot snapshot,
@@ -279,3 +369,8 @@ public sealed class VirtualNetworkService
         (byte)value
     });
 }
+
+public sealed record NetworkProviderOption(
+    string Id,
+    string DisplayName,
+    DateTimeOffset StartedAtUtc);

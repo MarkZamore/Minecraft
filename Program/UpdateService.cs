@@ -21,8 +21,10 @@ public sealed class UpdateService
     public const int ManifestSchemaVersion = 2;
     public const string DeltaPatchAlgorithm = "bsdiff";
     public const int DeltaPatchAlgorithmVersion = 1;
+    public const int MaximumDeltaPatches = 2;
 
     private const int UpdateCheckAttempts = 3;
+    private const string PreparedDirectoryName = "Ready";
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly HttpClient _httpClient;
@@ -62,8 +64,59 @@ public sealed class UpdateService
     public PreparedUpdate? TryGetPreparedUpdate()
     {
         var updatesDir = GetUpdatesDirectory(create: false);
-        var executablePath = Path.Combine(updatesDir, ExecutableAssetName);
-        var manifestPath = Path.Combine(updatesDir, ManifestAssetName);
+        var readyDirectory = Path.Combine(updatesDir, PreparedDirectoryName);
+        RecoverPreparedDirectory(updatesDir, readyDirectory);
+        var prepared = TryGetPreparedUpdateFromDirectory(readyDirectory);
+        if (prepared is not null)
+        {
+            CleanupPreparedStaging(updatesDir);
+            return prepared;
+        }
+
+        DeleteDirectoryIfExists(readyDirectory);
+        RecoverPreparedDirectory(updatesDir, readyDirectory);
+        prepared = TryGetPreparedUpdateFromDirectory(readyDirectory);
+        if (prepared is not null)
+        {
+            CleanupPreparedStaging(updatesDir);
+            return prepared;
+        }
+        return TryGetPreparedUpdateFromDirectory(updatesDir);
+    }
+
+    private void RecoverPreparedDirectory(string updatesDir, string readyDirectory)
+    {
+        if (Directory.Exists(readyDirectory) || !Directory.Exists(updatesDir)) return;
+        var candidates = Directory.EnumerateDirectories(updatesDir, ".ready-*", SearchOption.TopDirectoryOnly)
+            .Concat(Directory.EnumerateDirectories(updatesDir, ".previous-*", SearchOption.TopDirectoryOnly))
+            .OrderByDescending(Directory.GetLastWriteTimeUtc)
+            .ToArray();
+        foreach (var candidate in candidates)
+        {
+            if (TryGetPreparedUpdateFromDirectory(candidate) is null)
+            {
+                DeleteDirectoryIfExists(candidate);
+                continue;
+            }
+            Directory.Move(candidate, readyDirectory);
+            return;
+        }
+    }
+
+    private static void CleanupPreparedStaging(string updatesDir)
+    {
+        if (!Directory.Exists(updatesDir)) return;
+        foreach (var directory in Directory.EnumerateDirectories(updatesDir, ".ready-*", SearchOption.TopDirectoryOnly)
+                     .Concat(Directory.EnumerateDirectories(updatesDir, ".previous-*", SearchOption.TopDirectoryOnly)))
+        {
+            DeleteDirectoryIfExists(directory);
+        }
+    }
+
+    private PreparedUpdate? TryGetPreparedUpdateFromDirectory(string directory)
+    {
+        var executablePath = Path.Combine(directory, ExecutableAssetName);
+        var manifestPath = Path.Combine(directory, ManifestAssetName);
         var hasExecutable = File.Exists(executablePath);
         var hasManifest = File.Exists(manifestPath);
         if (!hasExecutable && !hasManifest)
@@ -102,18 +155,23 @@ public sealed class UpdateService
         }
     }
 
-    public async Task<UpdateCheckResult> CheckAsync(CancellationToken token)
+    public async Task<UpdateCheckResult> CheckAsync(
+        CancellationToken token,
+        int attempts = UpdateCheckAttempts,
+        TimeSpan? attemptTimeout = null)
     {
+        attempts = Math.Clamp(attempts, 1, UpdateCheckAttempts);
+        var effectiveTimeout = attemptTimeout ?? _checkTimeout;
         Exception? lastError = null;
-        for (var attempt = 1; attempt <= UpdateCheckAttempts; attempt++)
+        for (var attempt = 1; attempt <= attempts; attempt++)
         {
             try
             {
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-                timeout.CancelAfter(_checkTimeout);
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                timeoutCts.CancelAfter(effectiveTimeout);
                 var manifest = await DownloadManifestAsync(
                     BuildReleaseAssetUri(ManifestAssetName, preventCaching: true),
-                    timeout.Token).ConfigureAwait(false);
+                    timeoutCts.Token).ConfigureAwait(false);
                 ValidateManifest(manifest);
                 var evaluation = EvaluateManifest(manifest, _currentCommitSha);
                 if (!evaluation.IsUpdateAvailable)
@@ -122,19 +180,16 @@ public sealed class UpdateService
                 }
 
                 Uri? deltaPatchDownloadUrl = null;
-                if (manifest.DeltaPatch is not null &&
-                    string.Equals(
-                        NormalizeSha(manifest.DeltaPatch.BaseCommitSha),
-                        _currentCommitSha,
-                        StringComparison.OrdinalIgnoreCase) &&
-                    await CurrentExecutableMatchesBaseAsync(manifest.DeltaPatch, token).ConfigureAwait(false))
+                var deltaPatch = await FindMatchingDeltaPatchAsync(manifest, token).ConfigureAwait(false);
+                if (deltaPatch is not null)
                 {
-                    deltaPatchDownloadUrl = BuildReleaseAssetUri(manifest.DeltaPatch.AssetName);
+                    deltaPatchDownloadUrl = BuildReleaseAssetUri(deltaPatch.AssetName);
                 }
 
                 return UpdateCheckResult.Available(
                     manifest,
                     BuildReleaseAssetUri(manifest.AssetName),
+                    deltaPatch,
                     deltaPatchDownloadUrl);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -144,8 +199,8 @@ public sealed class UpdateService
             catch (Exception ex)
             {
                 lastError = ex;
-                _logger.Warn($"Update check attempt {attempt}/{UpdateCheckAttempts} failed: {ex.Message}");
-                if (attempt < UpdateCheckAttempts)
+                _logger.Warn($"Update check attempt {attempt}/{attempts} failed: {ex.Message}");
+                if (attempt < attempts)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(attempt), token).ConfigureAwait(false);
                 }
@@ -169,13 +224,13 @@ public sealed class UpdateService
         ValidateGitHubDownloadUri(update.ExecutableDownloadUrl);
         ValidateManifest(update.Manifest);
 
-        if (update.DeltaPatchDownloadUrl is not null && update.Manifest.DeltaPatch is not null)
+        if (update.DeltaPatchDownloadUrl is not null && update.DeltaPatch is not null)
         {
             try
             {
                 return await DownloadAndApplyDeltaAsync(
                     update.Manifest,
-                    update.Manifest.DeltaPatch,
+                    update.DeltaPatch,
                     update.DeltaPatchDownloadUrl,
                     progress,
                     token).ConfigureAwait(false);
@@ -207,7 +262,7 @@ public sealed class UpdateService
     {
         ValidateGitHubDownloadUri(downloadUri);
         var updatesDir = GetUpdatesDirectory(create: true);
-        var patchPath = Path.Combine(updatesDir, $"{DeltaPatchAssetName}.download");
+        var patchPath = Path.Combine(updatesDir, $"{delta.AssetName}.download");
         var reconstructedPath = Path.Combine(updatesDir, $"{ExecutableAssetName}.new");
         CleanupDeltaArtifacts(updatesDir);
 
@@ -317,11 +372,47 @@ public sealed class UpdateService
 
     private string StorePreparedUpdate(string sourcePath, UpdateManifest manifest, string updatesDir)
     {
-        var readyPath = Path.Combine(updatesDir, ExecutableAssetName);
-        File.Move(sourcePath, readyPath, overwrite: true);
-        var manifestPath = Path.Combine(updatesDir, ManifestAssetName);
-        AtomicFile.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, _jsonOptions));
-        return readyPath;
+        var candidateDirectory = Path.Combine(updatesDir, $".ready-{Guid.NewGuid():N}");
+        var readyDirectory = Path.Combine(updatesDir, PreparedDirectoryName);
+        var previousDirectory = Path.Combine(updatesDir, $".previous-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(candidateDirectory);
+        try
+        {
+            var candidateExecutable = Path.Combine(candidateDirectory, ExecutableAssetName);
+            var candidateManifest = Path.Combine(candidateDirectory, ManifestAssetName);
+            File.Move(sourcePath, candidateExecutable);
+            AtomicFile.WriteAllText(candidateManifest, JsonSerializer.Serialize(manifest, _jsonOptions));
+            ValidateDownloadedFile(candidateExecutable, manifest);
+
+            var movedPrevious = false;
+            if (Directory.Exists(readyDirectory))
+            {
+                Directory.Move(readyDirectory, previousDirectory);
+                movedPrevious = true;
+            }
+
+            try
+            {
+                Directory.Move(candidateDirectory, readyDirectory);
+            }
+            catch
+            {
+                if (movedPrevious && !Directory.Exists(readyDirectory) && Directory.Exists(previousDirectory))
+                {
+                    Directory.Move(previousDirectory, readyDirectory);
+                }
+                throw;
+            }
+
+            DeleteFileIfExists(Path.Combine(updatesDir, ExecutableAssetName));
+            DeleteFileIfExists(Path.Combine(updatesDir, ManifestAssetName));
+            DeleteDirectoryIfExists(previousDirectory);
+            return Path.Combine(readyDirectory, ExecutableAssetName);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(candidateDirectory);
+        }
     }
 
     private static void ApplyDeltaPatch(
@@ -358,7 +449,13 @@ public sealed class UpdateService
     private static void CleanupDeltaArtifacts(string updatesDir)
     {
         if (string.IsNullOrWhiteSpace(updatesDir)) return;
-        DeleteFileIfExists(Path.Combine(updatesDir, $"{DeltaPatchAssetName}.download"));
+        if (Directory.Exists(updatesDir))
+        {
+            foreach (var path in Directory.EnumerateFiles(updatesDir, "*.bsdiff.download", SearchOption.TopDirectoryOnly))
+            {
+                DeleteFileIfExists(path);
+            }
+        }
         DeleteFileIfExists(Path.Combine(updatesDir, $"{ExecutableAssetName}.new"));
     }
 
@@ -372,13 +469,26 @@ public sealed class UpdateService
         return path;
     }
 
-    private async Task<bool> CurrentExecutableMatchesBaseAsync(DeltaPatchManifest delta, CancellationToken token)
+    private async Task<DeltaPatchManifest?> FindMatchingDeltaPatchAsync(
+        UpdateManifest manifest,
+        CancellationToken token)
     {
         try
         {
+            var candidates = manifest.DeltaPatches
+                .Concat(manifest.DeltaPatch is null ? [] : [manifest.DeltaPatch])
+                .Where(delta => string.Equals(
+                    NormalizeSha(delta.BaseCommitSha),
+                    _currentCommitSha,
+                    StringComparison.OrdinalIgnoreCase))
+                .DistinctBy(delta => $"{NormalizeSha(delta.BaseSha256)}|{delta.AssetName}", StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (candidates.Length == 0) return null;
+
             var currentExe = GetCurrentExecutablePath();
             var actualSha = await Task.Run(() => HashFile(currentExe), token).ConfigureAwait(false);
-            return string.Equals(actualSha, delta.BaseSha256, StringComparison.OrdinalIgnoreCase);
+            return candidates.FirstOrDefault(delta =>
+                string.Equals(actualSha, delta.BaseSha256, StringComparison.OrdinalIgnoreCase));
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -387,7 +497,7 @@ public sealed class UpdateService
         catch (Exception ex)
         {
             _logger.Warn($"The current executable could not be checked for a delta update: {ex.Message}");
-            return false;
+            return null;
         }
     }
 
@@ -453,6 +563,7 @@ public sealed class UpdateService
 
     public static void ValidateManifest(UpdateManifest manifest)
     {
+        manifest.DeltaPatches ??= [];
         if (manifest.SchemaVersion != ManifestSchemaVersion)
         {
             throw new InvalidOperationException("Update manifest schema is not supported.");
@@ -486,11 +597,32 @@ public sealed class UpdateService
 
         if (manifest.DeltaPatch is not null)
         {
-            ValidateDeltaPatchManifest(manifest.DeltaPatch, manifest.CommitSha);
+            ValidateDeltaPatchManifest(
+                manifest.DeltaPatch,
+                manifest.CommitSha,
+                requireLegacyAssetName: true);
+        }
+
+        if (manifest.DeltaPatches.Count > MaximumDeltaPatches)
+        {
+            throw new InvalidOperationException("Update manifest contains too many delta patches.");
+        }
+        foreach (var delta in manifest.DeltaPatches)
+        {
+            ValidateDeltaPatchManifest(delta, manifest.CommitSha, requireLegacyAssetName: false);
+        }
+        if (manifest.DeltaPatches
+            .GroupBy(delta => NormalizeSha(delta.BaseSha256), StringComparer.OrdinalIgnoreCase)
+            .Any(group => group.Count() > 1))
+        {
+            throw new InvalidOperationException("Update manifest contains duplicate delta bases.");
         }
     }
 
-    private static void ValidateDeltaPatchManifest(DeltaPatchManifest delta, string targetCommitSha)
+    private static void ValidateDeltaPatchManifest(
+        DeltaPatchManifest delta,
+        string targetCommitSha,
+        bool requireLegacyAssetName)
     {
         if (!string.Equals(delta.Algorithm, DeltaPatchAlgorithm, StringComparison.Ordinal))
         {
@@ -505,9 +637,17 @@ public sealed class UpdateService
         {
             throw new InvalidOperationException("Update manifest contains an invalid delta base commit.");
         }
-        if (!string.Equals(delta.AssetName, DeltaPatchAssetName, StringComparison.Ordinal))
+        if (requireLegacyAssetName && !string.Equals(delta.AssetName, DeltaPatchAssetName, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("Update manifest contains an unexpected delta asset name.");
+        }
+        if (!IsSafeDeltaAssetName(delta.AssetName))
+        {
+            throw new InvalidOperationException("Update manifest contains an invalid delta asset name.");
+        }
+        if (!requireLegacyAssetName && delta.BaseReleaseNumber < 1)
+        {
+            throw new InvalidOperationException("Update manifest contains an invalid delta base release number.");
         }
         if (delta.SizeBytes <= 0)
         {
@@ -515,6 +655,18 @@ public sealed class UpdateService
         }
         ValidateSha256(delta.BaseSha256, "delta base");
         ValidateSha256(delta.Sha256, "delta patch");
+    }
+
+    private static bool IsSafeDeltaAssetName(string? assetName)
+    {
+        if (string.IsNullOrWhiteSpace(assetName) ||
+            !assetName.EndsWith(".bsdiff", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Path.GetFileName(assetName), assetName, StringComparison.Ordinal) ||
+            assetName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            return false;
+        }
+        return true;
     }
 
     private static void ValidateSha256(string? value, string description)
@@ -704,6 +856,17 @@ public sealed class UpdateService
         }
     }
 
+    private static void DeleteDirectoryIfExists(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+        }
+    }
+
     private static string Quote(string value)
     {
         return "\"" + value.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
@@ -755,12 +918,14 @@ public sealed class UpdateManifest
     public string Sha256 { get; set; } = "";
     public long SizeBytes { get; set; }
     public DeltaPatchManifest? DeltaPatch { get; set; }
+    public List<DeltaPatchManifest> DeltaPatches { get; set; } = [];
 }
 
 public sealed class DeltaPatchManifest
 {
     public string Algorithm { get; set; } = UpdateService.DeltaPatchAlgorithm;
     public int AlgorithmVersion { get; set; }
+    public int BaseReleaseNumber { get; set; }
     public string BaseCommitSha { get; set; } = "";
     public string BaseSha256 { get; set; } = "";
     public string AssetName { get; set; } = UpdateService.DeltaPatchAssetName;
@@ -789,12 +954,14 @@ public sealed class UpdateCheckResult
         bool isUpdateAvailable,
         UpdateManifest? manifest,
         Uri? executableDownloadUrl,
+        DeltaPatchManifest? deltaPatch,
         Uri? deltaPatchDownloadUrl,
         string message)
     {
         IsUpdateAvailable = isUpdateAvailable;
         Manifest = manifest;
         ExecutableDownloadUrl = executableDownloadUrl;
+        DeltaPatch = deltaPatch;
         DeltaPatchDownloadUrl = deltaPatchDownloadUrl;
         Message = message;
     }
@@ -802,13 +969,16 @@ public sealed class UpdateCheckResult
     public bool IsUpdateAvailable { get; }
     public UpdateManifest? Manifest { get; }
     public Uri? ExecutableDownloadUrl { get; }
+    public DeltaPatchManifest? DeltaPatch { get; }
     public Uri? DeltaPatchDownloadUrl { get; }
     public string Message { get; }
 
-    public static UpdateCheckResult UpToDate(string message = "") => new(false, null, null, null, message);
+    public static UpdateCheckResult UpToDate(string message = "") => new(false, null, null, null, null, message);
 
     public static UpdateCheckResult Available(
         UpdateManifest manifest,
         Uri? executableDownloadUrl,
-        Uri? deltaPatchDownloadUrl = null) => new(true, manifest, executableDownloadUrl, deltaPatchDownloadUrl, "");
+        DeltaPatchManifest? deltaPatch = null,
+        Uri? deltaPatchDownloadUrl = null) =>
+        new(true, manifest, executableDownloadUrl, deltaPatch, deltaPatchDownloadUrl, "");
 }
