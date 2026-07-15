@@ -2812,7 +2812,7 @@ public partial class MainWindow : Window
                 : "Войти в голосовой канал";
             VoiceMuteButton.Content = _voiceChannel.IsMuted ? "\uE198" : "\uE720";
             VoiceMuteButton.ToolTip = _voiceChannel.IsMuted ? "Включить микрофон" : "Выключить микрофон";
-            VoiceProtectionButton.Content = _voiceChannel.IsTrafficProtectionEnabled ? "\uE83D" : "\uE711";
+            VoiceProtectionButton.Content = _voiceChannel.IsTrafficProtectionEnabled ? "\uE83D" : "\uE733";
             VoiceProtectionButton.ToolTip = _voiceChannel.IsTrafficProtectionEnabled
                 ? "Буфер включён"
                 : "Буфер выключен";
