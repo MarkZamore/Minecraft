@@ -275,10 +275,9 @@ jobs:
           gh release create $tag `
             $env:PREVIOUS_EXE `
             $env:PREVIOUS_MANIFEST `
-            --target $env:PREVIOUS_COMMIT `
             --prerelease `
             --title "Update base $env:PREVIOUS_RELEASE_NUMBER" `
-            --notes "Binary base retained for direct delta generation."
+            --notes "Binary base for commit $env:PREVIOUS_COMMIT retained for direct delta generation."
           if ($LASTEXITCODE -ne 0) { throw "Could not create archive $tag." }
 
       - name: Publish latest release
