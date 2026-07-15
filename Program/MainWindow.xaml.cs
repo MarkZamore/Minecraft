@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan SecretLoadingDuration = TimeSpan.FromMinutes(10);
     private const int HostReachabilityAttempts = 3;
+    private const double DisabledVoiceProtectionIconScale = 1.7d;
     private static readonly TimeSpan HostReachabilityTimeout = TimeSpan.FromMilliseconds(900);
 
     private readonly ObservableCollection<PeerViewModel> _peers = new();
@@ -2895,7 +2896,11 @@ public partial class MainWindow : Window
                 : "Войти в голосовой канал";
             VoiceMuteButton.Content = _voiceChannel.IsMuted ? "\uE198" : "\uE720";
             VoiceMuteButton.ToolTip = _voiceChannel.IsMuted ? "Включить микрофон" : "Выключить микрофон";
-            VoiceProtectionButton.Content = _voiceChannel.IsTrafficProtectionEnabled ? "\uEA18" : "\uEB59";
+            var protectionEnabled = _voiceChannel.IsTrafficProtectionEnabled;
+            VoiceProtectionIcon.Text = protectionEnabled ? "\uEA18" : "\uEB59";
+            var protectionIconScale = protectionEnabled ? 1d : DisabledVoiceProtectionIconScale;
+            VoiceProtectionIconScale.ScaleX = protectionIconScale;
+            VoiceProtectionIconScale.ScaleY = protectionIconScale;
             VoiceProtectionButton.ToolTip = _voiceChannel.IsTrafficProtectionEnabled
                 ? "Буфер включён"
                 : "Буфер выключен";
@@ -2905,7 +2910,9 @@ public partial class MainWindow : Window
         {
             VoiceJoinButton.Content = "\uE717";
             VoiceMuteButton.Content = "\uE720";
-            VoiceProtectionButton.Content = "\uEA18";
+            VoiceProtectionIcon.Text = "\uEA18";
+            VoiceProtectionIconScale.ScaleX = 1d;
+            VoiceProtectionIconScale.ScaleY = 1d;
             VoiceProtectionButton.ToolTip = "Буфер включён";
             VoiceDeafenButton.Content = "Звук";
         }
