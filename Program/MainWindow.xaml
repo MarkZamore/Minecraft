@@ -191,10 +191,9 @@
                                 ToolTip="Буфер включён" Click="VoiceProtectionButton_Click">
                             <TextBlock x:Name="VoiceProtectionIcon" Text="&#xEA18;"
                                        FontFamily="Segoe Fluent Icons" FontSize="14"
-                                       HorizontalAlignment="Center" VerticalAlignment="Center"
-                                       RenderTransformOrigin="0.5,0.5">
+                                       HorizontalAlignment="Center" VerticalAlignment="Center">
                                 <TextBlock.RenderTransform>
-                                    <ScaleTransform x:Name="VoiceProtectionIconScale" ScaleX="1" ScaleY="1"/>
+                                    <MatrixTransform x:Name="VoiceProtectionIconTransform"/>
                                 </TextBlock.RenderTransform>
                             </TextBlock>
                         </Button>
@@ -211,15 +210,17 @@
                 <TextBlock Text="Hamachi" Style="{StaticResource SectionTitleStyle}"/>
                 <Grid Margin="0,0,0,5">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="8"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="8"/>
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
                     <Button Grid.Column="0" x:Name="InstallNetworkToolButton" Content="Установить"
-                            Click="InstallNetworkToolButton_Click" Margin="0,0,8,0" MinWidth="92"/>
-                    <Button Grid.Column="1" x:Name="GenerateNetworkCredentialsButton" Content="Генерировать"
-                            Click="GenerateNetworkCredentialsButton_Click" Margin="0,0,8,0" MinWidth="108"/>
-                    <Grid Grid.Column="2">
+                            Click="InstallNetworkToolButton_Click"/>
+                    <Button Grid.Column="2" x:Name="GenerateNetworkCredentialsButton" Content="Генерировать"
+                            Click="GenerateNetworkCredentialsButton_Click"/>
+                    <Grid Grid.Column="4">
                         <local:CenteredDropDown x:Name="NetworkProviderComboBox"
                                                 ItemTemplate="{StaticResource NetworkProviderItemTemplate}"
                                                 SelectionChanged="NetworkProviderComboBox_SelectionChanged"/>

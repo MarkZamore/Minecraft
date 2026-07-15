@@ -22,7 +22,8 @@ public partial class MainWindow : Window
     private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan SecretLoadingDuration = TimeSpan.FromMinutes(10);
     private const int HostReachabilityAttempts = 3;
-    private const double DisabledVoiceProtectionIconScale = 1.7d;
+    // EB59 is a half-size badge glyph; this maps its ink bounds onto EA18's full shield bounds.
+    private static readonly Matrix DisabledVoiceProtectionIconTransform = new(2d, 0d, 0d, 2d, -14.875d, -14d);
     private static readonly TimeSpan HostReachabilityTimeout = TimeSpan.FromMilliseconds(900);
 
     private readonly ObservableCollection<PeerViewModel> _peers = new();
@@ -2898,9 +2899,9 @@ public partial class MainWindow : Window
             VoiceMuteButton.ToolTip = _voiceChannel.IsMuted ? "Включить микрофон" : "Выключить микрофон";
             var protectionEnabled = _voiceChannel.IsTrafficProtectionEnabled;
             VoiceProtectionIcon.Text = protectionEnabled ? "\uEA18" : "\uEB59";
-            var protectionIconScale = protectionEnabled ? 1d : DisabledVoiceProtectionIconScale;
-            VoiceProtectionIconScale.ScaleX = protectionIconScale;
-            VoiceProtectionIconScale.ScaleY = protectionIconScale;
+            VoiceProtectionIconTransform.Matrix = protectionEnabled
+                ? Matrix.Identity
+                : DisabledVoiceProtectionIconTransform;
             VoiceProtectionButton.ToolTip = _voiceChannel.IsTrafficProtectionEnabled
                 ? "Буфер включён"
                 : "Буфер выключен";
@@ -2911,8 +2912,7 @@ public partial class MainWindow : Window
             VoiceJoinButton.Content = "\uE717";
             VoiceMuteButton.Content = "\uE720";
             VoiceProtectionIcon.Text = "\uEA18";
-            VoiceProtectionIconScale.ScaleX = 1d;
-            VoiceProtectionIconScale.ScaleY = 1d;
+            VoiceProtectionIconTransform.Matrix = Matrix.Identity;
             VoiceProtectionButton.ToolTip = "Буфер включён";
             VoiceDeafenButton.Content = "Звук";
         }
