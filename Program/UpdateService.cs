@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using BsDiff;
 
 namespace Minecraft;
@@ -22,9 +23,18 @@ public sealed class UpdateService
     public const string DeltaPatchAlgorithm = "bsdiff";
     public const int DeltaPatchAlgorithmVersion = 1;
     public const int MaximumDeltaPatches = 2;
+    public const string InstallJournalFileName = "install-journal.json";
+    public const string InstallScriptFileName = "apply-update.ps1";
+    public const string InstallCandidateFileName = "Minecraft.exe.candidate";
+    public const string InstallBackupFileName = "Minecraft.exe.bak";
+    public const string InstallRestartRequestFileName = "restart-requested";
 
     private const int UpdateCheckAttempts = 3;
     private const string PreparedDirectoryName = "Ready";
+    private static readonly JsonSerializerOptions InstallJournalJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true
+    };
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly HttpClient _httpClient;
@@ -501,37 +511,146 @@ public sealed class UpdateService
         }
     }
 
-    public void StartInstallAndRestart(string newExecutablePath)
+    public void StartInstall(PreparedUpdate prepared, UpdateInstallMode mode)
     {
-        if (!File.Exists(newExecutablePath))
+        ArgumentNullException.ThrowIfNull(prepared);
+        ValidateManifest(prepared.Manifest);
+        ValidateDownloadedFile(prepared.ExecutablePath, prepared.Manifest);
+
+        var currentExe = GetCurrentExecutablePath();
+        var updatesDir = GetUpdatesDirectory(create: true);
+        if (IsInstallationInProgress(updatesDir))
         {
-            throw new FileNotFoundException("Downloaded update was not found.", newExecutablePath);
+            throw new InvalidOperationException("Another update installation is already running.");
+        }
+        var preparedExe = Path.GetFullPath(prepared.ExecutablePath);
+        EnsureUnderDirectory(preparedExe, updatesDir, "Prepared update");
+        var preparedManifest = Path.Combine(Path.GetDirectoryName(preparedExe)!, ManifestAssetName);
+        if (!File.Exists(preparedManifest))
+        {
+            throw new FileNotFoundException("Downloaded update manifest was not found.", preparedManifest);
         }
 
-        var currentExe = Environment.ProcessPath ?? Path.Combine(_paths.Root, ExecutableAssetName);
-        var updatesDir = GetUpdatesDirectory(create: true);
-        var scriptPath = Path.Combine(updatesDir, "apply-update.ps1");
-        var backupPath = Path.Combine(updatesDir, $"{ExecutableAssetName}.bak");
+        var scriptPath = Path.Combine(updatesDir, InstallScriptFileName);
+        var candidatePath = Path.Combine(updatesDir, InstallCandidateFileName);
+        var backupPath = Path.Combine(updatesDir, InstallBackupFileName);
+        var journalPath = Path.Combine(updatesDir, InstallJournalFileName);
+        var restartRequestPath = Path.Combine(updatesDir, InstallRestartRequestFileName);
         var logPath = Path.Combine(updatesDir, "update.log");
+        var currentSha256 = HashFile(currentExe);
+        var startedAtUtc = DateTimeOffset.UtcNow;
+
+        DeleteFileIfExists(candidatePath);
+        DeleteFileIfExists(backupPath);
+        DeleteFileIfExists(scriptPath);
+        DeleteFileIfExists(restartRequestPath);
+        var journal = new UpdateInstallJournal
+        {
+            Status = UpdateInstallStatus.Scheduled,
+            SourceProcessId = Environment.ProcessId,
+            TargetCommitSha = prepared.Manifest.CommitSha,
+            TargetSha256 = prepared.Manifest.Sha256,
+            TargetSizeBytes = prepared.Manifest.SizeBytes,
+            RestartAfterInstall = mode == UpdateInstallMode.InstallAndRestart,
+            StartedAtUtc = startedAtUtc,
+            UpdatedAtUtc = startedAtUtc
+        };
+        AtomicFile.WriteAllText(journalPath, JsonSerializer.Serialize(journal, _jsonOptions));
         AtomicFile.WriteAllText(scriptPath, BuildUpdaterScript(), Encoding.UTF8);
 
-        var arguments =
-            "-NoProfile -ExecutionPolicy Bypass -File " + Quote(scriptPath) +
-            " -PidToWait " + Environment.ProcessId +
-            " -ExePath " + Quote(currentExe) +
-            " -NewExePath " + Quote(newExecutablePath) +
-            " -BackupPath " + Quote(backupPath) +
-            " -LogPath " + Quote(logPath);
-
-        Process.Start(new ProcessStartInfo
+        var startInfo = new ProcessStartInfo
         {
             FileName = "powershell.exe",
-            Arguments = arguments,
             WorkingDirectory = _paths.Root,
             UseShellExecute = false,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden
-        });
+        };
+        foreach (var argument in new[]
+                 {
+                     "-NoProfile",
+                     "-ExecutionPolicy", "Bypass",
+                     "-File", scriptPath,
+                     "-PidToWait", Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                     "-ExePath", currentExe,
+                     "-PreparedExePath", preparedExe,
+                     "-PreparedManifestPath", preparedManifest,
+                     "-CandidatePath", candidatePath,
+                     "-BackupPath", backupPath,
+                     "-JournalPath", journalPath,
+                     "-RestartRequestPath", restartRequestPath,
+                     "-LogPath", logPath,
+                     "-ExpectedSize", prepared.Manifest.SizeBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                     "-ExpectedSha256", prepared.Manifest.Sha256,
+                     "-CurrentSha256", currentSha256,
+                     "-TargetCommitSha", prepared.Manifest.CommitSha,
+                     "-RestartAfterInstall", mode == UpdateInstallMode.InstallAndRestart ? "1" : "0",
+                     "-StartedAtUtc", startedAtUtc.ToString("O", System.Globalization.CultureInfo.InvariantCulture)
+                 })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            _ = Process.Start(startInfo) ?? throw new InvalidOperationException("The update helper could not be started.");
+            _logger.Info($"Update installation scheduled ({mode}).");
+        }
+        catch (Exception ex)
+        {
+            journal.Status = UpdateInstallStatus.Failed;
+            journal.Error = ex.Message;
+            journal.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            AtomicFile.WriteAllText(journalPath, JsonSerializer.Serialize(journal, _jsonOptions));
+            throw;
+        }
+    }
+
+    public static bool IsInstallationInProgress(string updatesDirectory)
+    {
+        var journalPath = Path.Combine(updatesDirectory, InstallJournalFileName);
+        if (!File.Exists(journalPath)) return false;
+        try
+        {
+            var journal = JsonSerializer.Deserialize<UpdateInstallJournal>(
+                File.ReadAllText(journalPath),
+                InstallJournalJsonOptions);
+            if (journal is null || journal.Status is not (UpdateInstallStatus.Scheduled or UpdateInstallStatus.Applying))
+            {
+                return false;
+            }
+
+            if (journal.HelperProcessId > 0)
+            {
+                try
+                {
+                    using var process = Process.GetProcessById(journal.HelperProcessId);
+                    return !process.HasExited;
+                }
+                catch (ArgumentException)
+                {
+                    return false;
+                }
+            }
+
+            return DateTimeOffset.UtcNow - journal.UpdatedAtUtc < TimeSpan.FromMinutes(2);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public bool RequestRestartForActiveInstallation()
+    {
+        var updatesDirectory = GetUpdatesDirectory(create: false);
+        if (!IsInstallationInProgress(updatesDirectory)) return false;
+
+        AtomicFile.WriteAllText(
+            Path.Combine(updatesDirectory, InstallRestartRequestFileName),
+            DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+        _logger.Info("A running update installation will open the application when it completes.");
+        return true;
     }
 
     public static UpdateCheckResult EvaluateManifest(UpdateManifest manifest, string? currentCommitSha)
@@ -814,33 +933,115 @@ public sealed class UpdateService
         param(
           [int]$PidToWait,
           [string]$ExePath,
-          [string]$NewExePath,
+          [string]$PreparedExePath,
+          [string]$PreparedManifestPath,
+          [string]$CandidatePath,
           [string]$BackupPath,
-          [string]$LogPath
+          [string]$JournalPath,
+          [string]$RestartRequestPath,
+          [string]$LogPath,
+          [long]$ExpectedSize,
+          [string]$ExpectedSha256,
+          [string]$CurrentSha256,
+          [string]$TargetCommitSha,
+          [int]$RestartAfterInstall,
+          [string]$StartedAtUtc
         )
         $ErrorActionPreference = "Stop"
         function Log([string]$Message) {
           try { Add-Content -LiteralPath $LogPath -Value ("{0} {1}" -f (Get-Date -Format o), $Message) } catch {}
         }
-        try {
-          Log "Waiting for process $PidToWait"
-          Wait-Process -Id $PidToWait -ErrorAction SilentlyContinue
-          Start-Sleep -Milliseconds 700
-          if (Test-Path -LiteralPath $BackupPath) { Remove-Item -LiteralPath $BackupPath -Force }
-          if (Test-Path -LiteralPath $ExePath) { Move-Item -LiteralPath $ExePath -Destination $BackupPath -Force }
-          Move-Item -LiteralPath $NewExePath -Destination $ExePath -Force
-          Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Parent $ExePath)
-          Start-Sleep -Seconds 3
-          if (Test-Path -LiteralPath $BackupPath) { Remove-Item -LiteralPath $BackupPath -Force }
-          Log "Update applied"
-        } catch {
-          Log ("Update failed: " + $_.Exception.Message)
+        function Write-Journal([string]$Status, [string]$ErrorMessage) {
           try {
-            if ((Test-Path -LiteralPath $BackupPath) -and -not (Test-Path -LiteralPath $ExePath)) {
-              Move-Item -LiteralPath $BackupPath -Destination $ExePath -Force
+            $value = [ordered]@{
+              schemaVersion = 1
+              status = $Status
+              sourceProcessId = $PidToWait
+              helperProcessId = $PID
+              targetCommitSha = $TargetCommitSha
+              targetSha256 = $ExpectedSha256
+              targetSizeBytes = $ExpectedSize
+              restartAfterInstall = ($RestartAfterInstall -eq 1)
+              startedAtUtc = $StartedAtUtc
+              updatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+              error = $ErrorMessage
             }
-            Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Parent $ExePath)
+            $temporary = "$JournalPath.tmp-$PID"
+            $value | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $temporary -Encoding UTF8
+            Move-Item -LiteralPath $temporary -Destination $JournalPath -Force
           } catch {}
+        }
+        function Get-Sha256([string]$Path) {
+          return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        function Assert-File([string]$Path, [long]$Size, [string]$Sha256) {
+          $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+          if ($file.Length -ne $Size) { throw "Update file size does not match the manifest." }
+          if ((Get-Sha256 $Path) -ne $Sha256.ToLowerInvariant()) { throw "Update file SHA-256 does not match the manifest." }
+        }
+        function Restore-PreviousExecutable {
+          if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { return }
+          if (Test-Path -LiteralPath $ExePath -PathType Leaf) { Remove-Item -LiteralPath $ExePath -Force }
+          Move-Item -LiteralPath $BackupPath -Destination $ExePath -Force
+          if (-not [string]::IsNullOrWhiteSpace($CurrentSha256) -and
+              (Get-Sha256 $ExePath) -ne $CurrentSha256.ToLowerInvariant()) {
+            throw "The previous executable could not be restored safely."
+          }
+        }
+
+        $replacementStarted = $false
+        Write-Journal "Applying" ""
+        Log "Waiting for process $PidToWait"
+        Wait-Process -Id $PidToWait -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 700
+        try {
+          Assert-File $PreparedExePath $ExpectedSize $ExpectedSha256
+          if (Test-Path -LiteralPath $CandidatePath) { Remove-Item -LiteralPath $CandidatePath -Force }
+          Copy-Item -LiteralPath $PreparedExePath -Destination $CandidatePath -Force
+          Assert-File $CandidatePath $ExpectedSize $ExpectedSha256
+          if (Test-Path -LiteralPath $BackupPath) { Remove-Item -LiteralPath $BackupPath -Force }
+          $replacementStarted = $true
+          if (Test-Path -LiteralPath $ExePath -PathType Leaf) {
+            [System.IO.File]::Replace($CandidatePath, $ExePath, $BackupPath, $true)
+          } else {
+            [System.IO.File]::Move($CandidatePath, $ExePath)
+          }
+          Assert-File $ExePath $ExpectedSize $ExpectedSha256
+        } catch {
+          $failure = $_.Exception.Message
+          Log ("Update failed: " + $failure)
+          if ($replacementStarted) {
+            try { Restore-PreviousExecutable } catch { Log ("Rollback failed: " + $_.Exception.Message) }
+          }
+          if (Test-Path -LiteralPath $CandidatePath) { Remove-Item -LiteralPath $CandidatePath -Force -ErrorAction SilentlyContinue }
+          Write-Journal "Failed" $failure
+          $restartRequested = $RestartAfterInstall -eq 1 -or (Test-Path -LiteralPath $RestartRequestPath -PathType Leaf)
+          if (Test-Path -LiteralPath $RestartRequestPath) { Remove-Item -LiteralPath $RestartRequestPath -Force -ErrorAction SilentlyContinue }
+          if ($restartRequested -and (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
+            try {
+              Start-Process -FilePath $ExePath `
+                -ArgumentList ("--skip-prestart-update=" + $TargetCommitSha) `
+                -WorkingDirectory (Split-Path -Parent $ExePath)
+            } catch {}
+          }
+          exit 1
+        }
+
+        Log "Update applied"
+        if (Test-Path -LiteralPath $BackupPath) { Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $PreparedExePath) { Remove-Item -LiteralPath $PreparedExePath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $PreparedManifestPath) { Remove-Item -LiteralPath $PreparedManifestPath -Force -ErrorAction SilentlyContinue }
+        $preparedDirectory = Split-Path -Parent $PreparedExePath
+        if ((Split-Path -Leaf $preparedDirectory) -eq "Ready" -and
+            (Test-Path -LiteralPath $preparedDirectory) -and
+            -not (Get-ChildItem -LiteralPath $preparedDirectory -Force | Select-Object -First 1)) {
+          Remove-Item -LiteralPath $preparedDirectory -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $JournalPath) { Remove-Item -LiteralPath $JournalPath -Force -ErrorAction SilentlyContinue }
+        $restartRequested = $RestartAfterInstall -eq 1 -or (Test-Path -LiteralPath $RestartRequestPath -PathType Leaf)
+        if (Test-Path -LiteralPath $RestartRequestPath) { Remove-Item -LiteralPath $RestartRequestPath -Force -ErrorAction SilentlyContinue }
+        if ($restartRequested) {
+          try { Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Parent $ExePath) } catch { Log ("Updated application could not be started: " + $_.Exception.Message) }
         }
         """;
     }
@@ -867,9 +1068,14 @@ public sealed class UpdateService
         }
     }
 
-    private static string Quote(string value)
+    private static void EnsureUnderDirectory(string path, string directory, string description)
     {
-        return "\"" + value.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
+        var fullPath = Path.GetFullPath(path);
+        var fullDirectory = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (!fullPath.StartsWith(fullDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"{description} is outside the update directory.");
+        }
     }
 
     private static string ResolveCurrentCommitSha()
@@ -947,6 +1153,35 @@ public sealed record UpdatePreparationProgress(
     long TotalBytes = 0);
 
 public sealed record PreparedUpdate(UpdateManifest Manifest, string ExecutablePath);
+
+public enum UpdateInstallMode
+{
+    InstallOnExit,
+    InstallAndRestart
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum UpdateInstallStatus
+{
+    Scheduled,
+    Applying,
+    Failed
+}
+
+public sealed class UpdateInstallJournal
+{
+    public int SchemaVersion { get; set; } = 1;
+    public UpdateInstallStatus Status { get; set; }
+    public int SourceProcessId { get; set; }
+    public int HelperProcessId { get; set; }
+    public string TargetCommitSha { get; set; } = "";
+    public string TargetSha256 { get; set; } = "";
+    public long TargetSizeBytes { get; set; }
+    public bool RestartAfterInstall { get; set; }
+    public DateTimeOffset StartedAtUtc { get; set; }
+    public DateTimeOffset UpdatedAtUtc { get; set; }
+    public string Error { get; set; } = "";
+}
 
 public sealed class UpdateCheckResult
 {

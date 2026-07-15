@@ -106,23 +106,45 @@ public static class LogCleanupService
     private static void CleanupUpdateArtifacts(string updatesRoot)
     {
         if (!Directory.Exists(updatesRoot)) return;
+        if (UpdateService.IsInstallationInProgress(updatesRoot)) return;
+
+        var journalPath = Path.Combine(updatesRoot, UpdateService.InstallJournalFileName);
+        var hasJournal = File.Exists(journalPath);
 
         foreach (var fileName in new[]
                  {
                      $"{UpdateService.ExecutableAssetName}.download",
                      $"{UpdateService.DeltaPatchAssetName}.download",
                      $"{UpdateService.ExecutableAssetName}.new",
-                     "apply-update.ps1",
-                     $"{UpdateService.ExecutableAssetName}.bak",
+                     UpdateService.InstallCandidateFileName,
+                     UpdateService.InstallScriptFileName,
+                     UpdateService.InstallRestartRequestFileName,
                      "update.log"
                  })
         {
             DeleteFile(Path.Combine(updatesRoot, fileName));
         }
 
+        if (!hasJournal)
+        {
+            DeleteFile(Path.Combine(updatesRoot, UpdateService.InstallBackupFileName));
+        }
+
         foreach (var file in Directory.EnumerateFiles(updatesRoot, "*.bsdiff.download", SearchOption.TopDirectoryOnly))
         {
             DeleteFile(file);
+        }
+
+        var readyDirectory = Path.Combine(updatesRoot, "Ready");
+        var hasPreparedUpdate =
+            File.Exists(Path.Combine(readyDirectory, UpdateService.ExecutableAssetName)) &&
+            File.Exists(Path.Combine(readyDirectory, UpdateService.ManifestAssetName)) ||
+            File.Exists(Path.Combine(updatesRoot, UpdateService.ExecutableAssetName)) &&
+            File.Exists(Path.Combine(updatesRoot, UpdateService.ManifestAssetName));
+        if (hasJournal && !hasPreparedUpdate)
+        {
+            DeleteFile(journalPath);
+            DeleteFile(Path.Combine(updatesRoot, UpdateService.InstallBackupFileName));
         }
         TryDeleteDirectoryIfEmpty(updatesRoot);
     }

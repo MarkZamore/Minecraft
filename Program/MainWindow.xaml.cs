@@ -101,6 +101,7 @@ public partial class MainWindow : Window
     private bool _minecraftPreparing;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
+    private bool _restartAfterUpdateOnExit;
     private PreparedUpdate? _preparedUpdate;
     private readonly WindowPlacementService _windowPlacement;
 
@@ -270,6 +271,24 @@ public partial class MainWindow : Window
             if (_paths is not null)
             {
                 LogCleanupService.ScheduleCurrentExtractionCleanup(_paths, Environment.ProcessId);
+            }
+            try
+            {
+                if (_updateService is not null)
+                {
+                    var prepared = await Task.Run(_updateService.TryGetPreparedUpdate);
+                    if (prepared is not null)
+                    {
+                        var mode = _restartAfterUpdateOnExit
+                            ? UpdateInstallMode.InstallAndRestart
+                            : UpdateInstallMode.InstallOnExit;
+                        _updateService.StartInstall(prepared, mode);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.Warn($"Update could not be scheduled during shutdown: {ex.Message}");
             }
             _shutdownComplete = true;
             Close();
@@ -2302,12 +2321,9 @@ public partial class MainWindow : Window
         if (_updateService is null) return;
 
         PreparedUpdate? startupPrepared = null;
-        PreparedUpdate? readyUpdate = null;
-        var installAfterCheck = false;
         try
         {
             startupPrepared = await Task.Run(_updateService.TryGetPreparedUpdate, token);
-            readyUpdate = startupPrepared;
             token.ThrowIfCancellationRequested();
             if (startupPrepared is not null)
             {
@@ -2332,7 +2348,6 @@ public partial class MainWindow : Window
             token.ThrowIfCancellationRequested();
             if (!result.IsUpdateAvailable)
             {
-                installAfterCheck = startupPrepared is not null;
                 if (startupPrepared is null)
                 {
                     await Dispatcher.InvokeAsync(() =>
@@ -2378,7 +2393,7 @@ public partial class MainWindow : Window
                         UpdateProgressText.Text = "Применение обновления";
                     }
                 });
-                readyUpdate = await _updateService.DownloadUpdateAsync(result, progress, token);
+                var readyUpdate = await _updateService.DownloadUpdateAsync(result, progress, token);
                 token.ThrowIfCancellationRequested();
                 await Dispatcher.InvokeAsync(() =>
                 {
@@ -2388,11 +2403,6 @@ public partial class MainWindow : Window
                     SetProgressActivity(UpdateProgressBar, active: false);
                     UpdateProgressText.Text = "Обновление готово к установке";
                 });
-                installAfterCheck = startupPrepared is not null;
-            }
-            else
-            {
-                installAfterCheck = startupPrepared is not null;
             }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -2401,8 +2411,6 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _logger?.Warn($"Background update failed: {ex.Message}");
-            readyUpdate = startupPrepared;
-            installAfterCheck = startupPrepared is not null;
             if (startupPrepared is null)
             {
                 await Dispatcher.InvokeAsync(() =>
@@ -2425,29 +2433,6 @@ public partial class MainWindow : Window
                     RefreshUi();
                 });
             }
-        }
-
-        if (installAfterCheck && readyUpdate is not null && !token.IsCancellationRequested && !Dispatcher.HasShutdownStarted)
-        {
-            var installable = await Task.Run(_updateService.TryGetPreparedUpdate, token);
-            if (installable is null)
-            {
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    _preparedUpdate = null;
-                    UpdateProgressBar.Value = 0;
-                    SetProgressActivity(UpdateProgressBar, active: false);
-                    UpdateProgressText.Text = "Вы на последней версии";
-                    RefreshUi();
-                });
-                return;
-            }
-            await Dispatcher.InvokeAsync(() =>
-            {
-                _preparedUpdate = installable;
-                RequireUpdateService().StartInstallAndRestart(installable.ExecutablePath);
-                Application.Current.Shutdown();
-            });
         }
     }
 
@@ -2480,8 +2465,8 @@ public partial class MainWindow : Window
             UpdateProgressText.Text = "Обновление готово к установке";
             UpdateProgressBar.Value = 100;
             SetProgressActivity(UpdateProgressBar, active: false);
-            RequireUpdateService().StartInstallAndRestart(prepared.ExecutablePath);
-            Application.Current.Shutdown();
+            _restartAfterUpdateOnExit = true;
+            Close();
         }
         catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
         {

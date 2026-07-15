@@ -43,6 +43,9 @@
     <None Remove="NetworkProviders.json" />
     <EmbeddedResource Include="NetworkProviders.json"
                       LogicalName="Minecraft.NetworkProviders.json" />
+    <None Remove="SecretMessage.gif" />
+    <EmbeddedResource Include="SecretMessage.gif"
+                      LogicalName="Minecraft.SecretMessage.gif" />
     <PackageReference Include="NAudio" Version="2.3.0" />
     <PackageReference Include="Concentus" Version="2.2.2" />
     <PackageReference Include="CmlLib.Core" Version="4.0.6" />
