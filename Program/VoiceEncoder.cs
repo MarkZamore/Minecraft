@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using Concentus;
 using Concentus.Enums;
+using Concentus.Structs;
 
 namespace Minecraft;
 
@@ -66,13 +67,44 @@ public sealed class VoiceDecoder : IDisposable
             TextWriter.Null);
     }
 
-    public short[] Decode(byte[] encoded, bool useFec = false)
+    public static bool IsTwentyMillisecondPacket(byte[] encoded)
     {
-        if (encoded is null || encoded.Length == 0)
+        if (encoded is null || encoded.Length == 0) return false;
+        try
         {
-            return Array.Empty<short>();
+            return OpusPacketInfo.GetNumSamples(encoded, VoiceEncoder.SampleRate) ==
+                   VoiceEncoder.FrameSamples;
         }
+        catch
+        {
+            return false;
+        }
+    }
 
+    public short[] DecodePacket(byte[] encoded)
+    {
+        if (!IsTwentyMillisecondPacket(encoded))
+        {
+            throw new InvalidDataException("Voice packet is not a 20 ms Opus frame.");
+        }
+        return DecodeCore(encoded, useFec: false);
+    }
+
+    public short[] DecodeFec(byte[] encoded)
+    {
+        if (!IsTwentyMillisecondPacket(encoded))
+        {
+            throw new InvalidDataException("Voice FEC packet is not a 20 ms Opus frame.");
+        }
+        return DecodeCore(encoded, useFec: true);
+    }
+
+    public short[] DecodeMissing() => DecodeCore(ReadOnlySpan<byte>.Empty, useFec: false);
+
+    public void Reset() => _decoder.ResetState();
+
+    private short[] DecodeCore(ReadOnlySpan<byte> encoded, bool useFec)
+    {
         var decoded = new short[VoiceEncoder.FrameSamples * VoiceEncoder.Channels];
         var decodedSamples = _decoder.Decode(encoded, decoded, VoiceEncoder.FrameSamples, useFec);
         var outputSamples = Math.Max(0, decodedSamples) * VoiceEncoder.Channels;

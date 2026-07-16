@@ -6,6 +6,7 @@ namespace Minecraft;
 
 public sealed class VirtualNetworkService
 {
+    private const SocketOptionName UnicastInterfaceOption = (SocketOptionName)31;
     private readonly NetworkProviderCatalog _providers;
     private readonly object _sessionGate = new();
     private Dictionary<string, DateTimeOffset> _sessionProviders =
@@ -115,6 +116,113 @@ public sealed class VirtualNetworkService
             Endpoints = ordered,
             PrimaryEndpoint = primary
         };
+    }
+
+    public NetworkEndpointInfo? SelectLocalEndpoint(
+        IPAddress remoteAddress,
+        string? providerId = null)
+    {
+        ArgumentNullException.ThrowIfNull(remoteAddress);
+        if (IPAddress.IsLoopback(remoteAddress)) return null;
+
+        providerId = providerId?.Trim() ?? "";
+        var snapshot = GetSnapshot();
+        var candidates = snapshot.Endpoints
+            .Where(endpoint => endpoint.AddressFamily == remoteAddress.AddressFamily)
+            .ToArray();
+        if (candidates.Length == 0) return null;
+
+        if (!string.IsNullOrWhiteSpace(providerId))
+        {
+            var providerEndpoint = candidates
+                .Where(endpoint => string.Equals(
+                    endpoint.ProviderId,
+                    providerId,
+                    StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(endpoint => IsInSameNetwork(remoteAddress, endpoint))
+                .ThenByDescending(endpoint => endpoint.IsPreferredNetwork)
+                .ThenBy(endpoint => endpoint.SortPriority)
+                .FirstOrDefault();
+            if (providerEndpoint is not null) return providerEndpoint;
+        }
+
+        var matchingNetwork = candidates
+            .Where(endpoint => IsInSameNetwork(remoteAddress, endpoint))
+            .OrderByDescending(endpoint => endpoint.IsPreferredNetwork)
+            .ThenBy(endpoint => endpoint.SortPriority)
+            .FirstOrDefault();
+        if (matchingNetwork is not null) return matchingNetwork;
+
+        if (string.IsNullOrWhiteSpace(providerId))
+        {
+            return candidates
+                .Where(endpoint => endpoint.IsPhysical)
+                .OrderByDescending(endpoint => endpoint.HasDefaultRoute)
+                .ThenBy(endpoint => endpoint.SortPriority)
+                .FirstOrDefault();
+        }
+
+        return null;
+    }
+
+    public TcpClient CreateBoundTcpClient(
+        IPAddress remoteAddress,
+        string? providerId = null)
+    {
+        ArgumentNullException.ThrowIfNull(remoteAddress);
+        var client = new TcpClient(remoteAddress.AddressFamily);
+        if (IPAddress.IsLoopback(remoteAddress)) return client;
+
+        var localEndpoint = SelectLocalEndpoint(remoteAddress, providerId) ??
+            throw new SocketException((int)SocketError.NetworkUnreachable);
+        ConfigureInterface(client.Client, localEndpoint);
+        client.Client.Bind(new IPEndPoint(IPAddress.Parse(localEndpoint.NetworkAddress), 0));
+        return client;
+    }
+
+    public UdpClient CreateBoundUdpClient(
+        NetworkEndpointInfo endpoint,
+        int port,
+        bool reuseAddress)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        if (port is < 0 or > 65535) throw new ArgumentOutOfRangeException(nameof(port));
+        var localAddress = IPAddress.Parse(endpoint.NetworkAddress);
+        var udp = new UdpClient(localAddress.AddressFamily);
+        if (localAddress.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            udp.Client.DualMode = false;
+        }
+        if (reuseAddress)
+        {
+            udp.Client.ExclusiveAddressUse = false;
+            udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        }
+        ConfigureInterface(udp.Client, endpoint);
+        udp.Client.Bind(new IPEndPoint(localAddress, port));
+        return udp;
+    }
+
+    public static void ConfigureInterface(Socket socket, NetworkEndpointInfo endpoint)
+    {
+        ArgumentNullException.ThrowIfNull(socket);
+        ArgumentNullException.ThrowIfNull(endpoint);
+        if (endpoint.InterfaceIndex <= 0) return;
+
+        if (endpoint.AddressFamily == AddressFamily.InterNetwork)
+        {
+            socket.SetSocketOption(
+                SocketOptionLevel.IP,
+                UnicastInterfaceOption,
+                IPAddress.HostToNetworkOrder(endpoint.InterfaceIndex));
+        }
+        else if (endpoint.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            socket.SetSocketOption(
+                SocketOptionLevel.IPv6,
+                UnicastInterfaceOption,
+                endpoint.InterfaceIndex);
+        }
     }
 
     private List<NetworkEndpointInfo> EnumerateEndpoints(string selectedProviderId)

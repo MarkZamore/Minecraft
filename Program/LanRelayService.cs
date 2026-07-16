@@ -11,27 +11,39 @@ public sealed class LanRelayService : IAsyncDisposable
     public const string ProtocolName = "MinecraftPortableLanRelay";
     public const int ProtocolVersion = 1;
     private readonly Logger _logger;
+    private readonly VirtualNetworkService _network;
     private readonly ConcurrentDictionary<string, ClientRelay> _clientRelays = new(StringComparer.OrdinalIgnoreCase);
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private int _hostPort;
 
-    public LanRelayService(Logger logger)
+    public LanRelayService(Logger logger, VirtualNetworkService network)
     {
         _logger = logger;
+        _network = network;
     }
 
     public void SetHostPort(int? port) =>
         Volatile.Write(ref _hostPort, port is > 0 and <= 65535 ? port.Value : 0);
 
-    public ClientLanRelayInfo GetOrCreateClientRelay(IPAddress remoteAddress, int remoteLanPort)
+    public ClientLanRelayInfo GetOrCreateClientRelay(
+        string peerId,
+        IReadOnlyList<PeerEndpointInfo> endpoints,
+        int remoteLanPort)
     {
-        if (remoteAddress.AddressFamily != AddressFamily.InterNetworkV6)
-        {
-            throw new ArgumentException("A LAN relay is only needed for an IPv6 endpoint.", nameof(remoteAddress));
-        }
         if (remoteLanPort is <= 0 or > 65535) throw new ArgumentOutOfRangeException(nameof(remoteLanPort));
-        var key = BuildKey(remoteAddress, remoteLanPort);
-        var relay = _clientRelays.GetOrAdd(key, _ => new ClientRelay(remoteAddress, remoteLanPort, _logger, _jsonOptions));
+        var targets = endpoints
+            .Select(endpoint => IPAddress.TryParse(endpoint.Address, out var address)
+                ? new LanRelayTarget(address, endpoint.ProviderId)
+                : null)
+            .Where(target => target is not null)
+            .Cast<LanRelayTarget>()
+            .Distinct()
+            .ToArray();
+        if (targets.Length == 0) throw new ArgumentException("LAN relay has no valid peer endpoint.", nameof(endpoints));
+        var key = BuildKey(peerId, targets, remoteLanPort);
+        var relay = _clientRelays.GetOrAdd(
+            key,
+            _ => new ClientRelay(targets, remoteLanPort, _logger, _jsonOptions, _network));
         return new ClientLanRelayInfo(key, relay.LocalPort);
     }
 
@@ -95,7 +107,14 @@ public sealed class LanRelayService : IAsyncDisposable
         foreach (var relay in relays) await relay.DisposeAsync().ConfigureAwait(false);
     }
 
-    private static string BuildKey(IPAddress address, int port) => $"{address}|{port}";
+    private static string BuildKey(
+        string peerId,
+        IReadOnlyList<LanRelayTarget> targets,
+        int port) =>
+        $"{peerId}|{port}|" + string.Join(",", targets
+            .OrderBy(target => target.Address.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+            .ThenBy(target => target.Address.ToString(), StringComparer.OrdinalIgnoreCase)
+            .Select(target => $"{target.ProviderId}@{target.Address}"));
 
     private static async Task RelayBidirectionalAsync(Stream first, Stream second, CancellationToken token)
     {
@@ -118,24 +137,27 @@ public sealed class LanRelayService : IAsyncDisposable
 
     private sealed class ClientRelay : IAsyncDisposable
     {
-        private readonly IPAddress _remoteAddress;
+        private readonly IReadOnlyList<LanRelayTarget> _targets;
         private readonly int _remoteLanPort;
         private readonly Logger _logger;
         private readonly JsonSerializerOptions _jsonOptions;
+        private readonly VirtualNetworkService _network;
         private readonly TcpListener _listener;
         private readonly CancellationTokenSource _cts = new();
         private readonly Task _acceptTask;
 
         public ClientRelay(
-            IPAddress remoteAddress,
+            IReadOnlyList<LanRelayTarget> targets,
             int remoteLanPort,
             Logger logger,
-            JsonSerializerOptions jsonOptions)
+            JsonSerializerOptions jsonOptions,
+            VirtualNetworkService network)
         {
-            _remoteAddress = remoteAddress;
+            _targets = targets;
             _remoteLanPort = remoteLanPort;
             _logger = logger;
             _jsonOptions = jsonOptions;
+            _network = network;
             _listener = new TcpListener(IPAddress.Loopback, 0);
             _listener.Start();
             LocalPort = ((IPEndPoint)_listener.LocalEndpoint).Port;
@@ -168,28 +190,46 @@ public sealed class LanRelayService : IAsyncDisposable
         private async Task HandleClientAsync(TcpClient localClient, CancellationToken token)
         {
             using (localClient)
-            using (var remoteClient = new TcpClient(AddressFamily.InterNetworkV6))
             {
-                try
+                var failures = new List<string>();
+                foreach (var target in _targets)
                 {
-                    await remoteClient.ConnectAsync(_remoteAddress, WorldTransferService.TransferPort, token).ConfigureAwait(false);
-                    await using var remoteStream = remoteClient.GetStream();
-                    await PortableProtocol.WriteJsonAsync(remoteStream, new LanRelayRequest
+                    try
                     {
-                        ServerPort = _remoteLanPort
-                    }, _jsonOptions, token).ConfigureAwait(false);
-                    var replyFrame = await PortableProtocol.ReadFrameAsync(remoteStream, token).ConfigureAwait(false);
-                    var reply = PortableProtocol.Deserialize<LanRelayReply>(replyFrame, _jsonOptions);
-                    if (reply is null || reply.Protocol != ProtocolName || reply.ProtocolVersion != ProtocolVersion || !reply.Ok)
-                    {
-                        throw new IOException(reply?.Message ?? "Remote LAN relay was rejected.");
+                        using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        connectCts.CancelAfter(TimeSpan.FromSeconds(4));
+                        using var remoteClient = _network.CreateBoundTcpClient(target.Address, target.ProviderId);
+                        await remoteClient.ConnectAsync(
+                            target.Address,
+                            WorldTransferService.TransferPort,
+                            connectCts.Token).ConfigureAwait(false);
+                        await using var remoteStream = remoteClient.GetStream();
+                        await PortableProtocol.WriteJsonAsync(remoteStream, new LanRelayRequest
+                        {
+                            ServerPort = _remoteLanPort
+                        }, _jsonOptions, connectCts.Token).ConfigureAwait(false);
+                        var replyFrame = await PortableProtocol.ReadFrameAsync(
+                            remoteStream,
+                            connectCts.Token).ConfigureAwait(false);
+                        var reply = PortableProtocol.Deserialize<LanRelayReply>(replyFrame, _jsonOptions);
+                        if (reply is null || reply.Protocol != ProtocolName ||
+                            reply.ProtocolVersion != ProtocolVersion || !reply.Ok)
+                        {
+                            throw new IOException(reply?.Message ?? "Remote LAN relay was rejected.");
+                        }
+                        await RelayBidirectionalAsync(
+                            localClient.GetStream(),
+                            remoteStream,
+                            token).ConfigureAwait(false);
+                        return;
                     }
-                    await RelayBidirectionalAsync(localClient.GetStream(), remoteStream, token).ConfigureAwait(false);
+                    catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException)
+                    {
+                        if (token.IsCancellationRequested) return;
+                        failures.Add($"{target.Address}: {ex.Message}");
+                    }
                 }
-                catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException)
-                {
-                    if (!token.IsCancellationRequested) _logger.Warn($"Minecraft LAN relay to {_remoteAddress} failed: {ex.Message}");
-                }
+                _logger.Warn("Minecraft LAN relay failed: " + string.Join("; ", failures.Take(3)));
             }
         }
 
@@ -225,3 +265,5 @@ public sealed class LanRelayService : IAsyncDisposable
 }
 
 public sealed record ClientLanRelayInfo(string Key, int LocalPort);
+
+internal sealed record LanRelayTarget(IPAddress Address, string ProviderId);

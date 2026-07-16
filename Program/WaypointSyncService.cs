@@ -19,6 +19,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly WorldMetadataService _worldMetadata;
+    private readonly VirtualNetworkService _network;
     private readonly WaypointProviderRegistry _providerRegistry;
     private readonly WaypointStoreService _store;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
@@ -41,11 +42,13 @@ public sealed class WaypointSyncService : IAsyncDisposable
     public WaypointSyncService(
         AppPaths paths,
         Logger logger,
-        WorldMetadataService worldMetadata)
+        WorldMetadataService worldMetadata,
+        VirtualNetworkService network)
     {
         _paths = paths;
         _logger = logger;
         _worldMetadata = worldMetadata;
+        _network = network;
         _providerRegistry = new WaypointProviderRegistry(logger);
         _store = new WaypointStoreService(worldMetadata, _providerRegistry, logger);
         MigrateLegacyState();
@@ -211,36 +214,52 @@ public sealed class WaypointSyncService : IAsyncDisposable
     public void ObservePeer(PeerAnnouncement announcement)
     {
         if (!announcement.IsHost || announcement.WaypointProtocolVersion != ProtocolVersion ||
-            !Guid.TryParse(announcement.HostedWorldId, out var worldId) || worldId == Guid.Empty ||
-            !IPAddress.TryParse(announcement.NetworkAddress, out var address))
+            !Guid.TryParse(announcement.HostedWorldId, out var worldId) || worldId == Guid.Empty)
         {
             return;
         }
 
+        var addresses = (announcement.NetworkEndpoints ?? [])
+            .Select(endpoint => new WaypointRouteEndpoint(endpoint.Address, endpoint.ProviderId))
+            .Append(new WaypointRouteEndpoint(
+                announcement.NetworkAddress,
+                announcement.NetworkProviderId))
+            .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
+            .Distinct()
+            .ToArray();
+        if (addresses.Length == 0) return;
+
+        var providers = (announcement.WaypointProviders ?? []).Select(item => new WaypointProviderAnnouncement
+        {
+            ProviderId = item.ProviderId,
+            ModVersion = item.ModVersion,
+            WorldContextId = item.WorldContextId
+        }).ToArray();
         var identityKey = string.IsNullOrWhiteSpace(announcement.IdentityId)
-            ? address.ToString()
+            ? addresses[0].Address
             : announcement.IdentityId;
-        var pending = new PendingHostAnnouncement(
-            worldId.ToString("D"),
-            identityKey,
-            address.ToString(),
-            (announcement.WaypointProviders ?? []).Select(item => new WaypointProviderAnnouncement
-            {
-                ProviderId = item.ProviderId,
-                ModVersion = item.ModVersion,
-                WorldContextId = item.WorldContextId
-            }).ToArray(),
-            DateTimeOffset.UtcNow);
+        var pendingAnnouncements = addresses.Select(endpoint =>
+            new PendingHostAnnouncement(
+                worldId.ToString("D"),
+                identityKey,
+                endpoint.Address,
+                endpoint.ProviderId,
+                providers,
+                DateTimeOffset.UtcNow))
+            .ToArray();
 
         LocalWaypointSession? local;
         lock (_stateGate)
         {
-            var pendingKey = $"{pending.WorldId}|{pending.HostIdentityId}|{pending.Address}";
-            _pendingAnnouncements[pendingKey] = pending;
+            foreach (var pending in pendingAnnouncements)
+            {
+                var pendingKey = $"{pending.WorldId}|{pending.HostIdentityId}|{pending.Address}";
+                _pendingAnnouncements[pendingKey] = pending;
+            }
             local = _localSession;
         }
         if (local is null) return;
-        RegisterRemote(pending, local);
+        foreach (var pending in pendingAnnouncements) RegisterRemote(pending, local);
     }
 
     private void RegisterRemote(PendingHostAnnouncement announcement, LocalWaypointSession local)
@@ -263,11 +282,15 @@ public sealed class WaypointSyncService : IAsyncDisposable
                 remote = new RemoteWorldSession(announcement.WorldId);
                 _remoteSessions[key] = remote;
             }
-            var endpointAdded = !remote.Addresses.ContainsKey(announcement.Address);
+            var endpointKey = $"{announcement.ProviderId}|{announcement.Address}";
+            var endpointAdded = !remote.Addresses.ContainsKey(endpointKey);
             var providersChanged = remote.Providers.Count != providers.Count || providers.Any(item =>
                 !remote.Providers.TryGetValue(item.Key, out var current) ||
                 !string.Equals(current.WorldContextId, item.Value.WorldContextId, StringComparison.Ordinal));
-            remote.Addresses[announcement.Address] = announcement.LastSeenUtc;
+            remote.Addresses[endpointKey] = new RemoteAddressState(
+                announcement.Address,
+                announcement.ProviderId,
+                announcement.LastSeenUtc);
             remote.Providers = providers;
             if (endpointAdded || providersChanged)
             {
@@ -459,7 +482,10 @@ public sealed class WaypointSyncService : IAsyncDisposable
             foreach (var pair in _remoteSessions.ToArray())
             {
                 var endpointRemoved = false;
-                foreach (var address in pair.Value.Addresses.Where(endpoint => endpoint.Value < cutoff).Select(endpoint => endpoint.Key).ToArray())
+                foreach (var address in pair.Value.Addresses
+                             .Where(endpoint => endpoint.Value.LastSeenUtc < cutoff)
+                             .Select(endpoint => endpoint.Key)
+                             .ToArray())
                 {
                     pair.Value.Addresses.Remove(address);
                     endpointRemoved = true;
@@ -477,7 +503,11 @@ public sealed class WaypointSyncService : IAsyncDisposable
             remotes = _remoteSessions.Select(pair => new RemoteWorldWorkItem(
                 pair.Key,
                 pair.Value.WorldId,
-                pair.Value.Addresses.Keys.ToArray(),
+                pair.Value.Addresses.Values
+                    .Select(endpoint => new WaypointRouteEndpoint(
+                        endpoint.Address,
+                        endpoint.ProviderId))
+                    .ToArray(),
                 pair.Value.Providers.Values.ToArray(),
                 pair.Value.PullRequested,
                 pair.Value.ChangeVersion)).ToArray();
@@ -557,7 +587,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
                 if (!pulled) continue;
             }
 
-            foreach (var address in addresses)
+            foreach (var endpoint in addresses)
             {
                 token.ThrowIfCancellationRequested();
                 try
@@ -569,7 +599,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
                         providerInfo.WorldContextId,
                         providerInfo.ModVersion,
                         IsHost: false,
-                        RemoteAddress: address);
+                        RemoteAddress: endpoint.Address);
                     var snapshot = providerInfo.Provider.Export(context);
                     var nativeHash = WaypointStoreService.ComputeSnapshotHash(snapshot);
                     if (string.Equals(nativeHash, state.LastNativeSha256, StringComparison.OrdinalIgnoreCase)) continue;
@@ -596,7 +626,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
         LocalWaypointSession local,
         RemoteWorldWorkItem remote,
         RemoteProvider providerInfo,
-        IReadOnlyList<string> addresses,
+        IReadOnlyList<WaypointRouteEndpoint> addresses,
         WaypointLocalProviderState state,
         CancellationToken token)
     {
@@ -620,7 +650,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
             {
                 throw new InvalidDataException("Remote waypoint snapshot belongs to a different world context.");
             }
-            foreach (var address in addresses)
+            foreach (var endpoint in addresses)
             {
                 var context = new WaypointNativeContext(
                     local.GameDirectory,
@@ -629,7 +659,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
                     providerInfo.WorldContextId,
                     providerInfo.ModVersion,
                     IsHost: false,
-                    RemoteAddress: address);
+                    RemoteAddress: endpoint.Address);
                 var result = providerInfo.Provider.Import(context, response.Snapshot, []);
                 managed.UnionWith(result.ManagedRelativePaths);
             }
@@ -657,7 +687,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
         LocalWaypointSession local,
         RemoteWorldWorkItem remote,
         RemoteProvider providerInfo,
-        IReadOnlyList<string> addresses,
+        IReadOnlyList<WaypointRouteEndpoint> addresses,
         WaypointLocalProviderState state,
         WaypointSnapshot snapshot,
         CancellationToken token)
@@ -690,18 +720,18 @@ public sealed class WaypointSyncService : IAsyncDisposable
     }
 
     private async Task<WaypointSyncReply?> SendRequestAsync(
-        IReadOnlyList<string> addresses,
+        IReadOnlyList<WaypointRouteEndpoint> addresses,
         WaypointSyncEnvelope request,
         CancellationToken token)
     {
-        foreach (var address in addresses.Distinct(StringComparer.OrdinalIgnoreCase))
+        foreach (var endpoint in addresses.Distinct())
         {
-            if (!IPAddress.TryParse(address, out var ip)) continue;
+            if (!IPAddress.TryParse(endpoint.Address, out var ip)) continue;
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token, _shutdownCts.Token);
             timeoutCts.CancelAfter(TimeSpan.FromSeconds(4));
             try
             {
-                using var client = new TcpClient(ip.AddressFamily);
+                using var client = _network.CreateBoundTcpClient(ip, endpoint.ProviderId);
                 await client.ConnectAsync(ip, WorldTransferService.TransferPort, timeoutCts.Token).ConfigureAwait(false);
                 await using var stream = client.GetStream();
                 await PortableProtocol.WriteJsonAsync(stream, request, _jsonOptions, timeoutCts.Token).ConfigureAwait(false);
@@ -715,7 +745,7 @@ public sealed class WaypointSyncService : IAsyncDisposable
             catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException or InvalidDataException)
             {
                 token.ThrowIfCancellationRequested();
-                _logger.Warn($"Waypoint synchronization route {address} failed: {ex.Message}");
+                _logger.Warn($"Waypoint synchronization route {endpoint.Address} failed: {ex.Message}");
             }
         }
         return null;
@@ -1059,12 +1089,13 @@ public sealed class WaypointSyncService : IAsyncDisposable
         string WorldId,
         string HostIdentityId,
         string Address,
+        string ProviderId,
         IReadOnlyList<WaypointProviderAnnouncement> Providers,
         DateTimeOffset LastSeenUtc);
     private sealed record RemoteWorldWorkItem(
         string Key,
         string WorldId,
-        IReadOnlyList<string> Addresses,
+        IReadOnlyList<WaypointRouteEndpoint> Addresses,
         IReadOnlyList<RemoteProvider> Providers,
         bool PullRequested,
         long ChangeVersion);
@@ -1077,11 +1108,17 @@ public sealed class WaypointSyncService : IAsyncDisposable
         }
 
         public string WorldId { get; }
-        public Dictionary<string, DateTimeOffset> Addresses { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, RemoteAddressState> Addresses { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, RemoteProvider> Providers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public bool PullRequested { get; set; }
         public long ChangeVersion { get; set; }
     }
+
+    private sealed record WaypointRouteEndpoint(string Address, string ProviderId);
+    private sealed record RemoteAddressState(
+        string Address,
+        string ProviderId,
+        DateTimeOffset LastSeenUtc);
 }
 
 public sealed record WaypointHostAdvertisement(

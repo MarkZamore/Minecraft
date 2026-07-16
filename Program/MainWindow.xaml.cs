@@ -162,14 +162,14 @@ public partial class MainWindow : Window
                 _paths,
                 _logger,
                 networkCoordinator: _voiceNetwork);
-            _waypointSync = new WaypointSyncService(_paths, _logger, _worldMetadata);
-            _skinService = new SkinService(_paths, _logger);
+            _waypointSync = new WaypointSyncService(_paths, _logger, _worldMetadata, _network);
+            _skinService = new SkinService(_paths, _logger, _network);
             await _skinService.StartAsync(_lifetimeCts.Token);
-            _lanRelay = new LanRelayService(_logger);
+            _lanRelay = new LanRelayService(_logger, _network);
             _minecraft = new MinecraftProcessService(_paths, _logger, _identityService, _identityAdapter, _worldPlayerProfiles, _packInstances, _packRuntimes, _waypointSync, _skinService);
             _minecraft.ClientRunningChanged += OnMinecraftClientRunningChanged;
             _minecraft.ClientPreparingChanged += OnMinecraftClientPreparingChanged;
-            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _lanRelay, _voiceNetwork);
+            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _lanRelay, _voiceNetwork, _network);
             _updateService = new UpdateService(
                 _paths,
                 _logger,
@@ -189,7 +189,7 @@ public partial class MainWindow : Window
             _discovery.PeerUpdated += announcement => Dispatcher.Invoke(() => ApplyPeer(announcement));
             _lanAdvertisement = new LanAdvertisementService(_logger, _lanRelay);
             _lanAdvertisement.Start();
-            _voiceChannel = new VoiceChannelService(_logger, _voiceNetwork);
+            _voiceChannel = new VoiceChannelService(_logger, _voiceNetwork, network: _network);
             _voiceChannel.Initialize(_settings);
             _voiceChannel.SpeakingStateChanged += OnVoiceSpeakingStateChanged;
             _voiceChannel.PeerPresenceChanged += OnVoicePeerPresenceChanged;
@@ -918,19 +918,20 @@ public partial class MainWindow : Window
             if (_lastVoiceTransportPeerSignature.Length > 0)
             {
                 _lastVoiceTransportPeerSignature = "";
-                _voiceChannel.UpdatePeers(Array.Empty<(string peerId, string ip)>());
+                _voiceChannel.UpdatePeers(Array.Empty<VoicePeerCandidate>());
             }
             return;
         }
 
         var peers = _voicePresence
             .Where(pair => pair.Value.LastSeenUtc >= DateTimeOffset.UtcNow - TimeSpan.FromSeconds(30))
-            .SelectMany(pair => pair.Value.Endpoints.Select(ip =>
-                (peerId: pair.Key, ip)))
-            .Where(peer => !string.IsNullOrWhiteSpace(peer.peerId))
+            .SelectMany(pair => pair.Value.Endpoints.Select(endpoint =>
+                new VoicePeerCandidate(pair.Key, endpoint.Address, endpoint.ProviderId)))
+            .Where(peer => !string.IsNullOrWhiteSpace(peer.PeerId))
             .Distinct()
             .ToArray();
-        var signature = string.Join("|", peers.Select(peer => $"{peer.peerId}@{peer.ip}"));
+        var signature = string.Join("|", peers.Select(peer =>
+            $"{peer.PeerId}@{peer.Address}:{peer.ProviderId}"));
         if (string.Equals(signature, _lastVoiceTransportPeerSignature, StringComparison.Ordinal))
         {
             return;
@@ -1043,6 +1044,19 @@ public partial class MainWindow : Window
             identityContext);
         var waypointHost = RequireWaypointSync().GetHostAdvertisement();
         var skin = RequireSkinService().GetAnnouncement(settings, identity.id);
+        var advertisedEndpoints = _networkEndpoints
+            .Where(candidate =>
+                string.Equals(candidate.ProviderId, endpoint.ProviderId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(candidate.InterfaceId, endpoint.InterfaceId, StringComparison.OrdinalIgnoreCase))
+            .Select(candidate => new PeerAdvertisedEndpoint
+            {
+                Address = candidate.NetworkAddress,
+                ProviderId = candidate.ProviderId,
+                InterfaceId = candidate.InterfaceId,
+                AddressFamily = candidate.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
+                NetworkType = VirtualNetworkService.DetectNetworkType(candidate)
+            })
+            .ToList();
         return new PeerAnnouncement
         {
             ProtocolVersion = PeerDiscoveryService.ProtocolVersion,
@@ -1054,6 +1068,7 @@ public partial class MainWindow : Window
             NetworkInterfaceId = endpoint.InterfaceId,
             NetworkAddressFamily = endpoint.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
             NetworkType = VirtualNetworkService.DetectNetworkType(endpoint),
+            NetworkEndpoints = advertisedEndpoints,
             IsHost = openToLanPort.HasValue,
             PackHash = _localPackHash,
             ServerPort = openToLanPort ?? 0,
@@ -1106,7 +1121,7 @@ public partial class MainWindow : Window
                     {
                         _voicePresence[peerId] = new VoicePresenceEntry(
                             peer,
-                            peer.GetCandidateAddresses(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
+                            peer.GetCandidateEndpoints(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
                             DateTimeOffset.UtcNow);
                     }
                 }
@@ -1186,7 +1201,7 @@ public partial class MainWindow : Window
             {
                 _voicePresence[voicePeerId] = new VoicePresenceEntry(
                     peer,
-                    peer.GetCandidateAddresses(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
+                    peer.GetCandidateEndpoints(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
                     DateTimeOffset.UtcNow);
             }
             else
@@ -2950,7 +2965,10 @@ public partial class MainWindow : Window
 
     private sealed class VoicePresenceEntry
     {
-        public VoicePresenceEntry(PeerViewModel peer, IReadOnlyList<string> endpoints, DateTimeOffset lastSeenUtc)
+        public VoicePresenceEntry(
+            PeerViewModel peer,
+            IReadOnlyList<PeerEndpointInfo> endpoints,
+            DateTimeOffset lastSeenUtc)
         {
             Peer = peer;
             Endpoints = endpoints;
@@ -2958,7 +2976,7 @@ public partial class MainWindow : Window
         }
 
         public PeerViewModel Peer { get; }
-        public IReadOnlyList<string> Endpoints { get; set; }
+        public IReadOnlyList<PeerEndpointInfo> Endpoints { get; set; }
         public DateTimeOffset LastSeenUtc { get; set; }
     }
     private UpdateService RequireUpdateService() => _updateService ?? throw new InvalidOperationException("Update service is not initialized.");

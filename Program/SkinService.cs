@@ -19,6 +19,7 @@ public sealed class SkinService : IAsyncDisposable
     private const int MaxSkinBytes = 128 * 1024 * 1024;
     private readonly AppPaths _paths;
     private readonly Logger _logger;
+    private readonly VirtualNetworkService _network;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly ConcurrentDictionary<string, SkinAsset> _assets = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SkinPeerDescriptor> _peers = new(StringComparer.OrdinalIgnoreCase);
@@ -30,10 +31,11 @@ public sealed class SkinService : IAsyncDisposable
     private string _localUuid = "";
     private string _localSourceState = "";
 
-    public SkinService(AppPaths paths, Logger logger)
+    public SkinService(AppPaths paths, Logger logger, VirtualNetworkService network)
     {
         _paths = paths;
         _logger = logger;
+        _network = network;
         MigrateLegacyRegistry();
     }
 
@@ -148,11 +150,13 @@ public sealed class SkinService : IAsyncDisposable
             uuid,
             peer.SkinSha256.ToUpperInvariant(),
             NormalizeModel(peer.SkinModel),
-            peer.GetCandidateAddresses().ToArray());
+            peer.GetCandidateEndpoints()
+                .Select(endpoint => new SkinPeerEndpoint(endpoint.Address, endpoint.ProviderId))
+                .ToArray());
         var metadataChanged = !_peers.TryGetValue(uuid, out var previousDescriptor) ||
                               previousDescriptor.Sha256 != descriptor.Sha256 ||
                               previousDescriptor.Model != descriptor.Model ||
-                              !previousDescriptor.Addresses.SequenceEqual(descriptor.Addresses, StringComparer.OrdinalIgnoreCase);
+                              !previousDescriptor.Endpoints.SequenceEqual(descriptor.Endpoints);
         _peers[uuid] = descriptor;
         if (_assets.TryGetValue(uuid, out var cached) &&
             string.Equals(cached.Sha256, descriptor.Sha256, StringComparison.OrdinalIgnoreCase))
@@ -216,14 +220,14 @@ public sealed class SkinService : IAsyncDisposable
         if (!_fetches.TryAdd(fetchKey, 0)) return;
         try
         {
-            foreach (var endpoint in descriptor.Addresses)
+            foreach (var endpoint in descriptor.Endpoints)
             {
-                if (!IPAddress.TryParse(endpoint, out var address)) continue;
+                if (!IPAddress.TryParse(endpoint.Address, out var address)) continue;
                 try
                 {
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
                     timeout.CancelAfter(TimeSpan.FromSeconds(5));
-                    using var client = new TcpClient(address.AddressFamily);
+                    using var client = _network.CreateBoundTcpClient(address, endpoint.ProviderId);
                     await client.ConnectAsync(address, WorldTransferService.TransferPort, timeout.Token).ConfigureAwait(false);
                     await using var stream = client.GetStream();
                     await PortableProtocol.WriteJsonAsync(stream, new SkinRequest
@@ -566,7 +570,12 @@ public sealed class SkinService : IAsyncDisposable
         long SizeBytes,
         long LastWriteUtcTicks);
 
-    private sealed record SkinPeerDescriptor(string PlayerUuid, string Sha256, string Model, IReadOnlyList<string> Addresses);
+    private sealed record SkinPeerEndpoint(string Address, string ProviderId);
+    private sealed record SkinPeerDescriptor(
+        string PlayerUuid,
+        string Sha256,
+        string Model,
+        IReadOnlyList<SkinPeerEndpoint> Endpoints);
 }
 
 public sealed record SkinAnnouncement(bool IsAvailable, string Sha256, string Model);

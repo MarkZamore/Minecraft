@@ -102,6 +102,15 @@ public sealed class PeerEndpointInfo
     public DateTimeOffset LastSeen { get; set; }
 }
 
+public sealed class PeerAdvertisedEndpoint
+{
+    public string Address { get; set; } = "";
+    public string ProviderId { get; set; } = "";
+    public string InterfaceId { get; set; } = "";
+    public string AddressFamily { get; set; } = "";
+    public string NetworkType { get; set; } = "Unknown";
+}
+
 public sealed class PeerAnnouncement
 {
     public string App { get; set; } = "MinecraftPortable";
@@ -115,6 +124,8 @@ public sealed class PeerAnnouncement
     public string NetworkInterfaceId { get; set; } = "";
     public string NetworkAddressFamily { get; set; } = "";
     public string NetworkType { get; set; } = "";
+    public bool IsDirectedReply { get; set; }
+    public List<PeerAdvertisedEndpoint> NetworkEndpoints { get; set; } = [];
     public bool IsHost { get; set; }
     public string PackHash { get; set; } = "";
     public int ServerPort { get; set; }
@@ -459,22 +470,36 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         var now = DateTimeOffset.Now;
         LastSeen = now;
 
-        if (!string.IsNullOrWhiteSpace(announcement.NetworkAddress))
+        var announcedEndpoints = (announcement.NetworkEndpoints ?? [])
+            .Concat(string.IsNullOrWhiteSpace(announcement.NetworkAddress)
+                ? []
+                : [new PeerAdvertisedEndpoint
+                {
+                    Address = announcement.NetworkAddress,
+                    ProviderId = announcement.NetworkProviderId,
+                    InterfaceId = announcement.NetworkInterfaceId,
+                    AddressFamily = announcement.NetworkAddressFamily,
+                    NetworkType = announcement.NetworkType
+                }])
+            .Where(item => !string.IsNullOrWhiteSpace(item.Address))
+            .GroupBy(item => GetEndpointKey(item.Address, item.ProviderId, item.InterfaceId), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First());
+        foreach (var announcedEndpoint in announcedEndpoints)
         {
             var endpointKey = GetEndpointKey(
-                announcement.NetworkAddress,
-                announcement.NetworkProviderId,
-                announcement.NetworkInterfaceId);
+                announcedEndpoint.Address,
+                announcedEndpoint.ProviderId,
+                announcedEndpoint.InterfaceId);
             if (!_endpoints.TryGetValue(endpointKey, out var endpoint))
             {
-                endpoint = new PeerEndpointInfo { Address = announcement.NetworkAddress };
+                endpoint = new PeerEndpointInfo { Address = announcedEndpoint.Address };
                 _endpoints[endpointKey] = endpoint;
             }
 
-            endpoint.ProviderId = announcement.NetworkProviderId?.Trim() ?? "";
-            endpoint.InterfaceId = announcement.NetworkInterfaceId?.Trim() ?? "";
-            endpoint.AddressFamily = announcement.NetworkAddressFamily?.Trim() ?? "";
-            endpoint.NetworkType = NormalizeNetworkType(announcement.NetworkType);
+            endpoint.ProviderId = announcedEndpoint.ProviderId?.Trim() ?? "";
+            endpoint.InterfaceId = announcedEndpoint.InterfaceId?.Trim() ?? "";
+            endpoint.AddressFamily = announcedEndpoint.AddressFamily?.Trim() ?? "";
+            endpoint.NetworkType = NormalizeNetworkType(announcedEndpoint.NetworkType);
             endpoint.IsHost = announcement.IsHost;
             endpoint.ServerPort = announcement.ServerPort;
             endpoint.LastSeen = now;
@@ -486,9 +511,9 @@ public sealed class PeerViewModel : INotifyPropertyChanged
 
     public bool PruneEndpoints(DateTimeOffset cutoff)
     {
-        foreach (var endpoint in _endpoints.Values.Where(endpoint => endpoint.LastSeen < cutoff).ToArray())
+        foreach (var pair in _endpoints.Where(pair => pair.Value.LastSeen < cutoff).ToArray())
         {
-            _endpoints.Remove(endpoint.Address);
+            _endpoints.Remove(pair.Key);
         }
 
         SelectPrimaryEndpoint();
@@ -531,6 +556,14 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     }
 
     public IReadOnlyList<string> GetCandidateAddresses(bool requireHost = false, string? preferredProviderId = null)
+        => GetCandidateEndpoints(requireHost, preferredProviderId)
+            .Select(endpoint => endpoint.Address)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    public IReadOnlyList<PeerEndpointInfo> GetCandidateEndpoints(
+        bool requireHost = false,
+        string? preferredProviderId = null)
     {
         var preferred = string.IsNullOrWhiteSpace(preferredProviderId)
             ? _preferredProviderId
@@ -541,8 +574,10 @@ public sealed class PeerViewModel : INotifyPropertyChanged
                                            string.Equals(endpoint.ProviderId, preferred, StringComparison.OrdinalIgnoreCase))
             .ThenByDescending(endpoint => endpoint.Address.Equals(NetworkAddress, StringComparison.OrdinalIgnoreCase))
             .ThenByDescending(endpoint => endpoint.LastSeen)
-            .Select(endpoint => endpoint.Address)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .GroupBy(
+                endpoint => GetEndpointKey(endpoint.Address, endpoint.ProviderId, endpoint.InterfaceId),
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
             .ToArray();
     }
 

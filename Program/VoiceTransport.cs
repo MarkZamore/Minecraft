@@ -7,14 +7,16 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
 {
     public const int VoicePort = 35657;
     private readonly Logger _logger;
+    private readonly VirtualNetworkService _network;
     private readonly object _gate = new();
     private readonly List<TransportSocket> _sockets = [];
     private CancellationTokenSource? _cts;
     private DateTimeOffset _lastWarningAt = DateTimeOffset.MinValue;
 
-    public VoiceTransport(Logger logger)
+    public VoiceTransport(Logger logger, VirtualNetworkService network)
     {
         _logger = logger;
+        _network = network;
     }
 
     public void StartListening(
@@ -24,29 +26,27 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
     {
         StopAsync().AsTask().GetAwaiter().GetResult();
         var cts = new CancellationTokenSource();
-        var addresses = listenAddress.Equals(IPAddress.Any) || listenAddress.Equals(IPAddress.IPv6Any)
-            ? new[] { IPAddress.Any, IPAddress.IPv6Any }
-            : new[] { listenAddress };
+        var useNetworkEndpoints = listenAddress.Equals(IPAddress.Any) ||
+                                  listenAddress.Equals(IPAddress.IPv6Any);
+        var endpoints = useNetworkEndpoints
+            ? _network.GetSnapshot().Endpoints
+                .GroupBy(endpoint => endpoint.NetworkAddress, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToArray()
+            : Array.Empty<NetworkEndpointInfo>();
         var configured = new List<TransportSocket>();
         try
         {
-            foreach (var address in addresses)
+            if (useNetworkEndpoints)
             {
-                try
+                foreach (var endpoint in endpoints)
                 {
-                    var udp = new UdpClient(address.AddressFamily);
-                    if (address.AddressFamily == AddressFamily.InterNetworkV6) udp.Client.DualMode = false;
-                    udp.Client.Bind(new IPEndPoint(address, port));
-                    udp.Client.SendBufferSize = 512 * 1024;
-                    udp.Client.ReceiveBufferSize = 512 * 1024;
-                    var qos = VoiceQosSession.AttachBestEffort(udp.Client, _logger);
-                    var receiveTask = ReceiveLoopAsync(udp, onPacketReceived, cts.Token);
-                    configured.Add(new TransportSocket(udp, qos, receiveTask));
+                    TryConfigureSocket(endpoint, port, onPacketReceived, cts, configured);
                 }
-                catch (SocketException ex)
-                {
-                    _logger.Warn($"Voice {address.AddressFamily} listener is unavailable: {ex.Message}");
-                }
+            }
+            else
+            {
+                TryConfigureSocket(listenAddress, port, onPacketReceived, cts, configured);
             }
             if (configured.Count == 0)
             {
@@ -69,6 +69,61 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
             cts.Dispose();
             throw;
         }
+    }
+
+    private void TryConfigureSocket(
+        NetworkEndpointInfo endpoint,
+        int port,
+        Func<IPEndPoint, byte[], Task> onPacketReceived,
+        CancellationTokenSource cts,
+        ICollection<TransportSocket> configured)
+    {
+        try
+        {
+            var udp = _network.CreateBoundUdpClient(endpoint, port, reuseAddress: true);
+            ConfigureBuffers(udp);
+            var qos = VoiceQosSession.AttachBestEffort(udp.Client, _logger);
+            var receiveTask = ReceiveLoopAsync(udp, onPacketReceived, cts.Token);
+            configured.Add(new TransportSocket(
+                udp,
+                qos,
+                receiveTask,
+                endpoint.NetworkAddress,
+                endpoint.ProviderId));
+        }
+        catch (SocketException ex)
+        {
+            _logger.Warn($"Voice listener on {endpoint.NetworkAddress} is unavailable: {ex.Message}");
+        }
+    }
+
+    private void TryConfigureSocket(
+        IPAddress address,
+        int port,
+        Func<IPEndPoint, byte[], Task> onPacketReceived,
+        CancellationTokenSource cts,
+        ICollection<TransportSocket> configured)
+    {
+        try
+        {
+            var udp = new UdpClient(address.AddressFamily);
+            if (address.AddressFamily == AddressFamily.InterNetworkV6) udp.Client.DualMode = false;
+            udp.Client.Bind(new IPEndPoint(address, port));
+            ConfigureBuffers(udp);
+            var qos = VoiceQosSession.AttachBestEffort(udp.Client, _logger);
+            var receiveTask = ReceiveLoopAsync(udp, onPacketReceived, cts.Token);
+            configured.Add(new TransportSocket(udp, qos, receiveTask, address.ToString(), ""));
+        }
+        catch (SocketException ex)
+        {
+            _logger.Warn($"Voice listener on {address} is unavailable: {ex.Message}");
+        }
+    }
+
+    private static void ConfigureBuffers(UdpClient udp)
+    {
+        udp.Client.SendBufferSize = 512 * 1024;
+        udp.Client.ReceiveBufferSize = 512 * 1024;
     }
 
     private async Task ReceiveLoopAsync(
@@ -106,7 +161,13 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
         }
     }
 
-    public async Task SendAsync(IEnumerable<IPEndPoint> targets, byte[] payload, CancellationToken token)
+    public Task SendAsync(IEnumerable<IPEndPoint> targets, byte[] payload, CancellationToken token) =>
+        SendAsync(targets.Select(target => new VoiceRouteTarget(target, "")), payload, token);
+
+    public async Task SendAsync(
+        IEnumerable<VoiceRouteTarget> targets,
+        byte[] payload,
+        CancellationToken token)
     {
         TransportSocket[] sockets;
         lock (_gate) sockets = _sockets.ToArray();
@@ -114,13 +175,12 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
 
         foreach (var target in targets.Distinct())
         {
-            var transport = sockets.FirstOrDefault(socket =>
-                socket.Udp.Client.AddressFamily == target.AddressFamily);
+            var transport = SelectTransport(sockets, target);
             if (transport is null) continue;
             try
             {
-                transport.Qos.AddDestination(target);
-                await transport.Udp.SendAsync(payload, target, token).ConfigureAwait(false);
+                transport.Qos.AddDestination(target.EndPoint);
+                await transport.Udp.SendAsync(payload, target.EndPoint, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
@@ -128,9 +188,37 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
             }
             catch (Exception ex)
             {
-                WarnThrottled($"Voice send to {target.Address} failed: {ex.Message}");
+                WarnThrottled($"Voice send to {target.EndPoint.Address} failed: {ex.Message}");
             }
         }
+    }
+
+    private TransportSocket? SelectTransport(
+        IReadOnlyList<TransportSocket> sockets,
+        VoiceRouteTarget target)
+    {
+        var family = target.EndPoint.AddressFamily;
+        var familySockets = sockets
+            .Where(socket => socket.Udp.Client.AddressFamily == family)
+            .ToArray();
+        if (familySockets.Length == 0) return null;
+
+        if (!string.IsNullOrWhiteSpace(target.ProviderId))
+        {
+            var providerSocket = familySockets.FirstOrDefault(socket =>
+                string.Equals(socket.ProviderId, target.ProviderId, StringComparison.OrdinalIgnoreCase));
+            if (providerSocket is not null) return providerSocket;
+            return null;
+        }
+
+        var selected = _network.SelectLocalEndpoint(target.EndPoint.Address);
+        if (selected is not null)
+        {
+            var selectedSocket = familySockets.FirstOrDefault(socket =>
+                string.Equals(socket.LocalAddress, selected.NetworkAddress, StringComparison.OrdinalIgnoreCase));
+            if (selectedSocket is not null) return selectedSocket;
+        }
+        return familySockets.FirstOrDefault();
     }
 
     public async ValueTask StopAsync()
@@ -183,8 +271,17 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
         GC.SuppressFinalize(this);
     }
 
-    private sealed record TransportSocket(UdpClient Udp, VoiceQosSession Qos, Task ReceiveTask);
+    private sealed record TransportSocket(
+        UdpClient Udp,
+        VoiceQosSession Qos,
+        Task ReceiveTask,
+        string LocalAddress,
+        string ProviderId);
 }
+
+public sealed record VoiceRouteTarget(IPEndPoint EndPoint, string ProviderId);
+
+public sealed record VoicePeerCandidate(string PeerId, string Address, string ProviderId);
 
 public sealed class VoiceRuntimeOptions
 {

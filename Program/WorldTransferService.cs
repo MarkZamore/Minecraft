@@ -29,6 +29,7 @@ public sealed class WorldTransferService : IAsyncDisposable
     private readonly SkinService _skinService;
     private readonly LanRelayService _lanRelay;
     private readonly VoiceNetworkCoordinator _voiceNetwork;
+    private readonly VirtualNetworkService _network;
     private readonly WorldTransferRuntimeOptions _runtimeOptions;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly JsonSerializerOptions _indentedJsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
@@ -53,6 +54,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         SkinService skinService,
         LanRelayService lanRelay,
         VoiceNetworkCoordinator voiceNetwork,
+        VirtualNetworkService network,
         WorldTransferRuntimeOptions? runtimeOptions = null)
     {
         _paths = paths;
@@ -66,6 +68,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         _skinService = skinService;
         _lanRelay = lanRelay;
         _voiceNetwork = voiceNetwork;
+        _network = network;
         _runtimeOptions = runtimeOptions ?? new WorldTransferRuntimeOptions();
         _runtimeOptions.Validate();
         WorldTransferRecoveryService.Recover(paths, logger);
@@ -162,7 +165,8 @@ public sealed class WorldTransferService : IAsyncDisposable
                     _logger.Warn($"Pack hash mismatch ({peer.PackStatus}); world transfer is allowed by local settings.");
                 }
 
-                var peerAddress = await VerifyPeerTransferReadyAsync(peer, settings, token);
+                var peerEndpoint = await VerifyPeerTransferReadyAsync(peer, settings, token);
+                var peerAddress = IPAddress.Parse(peerEndpoint.Address);
 
                 var worldDir = ResolveWorldToSend(worldPath);
                 WorldAccessGuard.EnsureClosed(worldDir);
@@ -229,7 +233,9 @@ public sealed class WorldTransferService : IAsyncDisposable
                     };
 
                     StatusChanged?.Invoke("Sending world archive...");
-                    using var client = new TcpClient(peerAddress.AddressFamily);
+                    using var client = _network.CreateBoundTcpClient(
+                        peerAddress,
+                        peerEndpoint.ProviderId);
                     await client.ConnectAsync(peerAddress, _runtimeOptions.Port, token);
                     await using var stream = client.GetStream();
                     await WriteJsonAsync(stream, header, token);
@@ -618,28 +624,29 @@ public sealed class WorldTransferService : IAsyncDisposable
         return worldDir;
     }
 
-    private async Task<IPAddress> VerifyPeerTransferReadyAsync(PeerViewModel peer, AppSettings settings, CancellationToken token)
+    private async Task<PeerEndpointInfo> VerifyPeerTransferReadyAsync(
+        PeerViewModel peer,
+        AppSettings settings,
+        CancellationToken token)
     {
         var identity = _identityService.ResolveContext(settings);
-        var candidateAddresses = peer.GetCandidateAddresses()
-            .Select(value => IPAddress.TryParse(value, out var address) ? address : null)
-            .Where(address => address is not null)
-            .Cast<IPAddress>()
-            .Distinct()
+        var candidateEndpoints = peer.GetCandidateEndpoints()
+            .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
             .ToArray();
-        if (candidateAddresses.Length == 0)
+        if (candidateEndpoints.Length == 0)
         {
             throw new InvalidOperationException("Selected player does not have a valid network IP address.");
         }
 
         var failures = new List<string>();
-        foreach (var ip in candidateAddresses)
+        foreach (var endpoint in candidateEndpoints)
         {
+            var ip = IPAddress.Parse(endpoint.Address);
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
             timeoutCts.CancelAfter(TimeSpan.FromSeconds(4));
             try
             {
-                using var client = new TcpClient(ip.AddressFamily);
+                using var client = _network.CreateBoundTcpClient(ip, endpoint.ProviderId);
                 await client.ConnectAsync(ip, _runtimeOptions.Port, timeoutCts.Token);
                 await using var stream = client.GetStream();
                 await WriteJsonAsync(stream, new WorldTransferHeader
@@ -661,7 +668,7 @@ public sealed class WorldTransferService : IAsyncDisposable
                 {
                     throw new InvalidOperationException(ack?.Message ?? "receiver did not accept transfer probe");
                 }
-                return ip;
+                return endpoint;
             }
             catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException or TimeoutException or InvalidOperationException)
             {
@@ -671,7 +678,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         }
 
         throw new InvalidOperationException(
-            BuildPeerConnectionMessage(string.Join(", ", candidateAddresses.Select(address => address.ToString()))) +
+            BuildPeerConnectionMessage(string.Join(", ", candidateEndpoints.Select(endpoint => endpoint.Address))) +
             Environment.NewLine + string.Join(Environment.NewLine, failures.Take(3)));
     }
 
