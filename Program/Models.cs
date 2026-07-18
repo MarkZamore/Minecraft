@@ -28,7 +28,6 @@ public sealed class AppSettings
     public string NetworkName { get; set; } = "";
     public string NetworkPassword { get; set; } = "";
     public bool NetworkToolAutoLaunch { get; set; } = true;
-    public string NetworkToolId { get; set; } = "hamachi";
     public string SkinPath { get; set; } = "";
     public string SelectedWorldRelativePath { get; set; } = "";
     public string VoiceInputDeviceId { get; set; } = "";

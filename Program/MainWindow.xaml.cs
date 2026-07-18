@@ -2660,10 +2660,11 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (RequireNetworkToolSetup().Launch())
+            var setup = RequireNetworkToolSetup();
+            if (setup.Launch())
             {
                 await RequireNetwork().WaitForProviderAsync(
-                    RequireSettings().NetworkToolId,
+                    setup.ToolId,
                     TimeSpan.FromSeconds(5),
                     _lifetimeCts.Token);
             }
