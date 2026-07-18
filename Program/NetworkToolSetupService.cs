@@ -15,13 +15,15 @@ public sealed class NetworkToolSetupService
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly NetworkToolDescriptor _descriptor;
+    private readonly HttpClient _httpClient;
 
-    public NetworkToolSetupService(AppPaths paths, Logger logger)
+    public NetworkToolSetupService(AppPaths paths, Logger logger, HttpClient? httpClient = null)
     {
         _paths = paths;
         _logger = logger;
         _descriptor = LoadDescriptor();
         ValidateDescriptor(_descriptor);
+        _httpClient = httpClient ?? PortableHttpClient.Shared;
     }
 
     public string DisplayName => _descriptor.DisplayName;
@@ -48,53 +50,79 @@ public sealed class NetworkToolSetupService
 
     public async Task<string> DownloadInstallerAsync(IProgress<string>? progress, CancellationToken token)
     {
-        var installerUri = new Uri(_descriptor.InstallerUri, UriKind.Absolute);
-        ValidateDownloadUri(installerUri);
         Directory.CreateDirectory(_paths.Personal);
-
-        var installerPath = Path.Combine(_paths.Personal, Path.GetFileName(installerUri.LocalPath));
-        if (File.Exists(installerPath) && new FileInfo(installerPath).Length > 1024 * 1024)
+        var baseInstallerUri = new Uri(_descriptor.InstallerUri, UriKind.Absolute);
+        ValidateDownloadUri(baseInstallerUri);
+        var installerPath = Path.Combine(_paths.Personal, Path.GetFileName(baseInstallerUri.LocalPath));
+        if (File.Exists(installerPath))
         {
-            progress?.Report($"{DisplayName} installer already downloaded in Minecraft folder.");
-            return installerPath;
+            try
+            {
+                ValidateInstallerFile(installerPath);
+                progress?.Report($"{DisplayName} installer already downloaded in Minecraft folder.");
+                return installerPath;
+            }
+            catch (InvalidDataException ex)
+            {
+                _logger.Warn($"Cached network tool installer was rejected and will be replaced: {ex.Message}");
+                DeleteInstallerIfExists(installerPath);
+            }
         }
-
-        progress?.Report($"Downloading {DisplayName} to Minecraft folder...");
-        using var response = await PortableHttpClient.Shared.GetAsync(
-            installerUri,
-            HttpCompletionOption.ResponseHeadersRead,
-            token);
-        response.EnsureSuccessStatusCode();
-        ValidateDownloadUri(response.RequestMessage?.RequestUri ?? installerUri);
 
         var temporaryPath = installerPath + ".download";
-        if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
-        try
+        DeleteInstallerIfExists(temporaryPath);
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            await using var input = await response.Content.ReadAsStreamAsync(token);
-            await using (var output = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            var installerUri = attempt == 0
+                ? baseInstallerUri
+                : AppendCacheBust(baseInstallerUri);
+            try
             {
-                await input.CopyToAsync(output, token);
-                await output.FlushAsync(token);
-                output.Flush(flushToDisk: true);
-            }
+                progress?.Report($"Downloading {DisplayName} to Minecraft folder...");
+                using var response = await _httpClient.GetAsync(
+                    installerUri,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    token);
+                response.EnsureSuccessStatusCode();
+                ValidateDownloadUri(response.RequestMessage?.RequestUri ?? installerUri);
 
-            var length = new FileInfo(temporaryPath).Length;
-            if (length < 1024 * 1024)
+                await using var input = await response.Content.ReadAsStreamAsync(token);
+                await using (var output = new FileStream(
+                                 temporaryPath,
+                                 FileMode.CreateNew,
+                                 FileAccess.Write,
+                                 FileShare.None))
+                {
+                    await input.CopyToAsync(output, token);
+                    await output.FlushAsync(token);
+                    output.Flush(flushToDisk: true);
+                }
+
+                ValidateInstallerFile(temporaryPath);
+                File.Move(temporaryPath, installerPath, overwrite: true);
+
+                progress?.Report(
+                    $"{DisplayName} installer downloaded to Minecraft folder: {Path.GetFileName(installerPath)}");
+                _logger.Info(
+                    $"Network tool installer downloaded from approved host: {installerUri.Host}; " +
+                    $"path={installerPath}; bytes={_descriptor.InstallerSizeBytes}; " +
+                    $"sha256={_descriptor.InstallerSha256}");
+                return installerPath;
+            }
+            catch (InvalidDataException ex) when (attempt == 0)
             {
-                throw new InvalidOperationException($"Downloaded {DisplayName} installer is unexpectedly small.");
+                DeleteInstallerIfExists(temporaryPath);
+                _logger.Warn(
+                    $"Network tool installer validation failed; retrying without GitHub cache: {ex.Message}");
             }
-            File.Move(temporaryPath, installerPath, overwrite: true);
+            catch
+            {
+                DeleteInstallerIfExists(temporaryPath);
+                throw;
+            }
+        }
 
-            progress?.Report($"{DisplayName} installer downloaded to Minecraft folder: {Path.GetFileName(installerPath)}");
-            _logger.Info($"Network tool installer downloaded from approved host: {installerUri.Host}; path={installerPath}; bytes={length}");
-            return installerPath;
-        }
-        catch
-        {
-            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
-            throw;
-        }
+        throw new InvalidDataException($"{DisplayName} installer could not be verified after downloading it again.");
     }
 
     public async Task InstallAndCleanupAsync(string installerPath, IProgress<string>? progress, CancellationToken token)
@@ -122,7 +150,7 @@ public sealed class NetworkToolSetupService
             throw new FileNotFoundException($"{DisplayName} installer was not found.", installerPath);
         }
 
-        ValidateInstallerSignature(installerPath);
+        ValidateInstallerFile(installerPath);
         var isMsi = string.Equals(_descriptor.InstallerKind, "msi", StringComparison.OrdinalIgnoreCase);
         var process = Process.Start(new ProcessStartInfo
         {
@@ -166,11 +194,30 @@ public sealed class NetworkToolSetupService
         return new NetworkCredentials($"Minecraft-{cleanPlayer}-{suffix}", password);
     }
 
+    private void ValidateInstallerFile(string installerPath)
+    {
+        var file = new FileInfo(installerPath);
+        if (!file.Exists || file.Length != _descriptor.InstallerSizeBytes)
+        {
+            throw new InvalidDataException($"{DisplayName} installer size does not match the pinned version.");
+        }
+
+        using var stream = new FileStream(installerPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var actualHash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+        if (!actualHash.Equals(_descriptor.InstallerSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"{DisplayName} installer SHA-256 does not match the pinned version.");
+        }
+
+        ValidateInstallerSignature(installerPath);
+    }
+
     private void ValidateInstallerSignature(string installerPath)
     {
         var escapedPath = installerPath.Replace("'", "''", StringComparison.Ordinal);
         var command = "$s = Get-AuthenticodeSignature -LiteralPath '" + escapedPath +
-                      "'; Write-Output ($s.Status.ToString() + '|' + $s.SignerCertificate.Subject)";
+                      "'; Write-Output ($s.Status.ToString() + '|' + " +
+                      "$s.SignerCertificate.Subject + '|' + $s.SignerCertificate.Thumbprint)";
         var startInfo = new ProcessStartInfo
         {
             FileName = "powershell",
@@ -186,9 +233,12 @@ public sealed class NetworkToolSetupService
         var output = process.StandardOutput.ReadToEnd().Trim();
         var error = process.StandardError.ReadToEnd().Trim();
         process.WaitForExit();
+        var parts = output.Split('|', 3);
         if (process.ExitCode != 0 ||
-            !output.StartsWith("Valid|", StringComparison.OrdinalIgnoreCase) ||
-            !output.Contains(_descriptor.SignerSubjectContains, StringComparison.OrdinalIgnoreCase))
+            parts.Length != 3 ||
+            !parts[0].Equals("Valid", StringComparison.OrdinalIgnoreCase) ||
+            !parts[1].Contains(_descriptor.SignerSubjectContains, StringComparison.OrdinalIgnoreCase) ||
+            !parts[2].Equals(_descriptor.SignerThumbprint, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidDataException(
                 $"Network tool installer signature is not valid.{(string.IsNullOrWhiteSpace(error) ? string.Empty : " " + error)}");
@@ -246,6 +296,24 @@ public sealed class NetworkToolSetupService
         {
             throw new InvalidOperationException($"Blocked unapproved network tool download host: {uri.Host}");
         }
+    }
+
+    private static Uri AppendCacheBust(Uri uri)
+    {
+        var builder = new UriBuilder(uri);
+        var query = builder.Query.TrimStart('?');
+        var parameter = "cacheBust=" + Guid.NewGuid().ToString("N");
+        builder.Query = string.IsNullOrWhiteSpace(query) ? parameter : query + "&" + parameter;
+        return builder.Uri;
+    }
+
+    private static bool IsHex(string? value, int requiredLength)
+    {
+        return value?.Length == requiredLength &&
+               value.All(character =>
+                   character is >= '0' and <= '9' ||
+                   character is >= 'a' and <= 'f' ||
+                   character is >= 'A' and <= 'F');
     }
 
     private string? FindFromRegistry()
@@ -337,7 +405,10 @@ public sealed class NetworkToolSetupService
             uri.Scheme != Uri.UriSchemeHttps ||
             descriptor.AllowedDownloadHosts.Count == 0 ||
             !descriptor.AllowedDownloadHosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase) ||
+            descriptor.InstallerSizeBytes < 1024 * 1024 ||
+            !IsHex(descriptor.InstallerSha256, 64) ||
             string.IsNullOrWhiteSpace(descriptor.SignerSubjectContains) ||
+            !IsHex(descriptor.SignerThumbprint, 40) ||
             descriptor.RegistryDisplayNameContains.Count == 0 ||
             descriptor.InstallDirectoryNames.Count == 0 ||
             descriptor.ExecutableNames.Count == 0)
@@ -353,7 +424,10 @@ public sealed class NetworkToolDescriptor
     public string DisplayName { get; set; } = "";
     public string InstallerUri { get; set; } = "";
     public List<string> AllowedDownloadHosts { get; set; } = [];
+    public long InstallerSizeBytes { get; set; }
+    public string InstallerSha256 { get; set; } = "";
     public string SignerSubjectContains { get; set; } = "";
+    public string SignerThumbprint { get; set; } = "";
     public List<string> RegistryDisplayNameContains { get; set; } = [];
     public List<string> InstallDirectoryNames { get; set; } = [];
     public List<string> ExecutableNames { get; set; } = [];

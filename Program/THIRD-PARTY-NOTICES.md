@@ -14,3 +14,12 @@ Source and license: https://github.com/Faithlife/bsdiff.net
 `SharpZipLib` is used transitively by `BsDiff` and distributed under the MIT License.
 
 Source and license: https://github.com/icsharpcode/SharpZipLib
+
+## Hamachi
+
+The unmodified Hamachi 2.4.0.23 Windows installer is a proprietary third-party
+product published and digitally signed by GoTo Technologies USA, LLC. It is
+stored in this repository solely as an installation convenience and is not
+part of the Minecraft Portable source code or MIT-licensed application.
+
+Product and support information: https://support.goto.com/hamachi

@@ -1,11 +1,14 @@
 {
   "id": "hamachi",
   "displayName": "Hamachi",
-  "installerUri": "https://secure.logmein.com/hamachi.msi",
+  "installerUri": "https://raw.githubusercontent.com/MarkZamore/Minecraft/main/Program/Installers/Hamachi.msi",
   "allowedDownloadHosts": [
-    "secure.logmein.com"
+    "raw.githubusercontent.com"
   ],
+  "installerSizeBytes": 14528512,
+  "installerSha256": "d429afe52323c2b856c0ce1b9feb69176ca17a1b4ce9e2e37c5b618307839715",
   "signerSubjectContains": "GoTo Technologies USA, LLC",
+  "signerThumbprint": "8D3FA6EEEBFC68A0FA76CDC4C6AD5982FE07DE91",
   "registryDisplayNameContains": [
     "Hamachi",
     "LogMeIn"
