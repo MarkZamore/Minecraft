@@ -11,6 +11,8 @@ public sealed class LanAdvertisementService : IAsyncDisposable
     private static readonly TimeSpan AdvertisementInterval = TimeSpan.FromMilliseconds(1500);
     private readonly Logger _logger;
     private readonly LanRelayService _relay;
+    private readonly VirtualNetworkService _network;
+    private readonly PeerRouteResolver _routes;
     private readonly object _stateGate = new();
     private readonly Dictionary<string, UdpClient> _senders = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? _cts;
@@ -18,10 +20,16 @@ public sealed class LanAdvertisementService : IAsyncDisposable
     private LanAdvertisementSnapshot _snapshot = LanAdvertisementSnapshot.Empty;
     private DateTimeOffset _lastWarningAt = DateTimeOffset.MinValue;
 
-    public LanAdvertisementService(Logger logger, LanRelayService relay)
+    public LanAdvertisementService(
+        Logger logger,
+        LanRelayService relay,
+        VirtualNetworkService network,
+        PeerRouteResolver routes)
     {
         _logger = logger;
         _relay = relay;
+        _network = network;
+        _routes = routes;
     }
 
     public void Start()
@@ -33,6 +41,7 @@ public sealed class LanAdvertisementService : IAsyncDisposable
 
     public void Update(
         int? localPort,
+        string localSessionId,
         string motd,
         IEnumerable<NetworkEndpointInfo> endpoints,
         IEnumerable<PeerViewModel> peers)
@@ -44,26 +53,21 @@ public sealed class LanAdvertisementService : IAsyncDisposable
                 !string.IsNullOrWhiteSpace(endpoint.ProviderId))?.ProviderId;
         var peerSnapshots = peers.Select(peer =>
         {
-            var peerEndpoints = peer.GetCandidateEndpoints(
-                    preferredProviderId: preferredProviderId)
-                .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
-                .GroupBy(endpoint =>
-                    $"{endpoint.ProviderId}|{endpoint.InterfaceId}|{endpoint.Address}",
-                    StringComparer.OrdinalIgnoreCase)
-                .Select(group => group.First())
-                .ToArray();
+            var peerEndpoints = _routes.GetSendCandidates(peer.IdentityId, preferredProviderId);
             return new RemoteLanPeer(
                 peer.IdentityId,
                 peer.PlayerName,
                 peer.IsHost,
                 peer.ServerPort,
+                peer.LanSessionId,
                 peerEndpoints);
         }).ToArray();
-        _relay.SetHostPort(localPort);
+        _relay.SetHostSession(localPort, localSessionId);
         lock (_stateGate)
         {
             _snapshot = new LanAdvertisementSnapshot(
                 localPort is > 0 and <= 65535 ? localPort : null,
+                localSessionId?.Trim() ?? "",
                 SanitizeMotd(motd),
                 endpointSnapshots,
                 peerSnapshots);
@@ -93,33 +97,38 @@ public sealed class LanAdvertisementService : IAsyncDisposable
         if (snapshot.LocalPort is not null)
         {
             var payload = BuildPayload(snapshot.Motd, snapshot.LocalPort.Value);
-            var ipv4Targets = snapshot.Peers
-                .SelectMany(peer => peer.Endpoints)
-                .Where(endpoint =>
-                    string.IsNullOrWhiteSpace(endpoint.ProviderId) &&
-                    !string.Equals(endpoint.NetworkType, "VPN", StringComparison.OrdinalIgnoreCase))
-                .Select(endpoint => ParseAddress(endpoint.Address))
-                .Where(address => address?.AddressFamily == AddressFamily.InterNetwork)
-                .Cast<IPAddress>()
-                .Distinct()
-                .ToArray();
-            foreach (var target in ipv4Targets)
+            foreach (var peer in snapshot.Peers)
             {
-                foreach (var endpoint in snapshot.Endpoints.Where(endpoint =>
-                             endpoint.AddressFamily == AddressFamily.InterNetwork && RouteUsesEndpoint(target, endpoint)))
+                var sent = false;
+                foreach (var candidate in peer.Endpoints.Where(endpoint =>
+                             ParseAddress(endpoint.Address)?.AddressFamily == AddressFamily.InterNetwork))
                 {
-                    if (!IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress)) continue;
+                    if (!IPAddress.TryParse(candidate.Address, out var target)) continue;
+                    var endpoint = _network.SelectLocalEndpoint(target, candidate.ProviderId);
+                    if (endpoint is null ||
+                        endpoint.AddressFamily != AddressFamily.InterNetwork ||
+                        !IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress))
+                    {
+                        continue;
+                    }
                     try
                     {
                         await GetOrCreateSender(localAddress).SendAsync(
                             payload,
                             new IPEndPoint(target, MinecraftLanDiscoveryPort),
                             token).ConfigureAwait(false);
+                        sent = true;
+                        break;
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException || !token.IsCancellationRequested)
                     {
                         WarnThrottled($"Minecraft LAN announcement to {target} failed: {ex.Message}");
                     }
+                }
+                if (!sent && peer.Endpoints.Any(endpoint =>
+                        ParseAddress(endpoint.Address)?.AddressFamily == AddressFamily.InterNetwork))
+                {
+                    WarnThrottled($"Minecraft LAN announcement has no valid IPv4 route to {peer.PlayerName}.");
                 }
             }
         }
@@ -131,24 +140,15 @@ public sealed class LanAdvertisementService : IAsyncDisposable
                 .Where(endpoint => ParseAddress(endpoint.Address) is not null)
                 .ToArray();
             if (endpoints.Length == 0) continue;
-            var hasDirectPhysicalRoute = endpoints.Any(endpoint =>
-                string.IsNullOrWhiteSpace(endpoint.ProviderId) &&
-                !string.Equals(endpoint.NetworkType, "VPN", StringComparison.OrdinalIgnoreCase) &&
-                ParseAddress(endpoint.Address) is { } address &&
-                snapshot.Endpoints.Any(local =>
-                    local.IsPhysical &&
-                    local.AddressFamily == address.AddressFamily &&
-                    VirtualNetworkService.IsInSameNetwork(address, local)));
-            var requiresRelay = !hasDirectPhysicalRoute &&
-                (endpoints.Any(endpoint =>
-                    !string.IsNullOrWhiteSpace(endpoint.ProviderId) ||
-                    string.Equals(endpoint.NetworkType, "VPN", StringComparison.OrdinalIgnoreCase)) ||
-                 endpoints.All(endpoint =>
-                     ParseAddress(endpoint.Address)?.AddressFamily != AddressFamily.InterNetwork));
-            if (!requiresRelay) continue;
+            if (endpoints.Any(endpoint =>
+                    ParseAddress(endpoint.Address)?.AddressFamily == AddressFamily.InterNetwork)) continue;
             try
             {
-                var relay = _relay.GetOrCreateClientRelay(peer.IdentityId, endpoints, peer.ServerPort);
+                var relay = _relay.GetOrCreateClientRelay(
+                    peer.IdentityId,
+                    peer.LanSessionId,
+                    endpoints,
+                    peer.ServerPort);
                 retainedRelays.Add(relay.Key);
                 var payload = BuildPayload(SanitizeMotd(peer.PlayerName), relay.LocalPort);
                 var sender = GetOrCreateSender(IPAddress.Loopback);
@@ -177,23 +177,6 @@ public sealed class LanAdvertisementService : IAsyncDisposable
             }
             _senders[key] = sender;
             return sender;
-        }
-    }
-
-    private static bool RouteUsesEndpoint(IPAddress target, NetworkEndpointInfo endpoint)
-    {
-        if (target.AddressFamily != endpoint.AddressFamily ||
-            !IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress)) return false;
-        if (VirtualNetworkService.IsInSameNetwork(target, endpoint)) return true;
-        try
-        {
-            using var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-            socket.Connect(new IPEndPoint(target, MinecraftLanDiscoveryPort));
-            return socket.LocalEndPoint is IPEndPoint local && local.Address.Equals(localAddress);
-        }
-        catch (SocketException)
-        {
-            return false;
         }
     }
 
@@ -248,14 +231,16 @@ public sealed class LanAdvertisementService : IAsyncDisposable
         string PlayerName,
         bool IsHost,
         int ServerPort,
-        IReadOnlyList<PeerEndpointInfo> Endpoints);
+        string LanSessionId,
+        IReadOnlyList<PeerCandidateEndpoint> Endpoints);
 
     private sealed record LanAdvertisementSnapshot(
         int? LocalPort,
+        string LocalSessionId,
         string Motd,
         IReadOnlyList<NetworkEndpointInfo> Endpoints,
         IReadOnlyList<RemoteLanPeer> Peers)
     {
-        public static LanAdvertisementSnapshot Empty { get; } = new(null, "Minecraft LAN", [], []);
+        public static LanAdvertisementSnapshot Empty { get; } = new(null, "", "Minecraft LAN", [], []);
     }
 }

@@ -110,6 +110,34 @@ public sealed class PeerAdvertisedEndpoint
     public string NetworkType { get; set; } = "Unknown";
 }
 
+public sealed class KnownPeerCache
+{
+    public int SchemaVersion { get; set; } = 3;
+    public List<KnownPeerIdentityRecord> Peers { get; set; } = [];
+}
+
+public sealed class KnownPeerIdentityRecord
+{
+    public string IdentityId { get; set; } = "";
+    public string PlayerName { get; set; } = "";
+    public List<KnownPeerEndpointRecord> Endpoints { get; set; } = [];
+}
+
+public sealed class KnownPeerEndpointRecord
+{
+    public string Address { get; set; } = "";
+    public string Ip { get; set; } = "";
+    public string ProviderId { get; set; } = "";
+    public string InterfaceId { get; set; } = "";
+    public string NetworkType { get; set; } = "Unknown";
+    public DateTimeOffset LastSeenUtc { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset LastSuccessUtc { get; set; }
+    public bool IsObserved { get; set; }
+    public bool IsConfirmed { get; set; }
+    public int FailureScore { get; set; }
+    public long Revision { get; set; }
+}
+
 public sealed class PeerAnnouncement
 {
     public string App { get; set; } = "MinecraftPortable";
@@ -128,6 +156,7 @@ public sealed class PeerAnnouncement
     public bool IsHost { get; set; }
     public string PackHash { get; set; } = "";
     public int ServerPort { get; set; }
+    public string LanSessionId { get; set; } = "";
     public string State { get; set; } = "";
     public bool IsVoiceChannelActive { get; set; }
     public bool IsVoiceMuted { get; set; }
@@ -161,6 +190,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private bool _isHost;
     private string _packHash = "";
     private int _serverPort;
+    private string _lanSessionId = "";
     private bool _isInVoiceChannel;
     private bool _isSpeaking;
     private bool _isVoiceMuted;
@@ -348,6 +378,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
             }
         }
     }
+    public string LanSessionId { get => _lanSessionId; set => Set(ref _lanSessionId, value ?? ""); }
     public string State { get => _state; set => Set(ref _state, value); }
     public DateTimeOffset LastSeen { get => _lastSeen; set { if (Set(ref _lastSeen, value)) OnPropertyChanged(nameof(LastSeenText)); } }
     public string LocalPackHash { get => _localPackHash; set { if (Set(ref _localPackHash, value)) OnPropertyChanged(nameof(PackStatus)); } }
@@ -464,6 +495,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         WaypointProtocolVersion = announcement.WaypointProtocolVersion;
         WaypointProviders = announcement.WaypointProviders?.ToArray() ?? Array.Empty<WaypointProviderAnnouncement>();
         PackHash = announcement.PackHash;
+        LanSessionId = announcement.LanSessionId;
         State = announcement.State;
         LocalPackHash = localPackHash;
         var now = DateTimeOffset.Now;

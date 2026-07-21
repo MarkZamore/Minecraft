@@ -12,38 +12,54 @@ public sealed class LanRelayService : IAsyncDisposable
     public const int ProtocolVersion = 1;
     private readonly Logger _logger;
     private readonly VirtualNetworkService _network;
+    private readonly PeerRouteResolver _routes;
     private readonly ConcurrentDictionary<string, ClientRelay> _clientRelays = new(StringComparer.OrdinalIgnoreCase);
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private int _hostPort;
+    private string _hostSessionId = "";
 
-    public LanRelayService(Logger logger, VirtualNetworkService network)
+    public LanRelayService(Logger logger, VirtualNetworkService network, PeerRouteResolver routes)
     {
         _logger = logger;
         _network = network;
+        _routes = routes;
     }
 
-    public void SetHostPort(int? port) =>
+    public void SetHostSession(int? port, string? sessionId)
+    {
         Volatile.Write(ref _hostPort, port is > 0 and <= 65535 ? port.Value : 0);
+        Volatile.Write(ref _hostSessionId, sessionId?.Trim() ?? "");
+    }
 
     public ClientLanRelayInfo GetOrCreateClientRelay(
         string peerId,
-        IReadOnlyList<PeerEndpointInfo> endpoints,
+        string lanSessionId,
+        IReadOnlyList<PeerCandidateEndpoint> endpoints,
         int remoteLanPort)
     {
         if (remoteLanPort is <= 0 or > 65535) throw new ArgumentOutOfRangeException(nameof(remoteLanPort));
         var targets = endpoints
             .Select(endpoint => IPAddress.TryParse(endpoint.Address, out var address)
-                ? new LanRelayTarget(address, endpoint.ProviderId)
+                ? new LanRelayTarget(address, endpoint.ProviderId, endpoint.InterfaceId)
                 : null)
             .Where(target => target is not null)
             .Cast<LanRelayTarget>()
             .Distinct()
             .ToArray();
         if (targets.Length == 0) throw new ArgumentException("LAN relay has no valid peer endpoint.", nameof(endpoints));
-        var key = BuildKey(peerId, targets, remoteLanPort);
+        var key = BuildKey(peerId, lanSessionId, remoteLanPort);
         var relay = _clientRelays.GetOrAdd(
             key,
-            _ => new ClientRelay(targets, remoteLanPort, _logger, _jsonOptions, _network));
+            _ => new ClientRelay(
+                peerId,
+                targets,
+                remoteLanPort,
+                lanSessionId,
+                _logger,
+                _jsonOptions,
+                _network,
+                _routes));
+        relay.UpdateTargets(targets, remoteLanPort, lanSessionId);
         return new ClientLanRelayInfo(key, relay.LocalPort);
     }
 
@@ -60,8 +76,11 @@ public sealed class LanRelayService : IAsyncDisposable
     {
         var request = PortableProtocol.Deserialize<LanRelayRequest>(initialFrame, _jsonOptions);
         var hostPort = Volatile.Read(ref _hostPort);
+        var hostSessionId = Volatile.Read(ref _hostSessionId);
         if (request is null || request.Protocol != ProtocolName || request.ProtocolVersion != ProtocolVersion ||
-            request.ServerPort is <= 0 or > 65535 || request.ServerPort != hostPort)
+            request.ServerPort is <= 0 or > 65535 || request.ServerPort != hostPort ||
+            (!string.IsNullOrWhiteSpace(request.LanSessionId) &&
+             !string.Equals(request.LanSessionId, hostSessionId, StringComparison.Ordinal)))
         {
             await PortableProtocol.WriteJsonAsync(stream, new LanRelayReply
             {
@@ -109,12 +128,9 @@ public sealed class LanRelayService : IAsyncDisposable
 
     private static string BuildKey(
         string peerId,
-        IReadOnlyList<LanRelayTarget> targets,
+        string lanSessionId,
         int port) =>
-        $"{peerId}|{port}|" + string.Join(",", targets
-            .OrderBy(target => target.Address.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
-            .ThenBy(target => target.Address.ToString(), StringComparer.OrdinalIgnoreCase)
-            .Select(target => $"{target.ProviderId}@{target.Address}"));
+        $"{peerId.Trim()}|{(string.IsNullOrWhiteSpace(lanSessionId) ? $"legacy-port-{port}" : lanSessionId.Trim())}";
 
     private static async Task RelayBidirectionalAsync(Stream first, Stream second, CancellationToken token)
     {
@@ -137,27 +153,37 @@ public sealed class LanRelayService : IAsyncDisposable
 
     private sealed class ClientRelay : IAsyncDisposable
     {
-        private readonly IReadOnlyList<LanRelayTarget> _targets;
-        private readonly int _remoteLanPort;
+        private readonly string _peerId;
+        private readonly object _targetGate = new();
+        private IReadOnlyList<LanRelayTarget> _targets;
+        private int _remoteLanPort;
+        private string _lanSessionId;
         private readonly Logger _logger;
         private readonly JsonSerializerOptions _jsonOptions;
         private readonly VirtualNetworkService _network;
+        private readonly PeerRouteResolver _routes;
         private readonly TcpListener _listener;
         private readonly CancellationTokenSource _cts = new();
         private readonly Task _acceptTask;
 
         public ClientRelay(
+            string peerId,
             IReadOnlyList<LanRelayTarget> targets,
             int remoteLanPort,
+            string lanSessionId,
             Logger logger,
             JsonSerializerOptions jsonOptions,
-            VirtualNetworkService network)
+            VirtualNetworkService network,
+            PeerRouteResolver routes)
         {
+            _peerId = peerId;
             _targets = targets;
             _remoteLanPort = remoteLanPort;
+            _lanSessionId = lanSessionId;
             _logger = logger;
             _jsonOptions = jsonOptions;
             _network = network;
+            _routes = routes;
             _listener = new TcpListener(IPAddress.Loopback, 0);
             _listener.Start();
             LocalPort = ((IPEndPoint)_listener.LocalEndpoint).Port;
@@ -165,6 +191,19 @@ public sealed class LanRelayService : IAsyncDisposable
         }
 
         public int LocalPort { get; }
+
+        public void UpdateTargets(
+            IReadOnlyList<LanRelayTarget> targets,
+            int remoteLanPort,
+            string lanSessionId)
+        {
+            lock (_targetGate)
+            {
+                _targets = targets.ToArray();
+                _remoteLanPort = remoteLanPort;
+                _lanSessionId = lanSessionId?.Trim() ?? "";
+            }
+        }
 
         private async Task AcceptLoopAsync(CancellationToken token)
         {
@@ -192,7 +231,17 @@ public sealed class LanRelayService : IAsyncDisposable
             using (localClient)
             {
                 var failures = new List<string>();
-                foreach (var target in _targets)
+                IReadOnlyList<LanRelayTarget> targets;
+                int remoteLanPort;
+                string lanSessionId;
+                lock (_targetGate)
+                {
+                    targets = _targets.ToArray();
+                    remoteLanPort = _remoteLanPort;
+                    lanSessionId = _lanSessionId;
+                }
+
+                foreach (var target in targets)
                 {
                     try
                     {
@@ -206,7 +255,8 @@ public sealed class LanRelayService : IAsyncDisposable
                         await using var remoteStream = remoteClient.GetStream();
                         await PortableProtocol.WriteJsonAsync(remoteStream, new LanRelayRequest
                         {
-                            ServerPort = _remoteLanPort
+                            ServerPort = remoteLanPort,
+                            LanSessionId = lanSessionId
                         }, _jsonOptions, connectCts.Token).ConfigureAwait(false);
                         var replyFrame = await PortableProtocol.ReadFrameAsync(
                             remoteStream,
@@ -217,6 +267,7 @@ public sealed class LanRelayService : IAsyncDisposable
                         {
                             throw new IOException(reply?.Message ?? "Remote LAN relay was rejected.");
                         }
+                        _routes.MarkEndpointHealthy(_peerId, target.ToCandidate());
                         await RelayBidirectionalAsync(
                             localClient.GetStream(),
                             remoteStream,
@@ -226,6 +277,7 @@ public sealed class LanRelayService : IAsyncDisposable
                     catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException)
                     {
                         if (token.IsCancellationRequested) return;
+                        _routes.MarkEndpointUnhealthy(_peerId, target.ToCandidate());
                         failures.Add($"{target.Address}: {ex.Message}");
                     }
                 }
@@ -253,6 +305,7 @@ public sealed class LanRelayService : IAsyncDisposable
         public string Protocol { get; set; } = ProtocolName;
         public int ProtocolVersion { get; set; } = LanRelayService.ProtocolVersion;
         public int ServerPort { get; set; }
+        public string LanSessionId { get; set; } = "";
     }
 
     private sealed class LanRelayReply
@@ -266,4 +319,13 @@ public sealed class LanRelayService : IAsyncDisposable
 
 public sealed record ClientLanRelayInfo(string Key, int LocalPort);
 
-internal sealed record LanRelayTarget(IPAddress Address, string ProviderId);
+internal sealed record LanRelayTarget(IPAddress Address, string ProviderId, string InterfaceId)
+{
+    public PeerCandidateEndpoint ToCandidate() => new()
+    {
+        Address = Address.ToString(),
+        ProviderId = ProviderId,
+        InterfaceId = InterfaceId,
+        AddressFamily = Address.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4"
+    };
+}

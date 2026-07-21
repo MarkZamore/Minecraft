@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Collections.Concurrent;
 using CmlLib.Core;
@@ -23,11 +26,37 @@ public sealed class MinecraftProcessService
     private readonly MinecraftWindowPlacementService _gameWindowPlacement;
     private readonly ConcurrentDictionary<int, byte> _activeClientProcesses = new();
     private int _clientPreparing;
+    private int _tcpOwnershipWarningLogged;
 
     public bool IsClientRunning => !_activeClientProcesses.IsEmpty;
     public bool IsClientPreparing => Volatile.Read(ref _clientPreparing) != 0;
     public event Action<bool>? ClientRunningChanged;
     public event Action<bool>? ClientPreparingChanged;
+
+    public bool OwnsTcpListener(int port)
+    {
+        if (port is <= 0 or > 65535 || _activeClientProcesses.IsEmpty) return false;
+        var processIds = _activeClientProcesses.Keys.ToHashSet();
+        if (!OperatingSystem.IsWindows())
+        {
+            return IPGlobalProperties.GetIPGlobalProperties()
+                .GetActiveTcpListeners()
+                .Any(listener => listener.Port == port);
+        }
+
+        try
+        {
+            return IsTcp4ListenerOwnedBy(port, processIds);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ExternalException)
+        {
+            if (Interlocked.Exchange(ref _tcpOwnershipWarningLogged, 1) == 0)
+            {
+                _logger.Warn($"Could not verify Minecraft LAN listener ownership: {ex.Message}");
+            }
+            return false;
+        }
+    }
 
     public MinecraftProcessService(
         AppPaths paths,
@@ -260,6 +289,86 @@ public sealed class MinecraftProcessService
     {
         if (Directory.Exists(path) && !Directory.EnumerateFileSystemEntries(path).Any()) Directory.Delete(path);
     }
+
+    private static bool IsTcp4ListenerOwnedBy(int port, HashSet<int> processIds)
+    {
+        var size = 0;
+        var status = GetExtendedTcpTable(
+            IntPtr.Zero,
+            ref size,
+            order: false,
+            AddressFamilyInterNetwork,
+            TcpTableClass.OwnerPidListener,
+            0);
+        if (status is not (ErrorInsufficientBuffer or ErrorSuccess) || size <= sizeof(int))
+        {
+            throw new InvalidOperationException($"GetExtendedTcpTable sizing failed with status {status}.");
+        }
+
+        var table = Marshal.AllocHGlobal(size);
+        try
+        {
+            status = GetExtendedTcpTable(
+                table,
+                ref size,
+                order: false,
+                AddressFamilyInterNetwork,
+                TcpTableClass.OwnerPidListener,
+                0);
+            if (status != ErrorSuccess)
+            {
+                throw new InvalidOperationException($"GetExtendedTcpTable failed with status {status}.");
+            }
+
+            var count = Marshal.ReadInt32(table);
+            var rowSize = Marshal.SizeOf<MibTcpRowOwnerPid>();
+            var rowAddress = IntPtr.Add(table, sizeof(int));
+            for (var index = 0; index < count; index++)
+            {
+                var row = Marshal.PtrToStructure<MibTcpRowOwnerPid>(rowAddress);
+                var listenerPort = unchecked((ushort)IPAddress.NetworkToHostOrder((short)row.LocalPort));
+                if (listenerPort == port && processIds.Contains(unchecked((int)row.OwningProcessId)))
+                {
+                    return true;
+                }
+                rowAddress = IntPtr.Add(rowAddress, rowSize);
+            }
+            return false;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(table);
+        }
+    }
+
+    private const uint ErrorSuccess = 0;
+    private const uint ErrorInsufficientBuffer = 122;
+    private const int AddressFamilyInterNetwork = 2;
+
+    private enum TcpTableClass
+    {
+        OwnerPidListener = 3
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct MibTcpRowOwnerPid
+    {
+        public readonly uint State;
+        public readonly uint LocalAddress;
+        public readonly uint LocalPort;
+        public readonly uint RemoteAddress;
+        public readonly uint RemotePort;
+        public readonly uint OwningProcessId;
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(
+        IntPtr tcpTable,
+        ref int size,
+        [MarshalAs(UnmanagedType.Bool)] bool order,
+        int addressFamily,
+        TcpTableClass tableClass,
+        uint reserved);
 
     private void NotifyClientRunningChanged(bool isRunning)
     {

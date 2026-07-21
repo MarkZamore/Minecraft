@@ -30,6 +30,7 @@ public sealed class WorldTransferService : IAsyncDisposable
     private readonly LanRelayService _lanRelay;
     private readonly VoiceNetworkCoordinator _voiceNetwork;
     private readonly VirtualNetworkService _network;
+    private readonly PeerRouteResolver _routes;
     private readonly WorldTransferRuntimeOptions _runtimeOptions;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly JsonSerializerOptions _indentedJsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
@@ -55,6 +56,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         LanRelayService lanRelay,
         VoiceNetworkCoordinator voiceNetwork,
         VirtualNetworkService network,
+        PeerRouteResolver routes,
         WorldTransferRuntimeOptions? runtimeOptions = null)
     {
         _paths = paths;
@@ -69,6 +71,7 @@ public sealed class WorldTransferService : IAsyncDisposable
         _lanRelay = lanRelay;
         _voiceNetwork = voiceNetwork;
         _network = network;
+        _routes = routes;
         _runtimeOptions = runtimeOptions ?? new WorldTransferRuntimeOptions();
         _runtimeOptions.Validate();
         WorldTransferRecoveryService.Recover(paths, logger);
@@ -624,15 +627,29 @@ public sealed class WorldTransferService : IAsyncDisposable
         return worldDir;
     }
 
-    private async Task<PeerEndpointInfo> VerifyPeerTransferReadyAsync(
+    private async Task<PeerCandidateEndpoint> VerifyPeerTransferReadyAsync(
         PeerViewModel peer,
         AppSettings settings,
         CancellationToken token)
     {
         var identity = _identityService.ResolveContext(settings);
-        var candidateEndpoints = peer.GetCandidateEndpoints()
+        var candidateEndpoints = _routes.GetSendCandidates(peer.IdentityId, _network.SelectedProviderId)
             .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
             .ToArray();
+        if (candidateEndpoints.Length == 0)
+        {
+            candidateEndpoints = peer.GetCandidateEndpoints(preferredProviderId: _network.SelectedProviderId)
+                .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
+                .Select(endpoint => new PeerCandidateEndpoint
+                {
+                    Address = endpoint.Address,
+                    ProviderId = endpoint.ProviderId,
+                    InterfaceId = endpoint.InterfaceId,
+                    AddressFamily = endpoint.AddressFamily,
+                    NetworkType = endpoint.NetworkType
+                })
+                .ToArray();
+        }
         if (candidateEndpoints.Length == 0)
         {
             throw new InvalidOperationException("Selected player does not have a valid network IP address.");
@@ -668,11 +685,13 @@ public sealed class WorldTransferService : IAsyncDisposable
                 {
                     throw new InvalidOperationException(ack?.Message ?? "receiver did not accept transfer probe");
                 }
+                _routes.MarkEndpointHealthy(peer.IdentityId, endpoint);
                 return endpoint;
             }
             catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException or TimeoutException or InvalidOperationException)
             {
                 token.ThrowIfCancellationRequested();
+                _routes.MarkEndpointUnhealthy(peer.IdentityId, endpoint);
                 failures.Add($"{ip}: {ex.Message}");
             }
         }

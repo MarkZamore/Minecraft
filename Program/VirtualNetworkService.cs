@@ -95,8 +95,7 @@ public sealed class VirtualNetworkService
         string selectedProviderId;
         lock (_sessionGate) selectedProviderId = _selectedProviderId;
         var endpoints = EnumerateEndpoints(selectedProviderId)
-            .Where(endpoint =>
-                endpoint.IsPhysical ||
+            .Where(endpoint => endpoint.IsPhysical ||
                 (!string.IsNullOrWhiteSpace(selectedProviderId) &&
                  string.Equals(endpoint.ProviderId, selectedProviderId, StringComparison.OrdinalIgnoreCase)))
             .ToList();
@@ -140,29 +139,31 @@ public sealed class VirtualNetworkService
                     providerId,
                     StringComparison.OrdinalIgnoreCase))
                 .OrderByDescending(endpoint => IsInSameNetwork(remoteAddress, endpoint))
+                .ThenByDescending(endpoint => RouteUsesEndpoint(remoteAddress, endpoint))
                 .ThenByDescending(endpoint => endpoint.IsPreferredNetwork)
                 .ThenBy(endpoint => endpoint.SortPriority)
                 .FirstOrDefault();
-            if (providerEndpoint is not null) return providerEndpoint;
+            if (providerEndpoint is not null &&
+                (IsInSameNetwork(remoteAddress, providerEndpoint) || RouteUsesEndpoint(remoteAddress, providerEndpoint)))
+            {
+                return providerEndpoint;
+            }
         }
 
-        var matchingNetwork = candidates
+        var sameNetwork = candidates
             .Where(endpoint => IsInSameNetwork(remoteAddress, endpoint))
+            .Where(endpoint => string.IsNullOrWhiteSpace(providerId) || endpoint.IsPhysical)
             .OrderByDescending(endpoint => endpoint.IsPreferredNetwork)
             .ThenBy(endpoint => endpoint.SortPriority)
             .FirstOrDefault();
-        if (matchingNetwork is not null) return matchingNetwork;
+        if (sameNetwork is not null) return sameNetwork;
 
-        if (string.IsNullOrWhiteSpace(providerId))
-        {
-            return candidates
-                .Where(endpoint => endpoint.IsPhysical)
-                .OrderByDescending(endpoint => endpoint.HasDefaultRoute)
-                .ThenBy(endpoint => endpoint.SortPriority)
-                .FirstOrDefault();
-        }
-
-        return null;
+        return candidates
+            .Where(endpoint => string.IsNullOrWhiteSpace(providerId) || endpoint.IsPhysical)
+            .Where(endpoint => RouteUsesEndpoint(remoteAddress, endpoint))
+            .OrderByDescending(endpoint => endpoint.IsPreferredNetwork)
+            .ThenBy(endpoint => endpoint.SortPriority)
+            .FirstOrDefault();
     }
 
     public TcpClient CreateBoundTcpClient(
@@ -339,6 +340,25 @@ public sealed class VirtualNetworkService
             return false;
         }
         return PrefixMatches(address, adapterAddress, endpoint.PrefixLength);
+    }
+
+    private static bool RouteUsesEndpoint(IPAddress target, NetworkEndpointInfo endpoint)
+    {
+        if (target.AddressFamily != endpoint.AddressFamily ||
+            !IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress))
+        {
+            return false;
+        }
+        try
+        {
+            using var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect(new IPEndPoint(target, 9));
+            return socket.LocalEndPoint is IPEndPoint local && local.Address.Equals(localAddress);
+        }
+        catch (SocketException)
+        {
+            return false;
+        }
     }
 
     public static IReadOnlyList<IPAddress> EnumerateProbeAddresses(NetworkEndpointInfo endpoint, int maxSubnetSize)

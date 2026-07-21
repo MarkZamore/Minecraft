@@ -19,7 +19,7 @@ namespace Minecraft;
 public partial class MainWindow : Window
 {
     private const int MinMemoryGb = MemorySizingService.MinMemoryGb;
-    private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(35);
     private static readonly TimeSpan SecretLoadingDuration = TimeSpan.FromMinutes(10);
     private const int HostReachabilityAttempts = 3;
     // EB59 is a half-size badge glyph; this maps its ink bounds onto EA18's full shield bounds.
@@ -46,6 +46,7 @@ public partial class MainWindow : Window
     private SettingsService? _settingsService;
     private Logger? _logger;
     private VirtualNetworkService? _network;
+    private PeerRouteResolver? _peerRoutes;
     private NetworkToolSetupService? _networkToolSetup;
     private PackHashService? _packHash;
     private WorldMetadataService? _worldMetadata;
@@ -72,6 +73,7 @@ public partial class MainWindow : Window
     private string _localPackHash = "";
     private string _state = "Starting";
     private int? _openToLanPort;
+    private string _openToLanSessionId = "";
     private long _openToLanLogPosition;
     private int? _cachedOpenToLanPort;
     private bool _networkToolInstalled;
@@ -147,6 +149,7 @@ public partial class MainWindow : Window
             _logger = new Logger(_paths.LogFile);
             _logger.LineWritten += line => Dispatcher.Invoke(() => AppendLog(line));
             _network = new VirtualNetworkService(_logger);
+            _peerRoutes = new PeerRouteResolver();
             _networkToolSetup = new NetworkToolSetupService(_paths, _logger);
             NetworkChange.NetworkAddressChanged += NetworkAddressChanged;
             _networkChangeSubscribed = true;
@@ -162,14 +165,14 @@ public partial class MainWindow : Window
                 _paths,
                 _logger,
                 networkCoordinator: _voiceNetwork);
-            _waypointSync = new WaypointSyncService(_paths, _logger, _worldMetadata, _network);
-            _skinService = new SkinService(_paths, _logger, _network);
+            _waypointSync = new WaypointSyncService(_paths, _logger, _worldMetadata, _network, _peerRoutes);
+            _skinService = new SkinService(_paths, _logger, _network, _peerRoutes);
             await _skinService.StartAsync(_lifetimeCts.Token);
-            _lanRelay = new LanRelayService(_logger, _network);
+            _lanRelay = new LanRelayService(_logger, _network, _peerRoutes);
             _minecraft = new MinecraftProcessService(_paths, _logger, _identityService, _identityAdapter, _worldPlayerProfiles, _packInstances, _packRuntimes, _waypointSync, _skinService);
             _minecraft.ClientRunningChanged += OnMinecraftClientRunningChanged;
             _minecraft.ClientPreparingChanged += OnMinecraftClientPreparingChanged;
-            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _lanRelay, _voiceNetwork, _network);
+            _transfer = new WorldTransferService(_paths, _logger, _minecraft, _settingsService, _worldMetadata, _identityService, _worldPlayerProfiles, _waypointSync, _skinService, _lanRelay, _voiceNetwork, _network, _peerRoutes);
             _updateService = new UpdateService(
                 _paths,
                 _logger,
@@ -185,11 +188,15 @@ public partial class MainWindow : Window
                 RefreshWorlds();
                 RefreshUi();
             });
-            _discovery = new PeerDiscoveryService(_paths, _logger, _network);
+            _discovery = new PeerDiscoveryService(_paths, _logger, _network, _peerRoutes);
             _discovery.PeerUpdated += announcement => Dispatcher.Invoke(() => ApplyPeer(announcement));
-            _lanAdvertisement = new LanAdvertisementService(_logger, _lanRelay);
+            _lanAdvertisement = new LanAdvertisementService(_logger, _lanRelay, _network, _peerRoutes);
             _lanAdvertisement.Start();
-            _voiceChannel = new VoiceChannelService(_logger, _voiceNetwork, network: _network);
+            _voiceChannel = new VoiceChannelService(
+                _logger,
+                _voiceNetwork,
+                network: _network,
+                routes: _peerRoutes);
             _voiceChannel.Initialize(_settings);
             _voiceChannel.SpeakingStateChanged += OnVoiceSpeakingStateChanged;
             _voiceChannel.PeerPresenceChanged += OnVoicePeerPresenceChanged;
@@ -830,7 +837,8 @@ public partial class MainWindow : Window
 
     private void RefreshHostPeers()
     {
-        var selectedIp = (HostComboBox.SelectedItem as PeerViewModel)?.NetworkAddress;
+        var selectedPeerId = GetSelectablePeerId(HostComboBox.SelectedItem as PeerViewModel);
+        var selectedCandidates = GetSelectedPeerAddresses(HostComboBox.SelectedItem as PeerViewModel);
         var hosts = _peers
             .Where(peer => peer.IsHost)
             .OrderByDescending(peer => peer.LastSeen)
@@ -850,7 +858,8 @@ public partial class MainWindow : Window
         }
         else
         {
-            var restored = _hostPeers.FirstOrDefault(host => string.Equals(host.NetworkAddress, selectedIp, StringComparison.OrdinalIgnoreCase));
+            var restored = FindMatchingPeer(_hostPeers, selectedPeerId, selectedCandidates)
+                ?? _hostPeers.FirstOrDefault();
             HostComboBox.SelectedItem = restored ?? _hostPeers[0];
         }
 
@@ -930,7 +939,7 @@ public partial class MainWindow : Window
                 : string.Compare(
                     left?.PlayerName,
                     right?.PlayerName,
-                    StringComparison.CurrentCultureIgnoreCase);
+                    StringComparison.OrdinalIgnoreCase);
         });
 
         if (_voiceChannel is { IsJoined: true })
@@ -950,7 +959,7 @@ public partial class MainWindow : Window
         {
             _localVoicePeer = null;
         }
-        var signature = string.Join("|", peers.Select(peer => $"{ResolveVoicePeerId(peer)}@{peer.NetworkAddress}"));
+        var signature = string.Join("|", peers.Select(GetVoicePeerSignature));
         var shouldRefreshList =
             !string.Equals(signature, _lastVoicePeerListSignature, StringComparison.Ordinal) ||
             _voicePeers.Count != peers.Count ||
@@ -990,7 +999,11 @@ public partial class MainWindow : Window
         var peers = _voicePresence
             .Where(pair => pair.Value.LastSeenUtc >= DateTimeOffset.UtcNow - TimeSpan.FromSeconds(30))
             .SelectMany(pair => pair.Value.Endpoints.Select(endpoint =>
-                new VoicePeerCandidate(pair.Key, endpoint.Address, endpoint.ProviderId)))
+                new VoicePeerCandidate(
+                    pair.Key,
+                    endpoint.Address,
+                    endpoint.ProviderId,
+                    endpoint.InterfaceId)))
             .Where(peer => !string.IsNullOrWhiteSpace(peer.PeerId))
             .Distinct()
             .ToArray();
@@ -999,7 +1012,11 @@ public partial class MainWindow : Window
                 peer.IsInVoiceChannel &&
                 DateTimeOffset.UtcNow - peer.LastSeen < TimeSpan.FromSeconds(30))
             .SelectMany(peer => GetVoiceFallbackEndpoints(peer).Select(endpoint =>
-                new VoicePeerCandidate(ResolveVoicePeerId(peer), endpoint.Address, endpoint.ProviderId)))
+                new VoicePeerCandidate(
+                    ResolveVoicePeerId(peer),
+                    endpoint.Address,
+                    endpoint.ProviderId,
+                    endpoint.InterfaceId)))
             .Where(peer => !string.IsNullOrWhiteSpace(peer.PeerId) && !string.IsNullOrWhiteSpace(peer.Address))
             .ToArray();
         peers = peers.Concat(discoveredVoicePeers)
@@ -1032,8 +1049,111 @@ public partial class MainWindow : Window
         return peer.NetworkAddress;
     }
 
-    private IReadOnlyList<PeerEndpointInfo> GetVoiceFallbackEndpoints(PeerViewModel peer)
+    private string GetVoicePeerSignature(PeerViewModel peer)
     {
+        var peerId = ResolveVoicePeerId(peer);
+        var addresses = (_peerRoutes?.GetSendCandidates(peer.IdentityId, _primaryEndpoint?.ProviderId) ?? [])
+            .Where(endpoint => !string.IsNullOrWhiteSpace(endpoint.Address))
+            .Select(endpoint => $"{endpoint.Address}|{endpoint.ProviderId}")
+            .Where(address => !string.IsNullOrWhiteSpace(address))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(address => address, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (addresses.Length == 0)
+        {
+            addresses = peer.NetworkAddress.Length > 0
+                ? [peer.NetworkAddress]
+                : Array.Empty<string>();
+        }
+
+        return $"{peerId}=>{string.Join(",", addresses)}";
+    }
+
+    private static string GetSelectablePeerId(PeerViewModel? peer)
+    {
+        if (peer is null)
+        {
+            return "";
+        }
+
+        if (!string.IsNullOrWhiteSpace(peer.IdentityId))
+        {
+            return peer.IdentityId;
+        }
+
+        return peer.NetworkAddress;
+    }
+
+    private static string[] GetSelectedPeerAddresses(PeerViewModel? peer)
+    {
+        if (peer is null)
+        {
+            return Array.Empty<string>();
+        }
+
+        return peer.GetCandidateAddresses()
+            .Where(address => !string.IsNullOrWhiteSpace(address))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static PeerViewModel? FindMatchingPeer(
+        ObservableCollection<PeerViewModel> peers,
+        string selectedPeerId,
+        string[]? selectedAddresses = null,
+        bool requireHost = false)
+    {
+        if (peers.Count == 0)
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(selectedPeerId))
+        {
+            var byIdentity = peers.FirstOrDefault(peer =>
+                string.Equals(peer.IdentityId, selectedPeerId, StringComparison.OrdinalIgnoreCase));
+            if (byIdentity is not null)
+            {
+                return byIdentity;
+            }
+        }
+
+        if (selectedAddresses is null || selectedAddresses.Length == 0)
+        {
+            return null;
+        }
+
+        var selectedSet = new HashSet<string>(selectedAddresses, StringComparer.OrdinalIgnoreCase);
+        var byCandidates = peers.FirstOrDefault(peer =>
+            peer.GetCandidateAddresses(requireHost).Any(address => selectedSet.Contains(address)));
+        if (byCandidates is not null)
+        {
+            return byCandidates;
+        }
+
+        return peers.FirstOrDefault(peer =>
+            !string.IsNullOrWhiteSpace(peer.NetworkAddress) &&
+            selectedSet.Contains(peer.NetworkAddress));
+    }
+
+    private PeerEndpointInfo[] GetVoiceFallbackEndpoints(PeerViewModel peer)
+    {
+        var resolved = _peerRoutes?
+            .GetSendCandidates(peer.IdentityId, _primaryEndpoint?.ProviderId)
+            .Where(endpoint => TryParsePeerAddress(endpoint.Address, out _))
+            .Select(endpoint => new PeerEndpointInfo
+            {
+                Address = endpoint.Address,
+                ProviderId = endpoint.ProviderId,
+                InterfaceId = endpoint.InterfaceId,
+                AddressFamily = endpoint.AddressFamily,
+                NetworkType = endpoint.NetworkType,
+                LastSeen = endpoint.LastSeenUtc,
+                IsHost = peer.IsHost
+            })
+            .ToArray() ?? Array.Empty<PeerEndpointInfo>();
+        if (resolved.Length > 0) return resolved;
+
         var endpoints = peer.GetCandidateEndpoints(preferredProviderId: _primaryEndpoint?.ProviderId)
             .Where(endpoint => TryParsePeerAddress(endpoint.Address, out _))
             .ToArray();
@@ -1046,27 +1166,19 @@ public partial class MainWindow : Window
             .FirstOrDefault(endpoint => TryParsePeerAddress(endpoint.Address, out _));
         if (networkEndpoint is not null)
         {
-            return [networkEndpoint];
-        }
-
-        if (!TryParsePeerAddress(peer.NetworkAddress, out var address))
-        {
-            return Array.Empty<PeerEndpointInfo>();
-        }
-
-        var preferredProviderId = _primaryEndpoint?.ProviderId ?? string.Empty;
-        var preferredInterfaceId = _primaryEndpoint?.InterfaceId ?? string.Empty;
-        return
-        [
-            new PeerEndpointInfo
+            return [new PeerEndpointInfo
             {
-                Address = address.ToString(),
-                ProviderId = preferredProviderId,
-                InterfaceId = preferredInterfaceId,
-                AddressFamily = address.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
-                LastSeen = peer.LastSeen
-            }
-        ];
+                Address = networkEndpoint.Address,
+                ProviderId = networkEndpoint.ProviderId,
+                InterfaceId = networkEndpoint.InterfaceId,
+                AddressFamily = networkEndpoint.AddressFamily,
+                NetworkType = networkEndpoint.NetworkType,
+                LastSeen = peer.LastSeen,
+                IsHost = networkEndpoint.IsHost,
+            }];
+        }
+
+        return Array.Empty<PeerEndpointInfo>();
     }
 
     private static bool TryParsePeerAddress(string? value, out IPAddress address)
@@ -1198,8 +1310,8 @@ public partial class MainWindow : Window
         var skin = RequireSkinService().GetAnnouncement(settings, identity.id);
         var advertisedEndpoints = _networkEndpoints
             .Where(candidate =>
-                string.Equals(candidate.ProviderId, endpoint.ProviderId, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(candidate.InterfaceId, endpoint.InterfaceId, StringComparison.OrdinalIgnoreCase))
+                string.Equals(candidate.InterfaceId, endpoint.InterfaceId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(candidate.ProviderId, endpoint.ProviderId, StringComparison.OrdinalIgnoreCase))
             .Select(candidate => new PeerAdvertisedEndpoint
             {
                 Address = candidate.NetworkAddress,
@@ -1208,6 +1320,8 @@ public partial class MainWindow : Window
                 AddressFamily = candidate.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
                 NetworkType = VirtualNetworkService.DetectNetworkType(candidate)
             })
+            .DistinctBy(item => string.Join("|", item.Address, item.ProviderId, item.InterfaceId, item.AddressFamily),
+                StringComparer.OrdinalIgnoreCase)
             .ToList();
         return new PeerAnnouncement
         {
@@ -1224,6 +1338,7 @@ public partial class MainWindow : Window
             IsHost = openToLanPort.HasValue,
             PackHash = _localPackHash,
             ServerPort = openToLanPort ?? 0,
+            LanSessionId = _openToLanSessionId,
             State = openToLanPort.HasValue ? "LAN open" : "Minecraft",
             IsVoiceChannelActive = _voiceChannel?.IsJoined == true,
             IsVoiceMuted = _voiceChannel?.IsMuted == true,
@@ -1335,12 +1450,15 @@ public partial class MainWindow : Window
 
         RequireWaypointSync().ObservePeer(announcement);
 
-        var peer = !string.IsNullOrWhiteSpace(announcement.IdentityId)
-            ? _peers.FirstOrDefault(item =>
-                string.Equals(item.IdentityId, announcement.IdentityId, StringComparison.OrdinalIgnoreCase))
-            : _peers.FirstOrDefault(item =>
-                item.NetworkEndpoints.Any(endpoint =>
-                    string.Equals(endpoint.Address, announcement.NetworkAddress, StringComparison.OrdinalIgnoreCase)));
+        var announcementAddresses = (announcement.NetworkEndpoints ?? [])
+            .Select(endpoint => endpoint.Address)
+            .Where(address => !string.IsNullOrWhiteSpace(address))
+            .Concat(string.IsNullOrWhiteSpace(announcement.NetworkAddress)
+                ? Array.Empty<string>()
+                : [announcement.NetworkAddress])
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var peer = FindMatchingPeer(_peers, announcement.IdentityId, announcementAddresses);
         if (peer is null)
         {
             peer = new PeerViewModel();
@@ -1379,7 +1497,8 @@ public partial class MainWindow : Window
     private void PruneStalePeers()
     {
         var cutoff = DateTimeOffset.Now - PeerTtl;
-        var selectedIp = (OnlinePlayerComboBox.SelectedItem as PeerViewModel)?.NetworkAddress;
+        var selectedPeerId = GetSelectablePeerId(OnlinePlayerComboBox.SelectedItem as PeerViewModel);
+        var selectedCandidates = GetSelectedPeerAddresses(OnlinePlayerComboBox.SelectedItem as PeerViewModel);
         for (var index = _peers.Count - 1; index >= 0; index--)
         {
             if (!_peers[index].PruneEndpoints(cutoff))
@@ -1388,10 +1507,9 @@ public partial class MainWindow : Window
             }
         }
 
-        if (!string.IsNullOrWhiteSpace(selectedIp))
+        if (!string.IsNullOrWhiteSpace(selectedPeerId) || selectedCandidates.Length > 0)
         {
-            OnlinePlayerComboBox.SelectedItem = _peers.FirstOrDefault(peer =>
-                string.Equals(peer.NetworkAddress, selectedIp, StringComparison.OrdinalIgnoreCase));
+            OnlinePlayerComboBox.SelectedItem = FindMatchingPeer(_peers, selectedPeerId, selectedCandidates);
         }
 
         if (OnlinePlayerComboBox.SelectedItem is null && _peers.Count > 0)
@@ -1411,6 +1529,7 @@ public partial class MainWindow : Window
         var identity = ResolveActiveLocalIdentity();
         _lanAdvertisement.Update(
             _openToLanPort,
+            _openToLanSessionId,
             string.IsNullOrWhiteSpace(identity.name) ? "Minecraft LAN" : identity.name,
             _networkEndpoints,
             _peers);
@@ -1422,7 +1541,6 @@ public partial class MainWindow : Window
 
         var hostPeers = _peers
             .Where(peer => peer.IsHost && peer.ServerPort > 0)
-            .Where(peer => !string.IsNullOrWhiteSpace(peer.NetworkAddress))
             .ToList();
         if (hostPeers.Count == 0) return;
 
@@ -1436,21 +1554,24 @@ public partial class MainWindow : Window
         {
             var probes = hostPeers.Select(async peer =>
             {
-                var peerIp = peer.NetworkAddress;
                 var peerPort = Math.Clamp(peer.ServerPort, 1, 65535);
-                var result = await CheckHostReachabilityAsync(peerIp, peerPort, attempts: 1, timeout: TimeSpan.FromMilliseconds(600));
+                var result = await ProbeHostEndpointAsync(peer, peerPort, attempts: 1, timeout: TimeSpan.FromMilliseconds(600));
 
                 await Dispatcher.InvokeAsync(() =>
                 {
                     var current = _peers.FirstOrDefault(item =>
                         item.IsHost &&
-                        item.ServerPort == peer.ServerPort &&
-                        string.Equals(item.NetworkAddress, peerIp, StringComparison.OrdinalIgnoreCase));
+                        item.ServerPort == peerPort &&
+                        (
+                            !string.IsNullOrWhiteSpace(peer.IdentityId)
+                                ? string.Equals(item.IdentityId, peer.IdentityId, StringComparison.OrdinalIgnoreCase)
+                                : string.Equals(item.NetworkAddress, peer.NetworkAddress, StringComparison.OrdinalIgnoreCase)));
                     if (current is null) return;
 
-                    current.LastRttMs = result.IsReachable ? result.RoundTripMs : null;
-                    if (result.IsReachable)
+                    current.LastRttMs = result.Reachability.IsReachable ? result.Reachability.RoundTripMs : null;
+                    if (result.Reachability.IsReachable)
                     {
+                        current.NetworkAddress = result.Address;
                         current.LastRttAt = DateTimeOffset.Now;
                     }
                     else if (current.LastRttAt == default)
@@ -1475,22 +1596,37 @@ public partial class MainWindow : Window
 
         if (_openToLanPort == port) return;
 
+        var previousPort = _openToLanPort;
         _openToLanPort = port;
         if (port.HasValue)
         {
-            RequireLogger().Info($"Minecraft Open to LAN detected on port {port.Value}.");
+            if (!previousPort.HasValue || previousPort.Value != port.Value)
+            {
+                _openToLanSessionId = Guid.NewGuid().ToString("N");
+            }
+            RequireLogger().Info(
+                $"Minecraft Open to LAN session {_openToLanSessionId} detected on port {port.Value}.");
             SetState($"LAN open: {port.Value}");
         }
-        else if (_state.StartsWith("LAN open:", StringComparison.OrdinalIgnoreCase))
+        else
         {
-            SetState("Minecraft");
-            RequireLogger().Info("Minecraft Open to LAN is no longer detected.");
+            _openToLanSessionId = "";
+            if (_state.StartsWith("LAN open:", StringComparison.OrdinalIgnoreCase))
+            {
+                SetState("Minecraft");
+                RequireLogger().Info("Minecraft Open to LAN is no longer detected.");
+            }
         }
     }
 
     private int? TryDetectOpenToLanPort()
     {
         if (_paths is null || _settings is null) return null;
+        if (!_minecraftRunning)
+        {
+            _cachedOpenToLanPort = null;
+            return null;
+        }
 
         var logPath = Path.Combine(_paths.CombineUnderInstances(_settings.ClientRelativePath), "logs", "latest.log");
         if (!File.Exists(logPath)) return null;
@@ -1537,9 +1673,9 @@ public partial class MainWindow : Window
         }
 
         var activePort = cachedPort.Value;
-        if (!IsTcpPortListening(activePort))
+        if (_minecraft?.OwnsTcpListener(activePort) != true)
         {
-            RequireLogger().Info($"Detected stale LAN port {activePort}; no active TCP listener found.");
+            RequireLogger().Info($"Detected stale LAN port {activePort}; the active Minecraft process does not own it.");
             _cachedOpenToLanPort = null;
             _openToLanPort = null;
             return null;
@@ -1586,16 +1722,10 @@ public partial class MainWindow : Window
         return false;
     }
 
-    private static bool IsTcpPortListening(int port)
-    {
-        var listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
-        return listeners.Any(listener => listener.Port == port);
-    }
-
     [GeneratedRegex("\\b\\d{2,5}\\b", RegexOptions.IgnoreCase)]
     private static partial Regex OpenToLanPortNumberRegex();
 
-    [GeneratedRegex("Stopping (?:singleplayer )?server|Saving and pausing game|disconnect", RegexOptions.IgnoreCase)]
+    [GeneratedRegex("Stopping (?:singleplayer )?server", RegexOptions.IgnoreCase)]
     private static partial Regex LanClosedRegex();
 
     private void OnMinecraftClientRunningChanged(bool isRunning)
@@ -1750,38 +1880,77 @@ public partial class MainWindow : Window
             return null;
         }
 
-        if (!IPAddress.TryParse(peer.NetworkAddress, out var peerIp))
+        var selectedHostPort = Math.Clamp(peer.ServerPort, 1, 65535);
+        var probe = await ProbeHostEndpointAsync(
+            peer,
+            selectedHostPort,
+            HostReachabilityAttempts,
+            HostReachabilityTimeout);
+        if (!probe.IsReachable)
         {
-            SetState($"Invalid host IP: {peer.NetworkAddress}");
+            SetState($"Host {peer.PlayerName} is not reachable. {probe.Reachability.FailureReason}");
             return null;
         }
 
-        if (IPAddress.IsLoopback(peerIp))
-        {
-            SetState("Selected host resolves to local loopback.");
-            return null;
-        }
-
-        var host = (Ip: peer.NetworkAddress, Port: Math.Clamp(peer.ServerPort, 1, 65535));
-        var reachability = await CheckHostReachabilityAsync(host.Ip, host.Port, HostReachabilityAttempts, HostReachabilityTimeout);
-        if (!reachability.IsReachable)
-        {
-            SetState($"Host {host.Ip}:{host.Port} is not reachable. {reachability.FailureReason}");
-            return null;
-        }
-
-        peer.LastRttMs = reachability.RoundTripMs;
+        peer.LastRttMs = probe.Reachability.RoundTripMs;
         peer.LastRttAt = DateTimeOffset.Now;
-        return host;
+        peer.NetworkAddress = probe.Address;
+        return (probe.Address, selectedHostPort);
     }
 
-    private static async Task<HostReachabilityResult> CheckHostReachabilityAsync(string host, int port, int attempts, TimeSpan timeout)
+    private sealed record HostEndpointProbeResult(
+        bool IsReachable,
+        HostReachabilityResult Reachability,
+        string Address);
+
+    private async Task<HostEndpointProbeResult> ProbeHostEndpointAsync(
+        PeerViewModel peer,
+        int port,
+        int attempts,
+        TimeSpan timeout)
     {
-        if (string.IsNullOrWhiteSpace(host) || port is <= 0 or > 65535)
+        var candidateEndpoints = (_peerRoutes?.GetSendCandidates(
+                peer.IdentityId,
+                _primaryEndpoint?.ProviderId) ?? [])
+            .Where(endpoint => !string.IsNullOrWhiteSpace(endpoint.Address))
+            .ToArray();
+        foreach (var endpoint in candidateEndpoints)
         {
-            return HostReachabilityResult.Failed("Invalid host endpoint.");
+            if (!IPAddress.TryParse(endpoint.Address, out var address))
+            {
+                continue;
+            }
+
+            if (IPAddress.IsLoopback(address))
+            {
+                continue;
+            }
+
+            var effectivePort = Math.Clamp(port, 1, 65535);
+            var reachability = await CheckHostReachabilityAsync(
+                address,
+                endpoint.ProviderId,
+                effectivePort,
+                attempts,
+                timeout);
+            if (reachability.IsReachable)
+            {
+                _peerRoutes?.MarkEndpointHealthy(peer.IdentityId, endpoint);
+                return new HostEndpointProbeResult(true, reachability, endpoint.Address);
+            }
+            _peerRoutes?.MarkEndpointUnhealthy(peer.IdentityId, endpoint);
         }
 
+        return new HostEndpointProbeResult(false, HostReachabilityResult.Failed("No reachable host endpoint."), string.Empty);
+    }
+
+    private async Task<HostReachabilityResult> CheckHostReachabilityAsync(
+        IPAddress address,
+        string providerId,
+        int port,
+        int attempts,
+        TimeSpan timeout)
+    {
         Exception? lastError = null;
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
@@ -1789,31 +1958,18 @@ public partial class MainWindow : Window
             var stopwatch = Stopwatch.StartNew();
             try
             {
-                if (!IPAddress.TryParse(host, out var address))
-                {
-                    throw new SocketException((int)SocketError.HostNotFound);
-                }
-                using var tcpClient = new TcpClient(address.AddressFamily);
-                await tcpClient.ConnectAsync(address, port, cts.Token);
+                using var client = RequireNetwork().CreateBoundTcpClient(address, providerId);
+                await client.ConnectAsync(address, port, cts.Token);
                 return HostReachabilityResult.Succeeded(stopwatch.ElapsedMilliseconds);
             }
             catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException or TimeoutException)
             {
                 lastError = ex;
-                if (attempt < attempts)
-                {
-                    await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(300, 120 * attempt)), CancellationToken.None);
-                }
+                if (attempt < attempts) await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(300, 120 * attempt)));
             }
         }
 
-        var reason = lastError?.Message ?? "Connection attempt failed.";
-        if (reason.Length > 140)
-        {
-            reason = reason[..140];
-        }
-
-        return HostReachabilityResult.Failed(reason);
+        return HostReachabilityResult.Failed(lastError?.Message ?? "Connection attempt failed.");
     }
 
     private sealed class HostReachabilityResult

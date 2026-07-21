@@ -20,6 +20,7 @@ public sealed class SkinService : IAsyncDisposable
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly VirtualNetworkService _network;
+    private readonly PeerRouteResolver _routes;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly ConcurrentDictionary<string, SkinAsset> _assets = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SkinPeerDescriptor> _peers = new(StringComparer.OrdinalIgnoreCase);
@@ -31,11 +32,16 @@ public sealed class SkinService : IAsyncDisposable
     private string _localUuid = "";
     private string _localSourceState = "";
 
-    public SkinService(AppPaths paths, Logger logger, VirtualNetworkService network)
+    public SkinService(
+        AppPaths paths,
+        Logger logger,
+        VirtualNetworkService network,
+        PeerRouteResolver routes)
     {
         _paths = paths;
         _logger = logger;
         _network = network;
+        _routes = routes;
         MigrateLegacyRegistry();
     }
 
@@ -150,8 +156,11 @@ public sealed class SkinService : IAsyncDisposable
             uuid,
             peer.SkinSha256.ToUpperInvariant(),
             NormalizeModel(peer.SkinModel),
-            peer.GetCandidateEndpoints()
-                .Select(endpoint => new SkinPeerEndpoint(endpoint.Address, endpoint.ProviderId))
+            _routes.GetSendCandidates(peer.IdentityId, _network.SelectedProviderId)
+                .Select(endpoint => new SkinPeerEndpoint(
+                    endpoint.Address,
+                    endpoint.ProviderId,
+                    endpoint.InterfaceId))
                 .ToArray());
         var metadataChanged = !_peers.TryGetValue(uuid, out var previousDescriptor) ||
                               previousDescriptor.Sha256 != descriptor.Sha256 ||
@@ -261,12 +270,14 @@ public sealed class SkinService : IAsyncDisposable
                         "",
                         bytes.LongLength,
                         0);
+                    _routes.MarkEndpointHealthy(descriptor.PlayerUuid, endpoint.ToCandidate());
                     WriteRegistry();
                     return;
                 }
                 catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or InvalidDataException)
                 {
                     if (token.IsCancellationRequested) return;
+                    _routes.MarkEndpointUnhealthy(descriptor.PlayerUuid, endpoint.ToCandidate());
                     _logger.Warn($"Peer skin request from {endpoint} failed: {ex.Message}");
                 }
             }
@@ -570,7 +581,19 @@ public sealed class SkinService : IAsyncDisposable
         long SizeBytes,
         long LastWriteUtcTicks);
 
-    private sealed record SkinPeerEndpoint(string Address, string ProviderId);
+    private sealed record SkinPeerEndpoint(string Address, string ProviderId, string InterfaceId)
+    {
+        public PeerCandidateEndpoint ToCandidate() => new()
+        {
+            Address = Address,
+            ProviderId = ProviderId,
+            InterfaceId = InterfaceId,
+            AddressFamily = IPAddress.TryParse(Address, out var parsed) &&
+                            parsed.AddressFamily == AddressFamily.InterNetworkV6
+                ? "IPv6"
+                : "IPv4"
+        };
+    }
     private sealed record SkinPeerDescriptor(
         string PlayerUuid,
         string Sha256,

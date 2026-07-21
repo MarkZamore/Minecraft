@@ -10,21 +10,21 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
 {
     public const int ProtocolVersion = 4;
     private const int DiscoveryPort = 35655;
-    private const int MaxKnownPeers = 64;
     private const int MaxFullSubnetProbeSize = 512;
+    private const int KnownPeerBatchSize = 64;
+    private const int SioUdpConnectionReset = -1744830452;
     private static readonly IPAddress IPv6MulticastGroup = IPAddress.Parse("ff12::4d43:5054");
     private static readonly TimeSpan BaseSendInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MaxSendInterval = TimeSpan.FromSeconds(4);
-    private static readonly TimeSpan KnownPeerTtl = TimeSpan.FromDays(30);
 
     private readonly AppPaths _paths;
     private readonly Logger _logger;
     private readonly VirtualNetworkService _network;
+    private readonly PeerRouteResolver _routes;
     private readonly NetworkNeighborService _neighborService = new();
     private readonly List<SenderEntry> _senders = [];
     private readonly List<UdpClient> _listeners = [];
     private readonly HashSet<string> _localAdvertisedAddresses = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, KnownPeerRecord> _knownPeers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, IReadOnlyList<IPAddress>> _neighborTargets = [];
     private readonly Dictionary<string, DateTimeOffset> _lastDirectedReplies = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _peerGate = new();
@@ -42,11 +42,16 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
     private NetworkEnvironmentSnapshot _snapshot = new();
     private IReadOnlyList<IPAddress> _dynamicTargets = Array.Empty<IPAddress>();
 
-    public PeerDiscoveryService(AppPaths paths, Logger logger, VirtualNetworkService network)
+    public PeerDiscoveryService(
+        AppPaths paths,
+        Logger logger,
+        VirtualNetworkService network,
+        PeerRouteResolver routes)
     {
         _paths = paths;
         _logger = logger;
         _network = network;
+        _routes = routes;
     }
 
     public event Action<PeerAnnouncement>? PeerUpdated;
@@ -72,6 +77,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
                 try
                 {
                     var sender = _network.CreateBoundUdpClient(endpoint, 0, reuseAddress: false);
+                    DisableUdpConnectionReset(sender.Client);
                     if (localAddress.AddressFamily == AddressFamily.InterNetwork)
                     {
                         sender.EnableBroadcast = true;
@@ -133,6 +139,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             try
             {
                 var listener = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
+                DisableUdpConnectionReset(listener.Client);
                 listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                 listener.Client.Bind(new IPEndPoint(IPAddress.Any, DiscoveryPort));
                 _listeners.Add(listener);
@@ -153,6 +160,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         try
         {
             var ipv6Listener = new UdpClient(AddressFamily.InterNetworkV6);
+            DisableUdpConnectionReset(ipv6Listener.Client);
             ipv6Listener.Client.DualMode = false;
             ipv6Listener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             ipv6Listener.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, DiscoveryPort));
@@ -286,6 +294,10 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             {
                 break;
             }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+            {
+                continue;
+            }
             catch (Exception ex)
             {
                 _logger.Warn($"Peer discovery receive failed: {ex.Message}");
@@ -362,42 +374,76 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
     {
         var targets = new List<DiscoveryTarget>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var target in entry.Targets)
+        foreach (var target in entry.Targets.Where(target => !target.IsProbe))
         {
-            if (!target.IsProbe || includeProbes) Add(target.Endpoint, target.IsProbe);
+            Add(target.Endpoint, false);
         }
 
-        KnownPeerRecord[] known;
+        if (includeProbes)
+        {
+            var probes = entry.Targets.Where(target => target.IsProbe).ToArray();
+            var count = Math.Min(16, probes.Length);
+            for (var index = 0; index < count; index++)
+            {
+                Add(probes[(entry.ProbeCursor + index) % probes.Length].Endpoint, true);
+            }
+            if (probes.Length > 0) entry.ProbeCursor = (entry.ProbeCursor + count) % probes.Length;
+        }
+
+        KnownPeerTarget[] known;
         IReadOnlyList<IPAddress> neighbors;
         lock (_peerGate)
         {
-            known = _knownPeers.Values.ToArray();
+            known = _routes.Export().Peers
+                .SelectMany(peer => peer.Endpoints.Select(endpoint => new KnownPeerTarget(
+                    peer.IdentityId,
+                    string.IsNullOrWhiteSpace(endpoint.Address) ? endpoint.Ip : endpoint.Address,
+                    endpoint.ProviderId,
+                    endpoint.LastSeenUtc)))
+                .ToArray();
             neighbors = _neighborTargets.TryGetValue(entry.Endpoint.InterfaceIndex, out var values)
                 ? values
                 : Array.Empty<IPAddress>();
         }
 
-        foreach (var peer in known)
+        var reachableKnown = known
+            .Select(peer => (Peer: peer, Address: ParseAddress(peer.Address)))
+            .Where(item => item.Address is not null &&
+                           item.Address.AddressFamily == entry.Endpoint.AddressFamily &&
+                           !IsLocalAddress(item.Address.ToString()) &&
+                           EndpointCanReach(
+                               item.Address,
+                               entry.Endpoint,
+                               item.Peer.ProviderId,
+                               requirePhysicalWhenProviderUnknown: true))
+            .GroupBy(item => string.IsNullOrWhiteSpace(item.Peer.IdentityId)
+                    ? item.Address!.ToString()
+                    : item.Peer.IdentityId,
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group
+                .OrderByDescending(item => item.Peer.LastSeenUtc)
+                .First())
+            .OrderByDescending(item => item.Peer.LastSeenUtc)
+            .ToArray();
+        var knownCount = Math.Min(KnownPeerBatchSize, reachableKnown.Length);
+        for (var index = 0; index < knownCount; index++)
         {
-            var address = ParseAddress(peer.Address);
-            if (address is null ||
-                address.AddressFamily != entry.Endpoint.AddressFamily ||
-                IsLocalAddress(address.ToString()))
-            {
-                continue;
-            }
-            if (EndpointCanReach(address, entry.Endpoint, peer.ProviderId))
-            {
-                Add(new IPEndPoint(address, DiscoveryPort), false);
-            }
+            var item = reachableKnown[(entry.KnownPeerCursor + index) % reachableKnown.Length];
+            Add(new IPEndPoint(item.Address!, DiscoveryPort), false);
         }
+        if (reachableKnown.Length > 0)
+            entry.KnownPeerCursor = (entry.KnownPeerCursor + knownCount) % reachableKnown.Length;
 
         foreach (var address in neighbors
                      .Concat(_dynamicTargets)
                      .Distinct())
         {
             if (address.AddressFamily != entry.Endpoint.AddressFamily || IsLocalAddress(address.ToString())) continue;
-            if (EndpointCanReach(address, entry.Endpoint, null))
+            if (EndpointCanReach(
+                    address,
+                    entry.Endpoint,
+                    providerId: null,
+                    requirePhysicalWhenProviderUnknown: false))
             {
                 Add(new IPEndPoint(address, DiscoveryPort), false);
             }
@@ -459,16 +505,17 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         lock (_senderGate) senders = _senders.ToArray();
         var selectedEndpoint = receivingEndpoint ??
             _network.SelectLocalEndpoint(peerAddress, providerId);
-        foreach (var entry in senders
-                     .Where(sender => sender.Endpoint.AddressFamily == peerAddress.AddressFamily)
-                     .OrderByDescending(sender => IsSameEndpoint(sender.Endpoint, selectedEndpoint))
-                     .ThenByDescending(sender => RouteUsesEndpoint(peerAddress, sender.Endpoint)))
+        var senderCandidates = senders
+            .Where(sender => sender.Endpoint.AddressFamily == peerAddress.AddressFamily)
+            .Where(sender => IsSameEndpoint(sender.Endpoint, selectedEndpoint) ||
+                             RouteUsesEndpoint(peerAddress, sender.Endpoint))
+            .OrderByDescending(sender => IsSameEndpoint(sender.Endpoint, selectedEndpoint))
+            .ThenByDescending(sender => RouteUsesEndpoint(peerAddress, sender.Endpoint))
+            .ToArray();
+        if (senderCandidates.Length == 0) return;
+
+        foreach (var entry in senderCandidates)
         {
-            if (!IsSameEndpoint(entry.Endpoint, selectedEndpoint) &&
-                !RouteUsesEndpoint(peerAddress, entry.Endpoint))
-            {
-                continue;
-            }
             try
             {
                 var announcement = factory(entry.Endpoint);
@@ -508,14 +555,13 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         {
             return false;
         }
-        if (VirtualNetworkService.IsInSameNetwork(target, endpoint)) return true;
         try
         {
             using var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
             socket.Connect(new IPEndPoint(target, DiscoveryPort));
             return socket.LocalEndPoint is IPEndPoint local && local.Address.Equals(localAddress);
         }
-        catch (SocketException)
+        catch (Exception)
         {
             return false;
         }
@@ -524,10 +570,19 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
     private bool EndpointCanReach(
         IPAddress target,
         NetworkEndpointInfo endpoint,
-        string? providerId)
+        string? providerId,
+        bool requirePhysicalWhenProviderUnknown)
     {
-        var selected = _network.SelectLocalEndpoint(target, providerId);
-        if (IsSameEndpoint(endpoint, selected)) return true;
+        if (target.AddressFamily != endpoint.AddressFamily) return false;
+        if (!string.IsNullOrWhiteSpace(providerId) &&
+            !string.Equals(endpoint.ProviderId, providerId, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(providerId) && requirePhysicalWhenProviderUnknown && !endpoint.IsPhysical)
+        {
+            return false;
+        }
         return RouteUsesEndpoint(target, endpoint);
     }
 
@@ -541,21 +596,24 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         var providerId = announcement.NetworkProviderId?.Trim() ?? "";
         var interfaceId = announcement.NetworkInterfaceId?.Trim() ?? "";
         var endpoints = (announcement.NetworkEndpoints ?? [])
-            .Where(endpoint =>
-                string.Equals(endpoint.ProviderId?.Trim(), providerId, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(endpoint.InterfaceId?.Trim(), interfaceId, StringComparison.OrdinalIgnoreCase) &&
-                TryGetUsablePeerAddress(endpoint.Address, out _))
+            .Where(endpoint => TryGetUsablePeerAddress(endpoint.Address, out _))
+            .Where(endpoint => string.IsNullOrWhiteSpace(providerId)
+                ? string.IsNullOrWhiteSpace(endpoint.ProviderId)
+                : string.Equals(endpoint.ProviderId, providerId, StringComparison.OrdinalIgnoreCase))
+            .Where(endpoint => CanRouteAdvertisedEndpoint(endpoint, providerId))
             .Take(8)
             .Select(endpoint => new PeerAdvertisedEndpoint
             {
                 Address = endpoint.Address.Trim(),
-                ProviderId = providerId,
-                InterfaceId = interfaceId,
+                ProviderId = endpoint.ProviderId?.Trim() ?? providerId,
+                InterfaceId = endpoint.InterfaceId?.Trim() ?? interfaceId,
                 AddressFamily = IPAddress.Parse(endpoint.Address).AddressFamily == AddressFamily.InterNetworkV6
                     ? "IPv6"
                     : "IPv4",
                 NetworkType = VirtualNetworkService.NormalizeNetworkType(endpoint.NetworkType)
             })
+            .DistinctBy(endpoint => string.Join("|", endpoint.Address, endpoint.ProviderId, endpoint.InterfaceId, endpoint.AddressFamily),
+                StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         if (!IsLocalAddress(observedAddress.ToString()) &&
@@ -575,6 +633,20 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         }
 
         announcement.NetworkEndpoints = endpoints;
+    }
+
+    private bool CanRouteAdvertisedEndpoint(PeerAdvertisedEndpoint endpoint, string announcementProviderId)
+    {
+        if (!TryGetUsablePeerAddress(endpoint.Address, out var address)) return false;
+        var providerId = string.IsNullOrWhiteSpace(endpoint.ProviderId)
+            ? announcementProviderId
+            : endpoint.ProviderId.Trim();
+        return _snapshot.Endpoints.Any(local =>
+            local.AddressFamily == address.AddressFamily &&
+            (string.IsNullOrWhiteSpace(providerId)
+                ? local.IsPhysical
+                : string.Equals(local.ProviderId, providerId, StringComparison.OrdinalIgnoreCase)) &&
+            RouteUsesEndpoint(address, local));
     }
 
     private static bool TryGetUsablePeerAddress(string? value, out IPAddress address)
@@ -599,34 +671,11 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
     private void RememberPeer(PeerAnnouncement announcement)
     {
         var now = DateTimeOffset.UtcNow;
-        var addresses = (announcement.NetworkEndpoints ?? [])
-            .Select(endpoint => endpoint.Address)
-            .Append(announcement.NetworkAddress)
-            .Where(address => TryGetUsablePeerAddress(address, out _) && !IsLocalAddress(address))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        if (addresses.Length == 0) return;
-        var persist = false;
+        _routes.UpsertFromAnnouncement(announcement, ParseAddress(announcement.NetworkAddress));
+        var persist = now - _lastKnownPeerSave > TimeSpan.FromMinutes(5);
         lock (_peerGate)
         {
-            var advertisedEndpoints = announcement.NetworkEndpoints ?? [];
-            foreach (var address in addresses)
-            {
-                var advertised = advertisedEndpoints.FirstOrDefault(endpoint =>
-                    string.Equals(endpoint.Address, address, StringComparison.OrdinalIgnoreCase));
-                var isNew = !_knownPeers.TryGetValue(address, out var peer);
-                peer ??= new KnownPeerRecord { Address = address };
-                peer.IdentityId = announcement.IdentityId;
-                peer.PlayerName = announcement.PlayerName;
-                peer.ProviderId = advertised?.ProviderId ?? announcement.NetworkProviderId;
-                peer.NetworkType = VirtualNetworkService.NormalizeNetworkType(
-                    advertised?.NetworkType ?? announcement.NetworkType);
-                peer.LastSeenUtc = now;
-                _knownPeers[address] = peer;
-                persist |= isNew;
-            }
             _knownPeersDirty = true;
-            persist |= now - _lastKnownPeerSave > TimeSpan.FromMinutes(5);
         }
         if (persist) PersistKnownPeers(force: true);
     }
@@ -637,28 +686,8 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         {
             if (!File.Exists(_paths.NetworkPeersFile)) return;
             var cache = JsonSerializer.Deserialize<KnownPeerCache>(File.ReadAllText(_paths.NetworkPeersFile), _jsonOptions);
-            lock (_peerGate)
-            {
-                _knownPeers.Clear();
-                foreach (var identity in cache?.Peers ?? [])
-                {
-                    foreach (var endpoint in identity.Endpoints)
-                    {
-                        var address = string.IsNullOrWhiteSpace(endpoint.Address) ? endpoint.Ip : endpoint.Address;
-                        if (ParseAddress(address) is null || DateTimeOffset.UtcNow - endpoint.LastSeenUtc > KnownPeerTtl) continue;
-                        _knownPeers[address] = new KnownPeerRecord
-                        {
-                            Address = address,
-                            IdentityId = identity.IdentityId,
-                            PlayerName = identity.PlayerName,
-                            ProviderId = endpoint.ProviderId,
-                            NetworkType = endpoint.NetworkType,
-                            LastSeenUtc = endpoint.LastSeenUtc
-                        };
-                    }
-                }
-                _knownPeersDirty = false;
-            }
+            _routes.Load(cache);
+            lock (_peerGate) _knownPeersDirty = false;
         }
         catch (Exception ex)
         {
@@ -668,20 +697,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
 
     private void PruneKnownPeers()
     {
-        var now = DateTimeOffset.UtcNow;
-        lock (_peerGate)
-        {
-            foreach (var peer in _knownPeers.Values.Where(peer => now - peer.LastSeenUtc > KnownPeerTtl).ToArray())
-            {
-                _knownPeers.Remove(peer.Address);
-                _knownPeersDirty = true;
-            }
-            foreach (var peer in _knownPeers.Values.OrderByDescending(peer => peer.LastSeenUtc).Skip(MaxKnownPeers).ToArray())
-            {
-                _knownPeers.Remove(peer.Address);
-                _knownPeersDirty = true;
-            }
-        }
+        _routes.Prune(DateTimeOffset.UtcNow);
     }
 
     private void PersistKnownPeers(bool force)
@@ -692,27 +708,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             {
                 if (!force && !_knownPeersDirty) return;
                 if (!_knownPeersDirty && File.Exists(_paths.NetworkPeersFile)) return;
-                var cache = new KnownPeerCache
-                {
-                    Peers = _knownPeers.Values
-                        .OrderByDescending(peer => peer.LastSeenUtc)
-                        .Take(MaxKnownPeers)
-                        .GroupBy(peer => string.IsNullOrWhiteSpace(peer.IdentityId)
-                            ? $"endpoint:{peer.Address}"
-                            : peer.IdentityId, StringComparer.OrdinalIgnoreCase)
-                        .Select(group => new KnownPeerIdentityRecord
-                        {
-                            IdentityId = group.Key.StartsWith("endpoint:", StringComparison.Ordinal) ? "" : group.Key,
-                            PlayerName = group.OrderByDescending(peer => peer.LastSeenUtc).First().PlayerName,
-                            Endpoints = group.Select(peer => new KnownPeerEndpointRecord
-                            {
-                                Address = peer.Address,
-                                ProviderId = peer.ProviderId,
-                                NetworkType = peer.NetworkType,
-                                LastSeenUtc = peer.LastSeenUtc
-                            }).ToList()
-                        }).ToList()
-                };
+                var cache = _routes.Export();
                 AtomicFile.WriteAllText(_paths.NetworkPeersFile, JsonSerializer.Serialize(cache, _jsonOptions));
                 _knownPeersDirty = false;
                 _lastKnownPeerSave = DateTimeOffset.UtcNow;
@@ -738,6 +734,22 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
     private static IPAddress? ParseAddress(string? value) =>
         IPAddress.TryParse(value, out var address) ? address : null;
 
+    private static void DisableUdpConnectionReset(Socket socket)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            socket.IOControl(
+                (IOControlCode)SioUdpConnectionReset,
+                [0, 0, 0, 0],
+                null);
+        }
+        catch (Exception ex) when (ex is SocketException or PlatformNotSupportedException or NotSupportedException)
+        {
+            // Discovery remains functional; Windows may only report ICMP errors on this socket.
+        }
+    }
+
     private sealed class SenderEntry
     {
         public SenderEntry(UdpClient sender, NetworkEndpointInfo endpoint, IReadOnlyList<DiscoveryTarget> targets)
@@ -752,39 +764,15 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         public TimeSpan FailureDelay { get; set; } = BaseSendInterval;
         public DateTimeOffset NextAttemptUtc { get; set; }
         public DateTimeOffset LastWarningUtc { get; set; } = DateTimeOffset.MinValue;
+        public int ProbeCursor { get; set; }
+        public int KnownPeerCursor { get; set; }
     }
 
     private sealed record DiscoveryTarget(IPEndPoint Endpoint, bool IsProbe);
 
-    private sealed class KnownPeerRecord
-    {
-        public string Address { get; set; } = "";
-        public string IdentityId { get; set; } = "";
-        public string PlayerName { get; set; } = "";
-        public string ProviderId { get; set; } = "";
-        public string NetworkType { get; set; } = "Unknown";
-        public DateTimeOffset LastSeenUtc { get; set; } = DateTimeOffset.UtcNow;
-    }
-
-    private sealed class KnownPeerCache
-    {
-        public int SchemaVersion { get; set; } = 3;
-        public List<KnownPeerIdentityRecord> Peers { get; set; } = [];
-    }
-
-    private sealed class KnownPeerIdentityRecord
-    {
-        public string IdentityId { get; set; } = "";
-        public string PlayerName { get; set; } = "";
-        public List<KnownPeerEndpointRecord> Endpoints { get; set; } = [];
-    }
-
-    private sealed class KnownPeerEndpointRecord
-    {
-        public string Address { get; set; } = "";
-        public string Ip { get; set; } = "";
-        public string ProviderId { get; set; } = "";
-        public string NetworkType { get; set; } = "Unknown";
-        public DateTimeOffset LastSeenUtc { get; set; } = DateTimeOffset.UtcNow;
-    }
+    private sealed record KnownPeerTarget(
+        string IdentityId,
+        string Address,
+        string ProviderId,
+        DateTimeOffset LastSeenUtc);
 }

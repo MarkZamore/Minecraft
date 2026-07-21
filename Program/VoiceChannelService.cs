@@ -16,6 +16,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     private static readonly TimeSpan SpeakingHold = TimeSpan.FromMilliseconds(250);
     private readonly Logger _logger;
     private readonly VoiceNetworkCoordinator _networkCoordinator;
+    private readonly PeerRouteResolver? _peerRoutes;
     private readonly VoiceRuntimeOptions _runtimeOptions;
     private readonly VoiceDeviceManager _deviceManager = new();
     private readonly VoiceTransport _transport;
@@ -59,10 +60,12 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         Logger logger,
         VoiceNetworkCoordinator? networkCoordinator = null,
         VoiceRuntimeOptions? runtimeOptions = null,
-        VirtualNetworkService? network = null)
+        VirtualNetworkService? network = null,
+        PeerRouteResolver? routes = null)
     {
         _logger = logger;
         _networkCoordinator = networkCoordinator ?? new VoiceNetworkCoordinator();
+        _peerRoutes = routes;
         _runtimeOptions = runtimeOptions ?? new VoiceRuntimeOptions();
         _runtimeOptions.Validate();
         _transport = new VoiceTransport(logger, network ?? new VirtualNetworkService(logger));
@@ -189,7 +192,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     }
 
     public void UpdatePeers(IEnumerable<(string peerId, string ip)> peers)
-        => UpdatePeers(peers.Select(peer => new VoicePeerCandidate(peer.peerId, peer.ip, "")));
+        => UpdatePeers(peers.Select(peer => new VoicePeerCandidate(peer.peerId, peer.ip, "", "")));
 
     public void UpdatePeers(IEnumerable<VoicePeerCandidate> peers)
     {
@@ -198,11 +201,12 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                            !string.Equals(peer.PeerId, _selfPeerId, StringComparison.OrdinalIgnoreCase) &&
                            IPAddress.TryParse(peer.Address, out _))
             .GroupBy(peer => peer.PeerId, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(
+                    .ToDictionary(
                 group => group.Key,
-                group => group.Select(peer => new VoiceRouteTarget(
+                    group => group.Select(peer => new VoiceRouteTarget(
                         new IPEndPoint(IPAddress.Parse(peer.Address), _runtimeOptions.Port),
-                        peer.ProviderId?.Trim() ?? ""))
+                        peer.ProviderId?.Trim() ?? "",
+                        peer.InterfaceId?.Trim() ?? ""))
                     .Distinct()
                     .ToArray(),
                 StringComparer.OrdinalIgnoreCase);
@@ -369,6 +373,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         while (!token.IsCancellationRequested)
         {
             List<(string PeerId, VoiceRouteTarget[] Targets, int Nonce)> sends;
+            List<(string PeerId, VoiceRouteTarget Target)> unhealthyRoutes = [];
             var now = DateTimeOffset.UtcNow;
             lock (_stateLock)
             {
@@ -377,12 +382,16 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                     if (pair.Value.ActiveTarget is not null &&
                         now - pair.Value.LastPacketUtc >= TimeSpan.FromSeconds(5))
                     {
+                        unhealthyRoutes.Add((pair.Key, pair.Value.ActiveTarget));
                         pair.Value.ActiveTarget = null;
                     }
                     var nonce = Interlocked.Increment(ref _nextHeartbeatSequence);
                     pair.Value.PendingHeartbeatSequence = nonce;
                     pair.Value.PendingHeartbeatSentUtc = now;
-                    return (pair.Key, pair.Value.Candidates.Distinct().ToArray(), nonce);
+                    var targets = pair.Value.ActiveTarget is { } active
+                        ? [active]
+                        : pair.Value.Candidates.Distinct().ToArray();
+                    return (pair.Key, targets, nonce);
                 }).ToList();
                 foreach (var pair in _routes)
                 {
@@ -392,6 +401,14 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                         PeerPresenceChanged?.Invoke(pair.Key, false, false);
                     }
                 }
+            }
+            foreach (var unhealthy in unhealthyRoutes)
+            {
+                _peerRoutes?.MarkEndpointUnhealthy(
+                    unhealthy.PeerId,
+                    ToPeerCandidate(unhealthy.Target));
+                _logger.Info(
+                    $"Voice route for {unhealthy.PeerId} timed out at {unhealthy.Target.EndPoint.Address}; probing alternatives.");
             }
             foreach (var send in sends)
             {
@@ -494,7 +511,11 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         _ = _transport.SendAsync(targets, packet, CancellationToken.None);
     }
 
-    private async Task OnVoicePacketAsync(IPEndPoint remote, byte[] buffer)
+    private async Task OnVoicePacketAsync(
+        IPEndPoint remote,
+        byte[] buffer,
+        string receivingProviderId,
+        string receivingInterfaceId)
     {
         try
         {
@@ -502,26 +523,43 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             if (string.Equals(peerId, _selfPeerId, StringComparison.OrdinalIgnoreCase)) return;
 
             VoicePeerRoute? route;
+            VoiceRouteTarget? confirmedTarget = null;
             var notifyPresence = false;
+            var routeChanged = false;
             lock (_stateLock)
             {
                 if (!_routes.TryGetValue(peerId, out route))
                 {
                     return;
                 }
-                var matchedCandidate = FindMatchedCandidate(route, remote);
+                var matchedCandidate = FindMatchedCandidate(
+                    route,
+                    remote,
+                    receivingProviderId,
+                    receivingInterfaceId);
                 if (matchedCandidate is null) return;
+                if (_peerRoutes is not null && !_peerRoutes.IsKnownEndpoint(peerId, remote.Address)) return;
                 var now = DateTimeOffset.UtcNow;
-                route.ActiveTarget = matchedCandidate with
+                confirmedTarget = matchedCandidate with
                 {
                     EndPoint = new IPEndPoint(remote.Address, remote.Port)
                 };
+                routeChanged = route.ActiveTarget is null || !route.ActiveTarget.Equals(confirmedTarget);
+                route.ActiveTarget = confirmedTarget;
                 route.LastPacketUtc = now;
                 if (!route.PresenceAnnounced || now - route.LastPresenceNotificationUtc >= TimeSpan.FromSeconds(1))
                 {
                     route.PresenceAnnounced = true;
                     route.LastPresenceNotificationUtc = now;
                     notifyPresence = true;
+                }
+            }
+            if (confirmedTarget is not null)
+            {
+                _peerRoutes?.MarkEndpointHealthy(peerId, ToPeerCandidate(confirmedTarget));
+                if (routeChanged)
+                {
+                    _logger.Info($"Voice route for {peerId} selected {confirmedTarget.EndPoint.Address}.");
                 }
             }
             if (notifyPresence) PeerPresenceChanged?.Invoke(peerId, true, false);
@@ -598,25 +636,36 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                 }
 
                 var missingCount = lastSequence <= 0 ? 0 : sequence - lastSequence - 1;
-                if (missingCount > 6)
+                try
+                {
+                    if (missingCount > 6)
+                    {
+                        decoder.Reset();
+                        _receiver.RemovePeer(peerId);
+                    }
+                    else if (missingCount > 0)
+                    {
+                        var plcCount = Math.Min(Math.Max(0, missingCount - 1), 2);
+                        for (var offset = 0; offset < plcCount; offset++)
+                        {
+                            var plc = decoder.DecodeMissing();
+                            if (plc.Length > 0)
+                            {
+                                recoveredFrames.Add((lastSequence + offset + 1, plc));
+                            }
+                        }
+                        var fec = decoder.DecodeFec(payload);
+                        if (fec.Length > 0) recoveredFrames.Add((sequence - 1, fec));
+                    }
+
+                    decoded = decoder.DecodePacket(payload);
+                }
+                catch (Exception ex) when (ex is ArgumentException or InvalidDataException or InvalidOperationException)
                 {
                     decoder.Reset();
-                    _receiver.RemovePeer(peerId);
+                    recoveredFrames.Clear();
+                    decoded = decoder.DecodePacket(payload);
                 }
-                else if (missingCount > 0)
-                {
-                    for (var missingSequence = lastSequence + 1;
-                         missingSequence < sequence - 1;
-                         missingSequence++)
-                    {
-                        var plc = decoder.DecodeMissing();
-                        if (plc.Length > 0) recoveredFrames.Add((missingSequence, plc));
-                    }
-                    var fec = decoder.DecodeFec(payload);
-                    if (fec.Length > 0) recoveredFrames.Add((sequence - 1, fec));
-                }
-
-                decoded = decoder.DecodePacket(payload);
                 lock (_stateLock)
                 {
                     if (_routes.TryGetValue(peerId, out route))
@@ -643,14 +692,14 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
 
     private void ResetPeerDecoderAfterFailure(byte[] packet)
     {
-        if (!TryParsePacket(packet, out _, out var peerId, out _, out _)) return;
+        if (!TryParsePacket(packet, out _, out var peerId, out var sequence, out _)) return;
         VoiceDecoder? decoder;
         lock (_stateLock)
         {
             _decoders.TryGetValue(peerId, out decoder);
             if (_routes.TryGetValue(peerId, out var route))
             {
-                route.LastAudioSequence = 0;
+                route.LastAudioSequence = Math.Max(route.LastAudioSequence, sequence);
             }
         }
         if (decoder is not null)
@@ -660,40 +709,26 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         _receiver.RemovePeer(peerId);
     }
 
-    private static VoiceRouteTarget? FindMatchedCandidate(VoicePeerRoute route, IPEndPoint remote)
+    private static PeerCandidateEndpoint ToPeerCandidate(VoiceRouteTarget target) => new()
     {
-        var exact = route.Candidates.FirstOrDefault(candidate =>
-            candidate.EndPoint.Address.Equals(remote.Address));
-        if (exact is not null) return exact;
+        Address = target.EndPoint.Address.ToString(),
+        ProviderId = target.ProviderId,
+        InterfaceId = target.InterfaceId,
+        AddressFamily = target.EndPoint.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4"
+    };
 
-        var sameFamily = route.Candidates.FirstOrDefault(candidate =>
-            candidate.EndPoint.AddressFamily == remote.AddressFamily);
-        if (sameFamily is not null) return sameFamily;
-
-        var normalized = NormalizeVoiceAddress(remote.Address);
-        var mapped = normalized is not null
-            ? route.Candidates.FirstOrDefault(candidate =>
-                NormalizeVoiceAddress(candidate.EndPoint.Address) is { } candidateNormalized &&
-                string.Equals(candidateNormalized, normalized, StringComparison.OrdinalIgnoreCase))
-            : null;
-        if (mapped is not null) return mapped;
-
-        if (route.Candidates.Count == 1)
-        {
-            return route.Candidates[0];
-        }
-
-        return null;
-    }
-
-    private static string? NormalizeVoiceAddress(IPAddress address)
+    private static VoiceRouteTarget? FindMatchedCandidate(
+        VoicePeerRoute route,
+        IPEndPoint remote,
+        string receivingProviderId,
+        string receivingInterfaceId)
     {
-        if (address.AddressFamily != AddressFamily.InterNetworkV6) return address.ToString();
-
-        if (!address.IsIPv4MappedToIPv6) return address.ToString();
-
-        var ipv4 = address.MapToIPv4();
-        return ipv4.ToString();
+        return route.Candidates.FirstOrDefault(candidate =>
+            candidate.EndPoint.Address.Equals(remote.Address) &&
+            string.Equals(candidate.ProviderId, receivingProviderId, StringComparison.OrdinalIgnoreCase) &&
+            (string.IsNullOrWhiteSpace(candidate.InterfaceId) ||
+             string.IsNullOrWhiteSpace(receivingInterfaceId) ||
+             string.Equals(candidate.InterfaceId, receivingInterfaceId, StringComparison.OrdinalIgnoreCase)));
     }
 
     private void CheckLocalSpeakingTimeout(object? state)
