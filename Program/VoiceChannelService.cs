@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 
 namespace Minecraft;
@@ -508,8 +509,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                 {
                     return;
                 }
-                var matchedCandidate = route.Candidates.FirstOrDefault(candidate =>
-                    candidate.EndPoint.Address.Equals(remote.Address));
+                var matchedCandidate = FindMatchedCandidate(route, remote);
                 if (matchedCandidate is null) return;
                 var now = DateTimeOffset.UtcNow;
                 route.ActiveTarget = matchedCandidate with
@@ -658,6 +658,42 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             lock (decoder) decoder.Reset();
         }
         _receiver.RemovePeer(peerId);
+    }
+
+    private static VoiceRouteTarget? FindMatchedCandidate(VoicePeerRoute route, IPEndPoint remote)
+    {
+        var exact = route.Candidates.FirstOrDefault(candidate =>
+            candidate.EndPoint.Address.Equals(remote.Address));
+        if (exact is not null) return exact;
+
+        var sameFamily = route.Candidates.FirstOrDefault(candidate =>
+            candidate.EndPoint.AddressFamily == remote.AddressFamily);
+        if (sameFamily is not null) return sameFamily;
+
+        var normalized = NormalizeVoiceAddress(remote.Address);
+        var mapped = normalized is not null
+            ? route.Candidates.FirstOrDefault(candidate =>
+                NormalizeVoiceAddress(candidate.EndPoint.Address) is { } candidateNormalized &&
+                string.Equals(candidateNormalized, normalized, StringComparison.OrdinalIgnoreCase))
+            : null;
+        if (mapped is not null) return mapped;
+
+        if (route.Candidates.Count == 1)
+        {
+            return route.Candidates[0];
+        }
+
+        return null;
+    }
+
+    private static string? NormalizeVoiceAddress(IPAddress address)
+    {
+        if (address.AddressFamily != AddressFamily.InterNetworkV6) return address.ToString();
+
+        if (!address.IsIPv4MappedToIPv6) return address.ToString();
+
+        var ipv4 = address.MapToIPv4();
+        return ipv4.ToString();
     }
 
     private void CheckLocalSpeakingTimeout(object? state)

@@ -869,6 +869,70 @@ public partial class MainWindow : Window
             .ThenBy(entry => entry.Peer.PlayerName, StringComparer.CurrentCultureIgnoreCase)
             .Select(entry => entry.Peer)
             .ToList();
+
+        var discoveredVoicePeers = _peers
+            .Where(peer =>
+                peer.IsInVoiceChannel &&
+                DateTimeOffset.UtcNow - peer.LastSeen < TimeSpan.FromSeconds(30))
+            .OrderByDescending(peer => peer.LastSeen)
+            .ThenBy(peer => peer.PlayerName, StringComparer.CurrentCultureIgnoreCase)
+            .ToArray();
+        var existingIds = peers
+            .Select(ResolveVoicePeerId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var peer in discoveredVoicePeers)
+        {
+            var id = ResolveVoicePeerId(peer);
+            if (!existingIds.Contains(id))
+            {
+                peers.Add(peer);
+                existingIds.Add(id);
+            }
+        }
+
+        if (_voiceChannel is not null)
+        {
+            var transportPeers = _voiceChannel.KnownPeers
+                .Where(peerId => !string.IsNullOrWhiteSpace(peerId))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            foreach (var peerId in transportPeers)
+            {
+                if (existingIds.Contains(peerId))
+                {
+                    continue;
+                }
+
+                var transportPeer = _peers.FirstOrDefault(peer =>
+                    string.Equals(ResolveVoicePeerId(peer), peerId, StringComparison.OrdinalIgnoreCase));
+                if (transportPeer is null)
+                {
+                    var placeholder = CreateUnknownVoicePeer(peerId);
+                    transportPeer = placeholder;
+                }
+
+                peers.Add(transportPeer);
+                existingIds.Add(peerId);
+            }
+        }
+
+        peers.Sort((left, right) =>
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+
+            var seenComparison = right?.LastSeen.CompareTo(left?.LastSeen ?? DateTimeOffset.MinValue) ?? 0;
+            return seenComparison != 0
+                ? seenComparison
+                : string.Compare(
+                    left?.PlayerName,
+                    right?.PlayerName,
+                    StringComparison.CurrentCultureIgnoreCase);
+        });
+
         if (_voiceChannel is { IsJoined: true })
         {
             var identity = ResolveActiveLocalIdentity();
@@ -930,6 +994,18 @@ public partial class MainWindow : Window
             .Where(peer => !string.IsNullOrWhiteSpace(peer.PeerId))
             .Distinct()
             .ToArray();
+        var discoveredVoicePeers = _peers
+            .Where(peer =>
+                peer.IsInVoiceChannel &&
+                DateTimeOffset.UtcNow - peer.LastSeen < TimeSpan.FromSeconds(30))
+            .SelectMany(peer => GetVoiceFallbackEndpoints(peer).Select(endpoint =>
+                new VoicePeerCandidate(ResolveVoicePeerId(peer), endpoint.Address, endpoint.ProviderId)))
+            .Where(peer => !string.IsNullOrWhiteSpace(peer.PeerId) && !string.IsNullOrWhiteSpace(peer.Address))
+            .ToArray();
+        peers = peers.Concat(discoveredVoicePeers)
+            .Distinct()
+            .ToArray();
+
         var signature = string.Join("|", peers.Select(peer =>
             $"{peer.PeerId}@{peer.Address}:{peer.ProviderId}"));
         if (string.Equals(signature, _lastVoiceTransportPeerSignature, StringComparison.Ordinal))
@@ -954,6 +1030,82 @@ public partial class MainWindow : Window
         }
 
         return peer.NetworkAddress;
+    }
+
+    private IReadOnlyList<PeerEndpointInfo> GetVoiceFallbackEndpoints(PeerViewModel peer)
+    {
+        var endpoints = peer.GetCandidateEndpoints(preferredProviderId: _primaryEndpoint?.ProviderId)
+            .Where(endpoint => TryParsePeerAddress(endpoint.Address, out _))
+            .ToArray();
+        if (endpoints.Length > 0)
+        {
+            return endpoints;
+        }
+
+        var networkEndpoint = peer.NetworkEndpoints
+            .FirstOrDefault(endpoint => TryParsePeerAddress(endpoint.Address, out _));
+        if (networkEndpoint is not null)
+        {
+            return [networkEndpoint];
+        }
+
+        if (!TryParsePeerAddress(peer.NetworkAddress, out var address))
+        {
+            return Array.Empty<PeerEndpointInfo>();
+        }
+
+        var preferredProviderId = _primaryEndpoint?.ProviderId ?? string.Empty;
+        var preferredInterfaceId = _primaryEndpoint?.InterfaceId ?? string.Empty;
+        return
+        [
+            new PeerEndpointInfo
+            {
+                Address = address.ToString(),
+                ProviderId = preferredProviderId,
+                InterfaceId = preferredInterfaceId,
+                AddressFamily = address.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
+                LastSeen = peer.LastSeen
+            }
+        ];
+    }
+
+    private static bool TryParsePeerAddress(string? value, out IPAddress address)
+    {
+        if (!IPAddress.TryParse(value, out address!))
+        {
+            return false;
+        }
+
+        return !address.Equals(IPAddress.Any) &&
+               !address.Equals(IPAddress.IPv6Any) &&
+               !address.IsIPv6Multicast &&
+               !address.IsIPv6LinkLocal;
+    }
+
+    private static string? NormalizeUnknownPeerLabel(string peerId)
+    {
+        if (string.IsNullOrWhiteSpace(peerId))
+        {
+            return null;
+        }
+
+        return peerId.Length <= 24
+            ? peerId
+            : $"{peerId[..10]}…{peerId[^8..]}";
+    }
+
+    private PeerViewModel CreateUnknownVoicePeer(string peerId)
+    {
+        var label = NormalizeUnknownPeerLabel(peerId) ?? "Unknown";
+        return new PeerViewModel
+        {
+            PlayerName = $"Игрок {label}",
+            IdentityName = peerId,
+            IdentityId = peerId,
+            IsInVoiceChannel = true,
+            IsVoiceMuted = false,
+            LastSeen = DateTimeOffset.Now
+        };
     }
 
     private WorldMetadataContext? CreateWorldMetadataContext()
@@ -1117,11 +1269,15 @@ public partial class MainWindow : Window
                 {
                     var peer = _peers.FirstOrDefault(candidate =>
                         string.Equals(ResolveVoicePeerId(candidate), peerId, StringComparison.OrdinalIgnoreCase));
+                    if (peer is null)
+                    {
+                        peer = CreateUnknownVoicePeer(peerId);
+                    }
                     if (peer is not null)
                     {
                         _voicePresence[peerId] = new VoicePresenceEntry(
                             peer,
-                            peer.GetCandidateEndpoints(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
+                            GetVoiceFallbackEndpoints(peer).ToArray(),
                             DateTimeOffset.UtcNow);
                     }
                 }
@@ -1201,7 +1357,7 @@ public partial class MainWindow : Window
             {
                 _voicePresence[voicePeerId] = new VoicePresenceEntry(
                     peer,
-                    peer.GetCandidateEndpoints(preferredProviderId: _primaryEndpoint?.ProviderId).ToArray(),
+                    GetVoiceFallbackEndpoints(peer).ToArray(),
                     DateTimeOffset.UtcNow);
             }
             else
