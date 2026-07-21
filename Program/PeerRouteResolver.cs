@@ -63,7 +63,6 @@ public sealed class PeerCandidateEndpoint : IEquatable<PeerCandidateEndpoint>
 
 public sealed class PeerRouteResolver : IPeerRouteResolver
 {
-    private const int MaxPeers = 1024;
     private static readonly TimeSpan PeerTtl = TimeSpan.FromDays(30);
     private static readonly TimeSpan EndpointTtl = TimeSpan.FromDays(30);
     private readonly Dictionary<string, PeerRouteState> _peers = new(StringComparer.OrdinalIgnoreCase);
@@ -237,7 +236,6 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
             {
                 Peers = _peers.Values
                     .OrderByDescending(peer => peer.LastSeenUtc)
-                    .Take(MaxPeers)
                     .Select(peer => new KnownPeerIdentityRecord
                     {
                         IdentityId = peer.IdentityId.StartsWith("legacy:", StringComparison.OrdinalIgnoreCase)
@@ -329,11 +327,6 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
                 RemoveEndpointIndexLocked(endpoint.Address, peer.IdentityId);
             }
             if (peer.Endpoints.Count == 0 || now - peer.LastSeenUtc > PeerTtl) RemovePeerLocked(peer);
-        }
-
-        foreach (var peer in _peers.Values.OrderByDescending(item => item.LastSeenUtc).Skip(MaxPeers).ToArray())
-        {
-            RemovePeerLocked(peer);
         }
     }
 
