@@ -109,11 +109,14 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
             <Grid Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
+                <Button x:Name="PlayButton" Content="Играть" Click="PlayButton_Click"
+                        MinHeight="38" FontSize="16" FontWeight="SemiBold"/>
+            </Grid>
+
+            <Grid Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="1.1*"/>
@@ -121,8 +124,12 @@
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="1.4*"/>
                 </Grid.ColumnDefinitions>
-                <TextBlock Grid.Column="0" Text="Имя"/>
-                <TextBox Grid.Column="1" x:Name="PlayerNameTextBox"
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Имя"/>
+                <TextBox Grid.Row="0" Grid.Column="1" x:Name="PlayerNameTextBox"
                          MaxLength="16"
                          IsReadOnly="True"
                          TextChanged="PlayerNameTextBox_TextChanged"
@@ -131,35 +138,51 @@
                          LostFocus="PlayerNameTextBox_LostFocus"
                          KeyDown="PlayerNameTextBox_KeyDown"
                          Margin="8,0,6,0"/>
-                <Button Grid.Column="2" x:Name="ChangePlayerNameButton"
+                <Button Grid.Row="0" Grid.Column="2" x:Name="ChangePlayerNameButton"
                         Content="Изменить" Click="ChangePlayerNameButton_Click"
                         MinWidth="72" Margin="0,0,12,0"/>
-                <TextBlock Grid.Column="3" Text="Сборка"/>
-                <local:CenteredDropDown Grid.Column="4" x:Name="BuildComboBox"
-                                        ItemTemplate="{StaticResource BuildItemTemplate}"
-                                        SelectionChanged="BuildComboBox_SelectionChanged"
-                                        Margin="8,0,0,0"/>
-            </Grid>
-
-            <Grid Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="68"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <Button Grid.Column="0" x:Name="PlayButton" Content="Играть" Click="PlayButton_Click"
-                        MinHeight="38" FontSize="16" FontWeight="SemiBold"/>
-                <Button Grid.Column="1" x:Name="SkinButton" Content="Скин" Click="SkinButton_Click"
-                        MinHeight="38" MinWidth="68" Margin="8,0,0,0"/>
-                <TextBlock Grid.Column="2" Text="RAM" Margin="12,0,6,0"/>
-                <TextBox Grid.Column="3" x:Name="MemoryTextBox" TextAlignment="Center" FontSize="16"
-                         PreviewTextInput="MemoryTextBox_PreviewTextInput"
-                         TextChanged="MemoryTextBox_TextChanged"
-                         DataObject.Pasting="MemoryTextBox_Pasting"
-                         LostFocus="MemoryTextBox_LostFocus" KeyDown="MemoryTextBox_KeyDown"/>
-                <TextBlock Grid.Column="4" Text="GB" Margin="6,0,0,0"/>
+                <TextBlock Grid.Row="0" Grid.Column="3" Text="Сборка"/>
+                <Grid Grid.Row="0" Grid.Column="4" Margin="8,0,0,0">
+                    <local:CenteredDropDown x:Name="BuildComboBox"
+                                            ItemTemplate="{StaticResource BuildItemTemplate}"
+                                            SelectionChanged="BuildComboBox_SelectionChanged"/>
+                    <TextBlock x:Name="BuildPlaceholderText"
+                               Text="Нет сборок"
+                               Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               IsHitTestVisible="False"
+                               Visibility="Collapsed"/>
+                </Grid>
+                <Grid Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,10,12,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="68"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Button Grid.Column="0" x:Name="SkinButton" Content="Скин" Click="SkinButton_Click"/>
+                    <TextBlock Grid.Column="1" Text="RAM" Margin="12,0,6,0"/>
+                    <TextBox Grid.Column="2" x:Name="MemoryTextBox" TextAlignment="Center" FontSize="16"
+                             PreviewTextInput="MemoryTextBox_PreviewTextInput"
+                             TextChanged="MemoryTextBox_TextChanged"
+                             DataObject.Pasting="MemoryTextBox_Pasting"
+                             LostFocus="MemoryTextBox_LostFocus" KeyDown="MemoryTextBox_KeyDown"/>
+                    <TextBlock Grid.Column="3" Text="GB" Margin="6,0,0,0"/>
+                </Grid>
+                <TextBlock Grid.Row="1" Grid.Column="3" Text="VPN" Margin="0,10,0,0"/>
+                <Grid Grid.Row="1" Grid.Column="4" Margin="8,10,0,0">
+                    <local:CenteredDropDown x:Name="NetworkProviderComboBox"
+                                            ItemTemplate="{StaticResource NetworkProviderItemTemplate}"
+                                            SelectionChanged="NetworkProviderComboBox_SelectionChanged"/>
+                    <TextBlock x:Name="NetworkProviderPlaceholderText"
+                               Text="Сервис не найден"
+                               Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               IsHitTestVisible="False"
+                               Visibility="Collapsed"/>
+                </Grid>
             </Grid>
 
             <Grid Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
@@ -206,61 +229,7 @@
                 </Grid>
             </Grid>
 
-            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,10">
-                <TextBlock Text="Hamachi" Style="{StaticResource SectionTitleStyle}"/>
-                <Grid Margin="0,0,0,5">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="8"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="8"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-                    <Button Grid.Column="0" x:Name="InstallNetworkToolButton" Content="Установить"
-                            Click="InstallNetworkToolButton_Click"/>
-                    <Button Grid.Column="2" x:Name="GenerateNetworkCredentialsButton" Content="Генерировать"
-                            Click="GenerateNetworkCredentialsButton_Click"/>
-                    <Grid Grid.Column="4">
-                        <local:CenteredDropDown x:Name="NetworkProviderComboBox"
-                                                ItemTemplate="{StaticResource NetworkProviderItemTemplate}"
-                                                SelectionChanged="NetworkProviderComboBox_SelectionChanged"/>
-                        <TextBlock x:Name="NetworkProviderPlaceholderText"
-                                   Text="VPN не найден"
-                                   Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
-                                   HorizontalAlignment="Center"
-                                   VerticalAlignment="Center"
-                                   IsHitTestVisible="False"
-                                   Visibility="Collapsed"/>
-                    </Grid>
-                </Grid>
-                <Grid Margin="0,0,0,5">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="70"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="0" Text="Сеть"/>
-                    <TextBox Grid.Column="1" x:Name="NetworkNameTextBox" IsReadOnly="True"/>
-                    <Button Grid.Column="2" x:Name="CopyNetworkNameButton" Content="Копировать"
-                            Click="CopyNetworkNameButton_Click" Margin="8,0,0,0" MinWidth="88"/>
-                </Grid>
-                <Grid Margin="0,0,0,5">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="70"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="0" Text="Пароль"/>
-                    <TextBox Grid.Column="1" x:Name="NetworkPasswordTextBox" IsReadOnly="True"/>
-                    <Button Grid.Column="2" x:Name="CopyNetworkPasswordButton" Content="Копировать"
-                            Click="CopyNetworkPasswordButton_Click" Margin="8,0,0,0" MinWidth="88"/>
-                </Grid>
-                <CheckBox x:Name="NetworkToolAutoLaunchCheckBox" Content="Автозапуск"
-                          Checked="NetworkToolAutoLaunchCheckBox_Changed"
-                          Unchecked="NetworkToolAutoLaunchCheckBox_Changed"/>
-            </StackPanel>
-
-            <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
+            <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
                 <TextBlock Text="Передача мира" Style="{StaticResource SectionTitleStyle}"/>
                 <Grid Margin="0,0,0,5">
                     <Grid.ColumnDefinitions>
@@ -300,7 +269,7 @@
                 </Grid>
             </StackPanel>
 
-            <Grid Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
+            <Grid Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
@@ -317,7 +286,7 @@
                         Click="TransferButton_Click" Margin="8,0,0,0" MinWidth="88"/>
             </Grid>
 
-            <Grid Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
+            <Grid Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
@@ -334,30 +303,7 @@
                         Click="UpdateButton_Click" Margin="8,0,0,0" MinWidth="88" IsEnabled="False"/>
             </Grid>
 
-            <Grid Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,6"
-                  ClipToBounds="True">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <Border Grid.Column="0" Style="{StaticResource ProgressFrameStyle}">
-                    <ProgressBar x:Name="SecretProgressBar" Minimum="0" Maximum="100"
-                                 Foreground="{StaticResource ProgressIdleBrush}"/>
-                </Border>
-                <Button Grid.Column="1" x:Name="SecretOpenButton" Content="Открыть"
-                        Click="SecretOpenButton_Click" Margin="8,0,0,0" MinWidth="88" IsEnabled="False"/>
-                <ProgressBar Grid.Column="0" Grid.ColumnSpan="2"
-                             x:Name="SecretExtendedProgressBar"
-                             Minimum="0" Maximum="600" Height="28"
-                             Background="Transparent" BorderThickness="0"
-                             Foreground="{StaticResource ProgressActiveBrush}"
-                             IsHitTestVisible="False" Panel.ZIndex="2"/>
-                <TextBlock Grid.Column="0" x:Name="SecretProgressText" Text="Загрузка"
-                           HorizontalAlignment="Center" VerticalAlignment="Center"
-                           FontWeight="SemiBold" Panel.ZIndex="3"/>
-            </Grid>
-
-            <Grid Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,8">
+            <Grid Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,0,16,8">
                 <Border Style="{StaticResource ProgressFrameStyle}">
                     <ProgressBar x:Name="RuntimeProgressBar" Minimum="0" Maximum="100"
                                  Foreground="{StaticResource ProgressIdleBrush}"/>
@@ -366,13 +312,13 @@
                            HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="SemiBold"/>
             </Grid>
 
-            <Grid Grid.Column="2" Grid.Row="0" Grid.RowSpan="10">
+            <Grid Grid.Column="2" Grid.Row="0" Grid.RowSpan="8">
                 <TextBlock Text="AI-помощник обученный на вашей сборке Minecraft"
                            TextWrapping="Wrap" TextAlignment="Center"
                            HorizontalAlignment="Center" VerticalAlignment="Center"
                            FontSize="15" FontWeight="SemiBold" Margin="10,10,10,46"/>
             </Grid>
-            <Grid Grid.Column="2" Grid.Row="8" Height="28"
+            <Grid Grid.Column="2" Grid.Row="6" Height="28"
                   Margin="0,0,0,8" VerticalAlignment="Top">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -384,9 +330,9 @@
                         IsEnabled="False" Margin="6,0,0,0"/>
             </Grid>
 
-            <TextBlock Grid.Row="9" Grid.Column="0" Grid.ColumnSpan="2"
+            <TextBlock Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="2"
                        Text="Лучше TLauncher" HorizontalAlignment="Left" FontSize="11"/>
-            <TextBlock Grid.Row="9" Grid.Column="2" x:Name="VersionTextBlock"
+            <TextBlock Grid.Row="7" Grid.Column="2" x:Name="VersionTextBlock"
                        HorizontalAlignment="Right" TextAlignment="Right" FontSize="11"/>
 
             <Grid Visibility="Collapsed">

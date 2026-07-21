@@ -91,8 +91,6 @@ public sealed class SettingsService
         }
 
         settings.ClientRelativePath = settings.ClientRelativePath?.Trim() ?? "";
-        settings.NetworkName = settings.NetworkName?.Trim() ?? "";
-        settings.NetworkPassword = settings.NetworkPassword?.Trim() ?? "";
         settings.SkinPath = settings.SkinPath?.Trim() ?? "";
         settings.SelectedWorldRelativePath = settings.SelectedWorldRelativePath?.Trim() ?? "";
         settings.VoiceInputDeviceId = settings.VoiceInputDeviceId?.Trim() ?? "";

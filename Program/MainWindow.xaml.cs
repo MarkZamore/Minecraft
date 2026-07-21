@@ -20,7 +20,6 @@ public partial class MainWindow : Window
 {
     private const int MinMemoryGb = MemorySizingService.MinMemoryGb;
     private static readonly TimeSpan PeerTtl = TimeSpan.FromSeconds(35);
-    private static readonly TimeSpan SecretLoadingDuration = TimeSpan.FromMinutes(10);
     private const int HostReachabilityAttempts = 3;
     // EB59 is a half-size badge glyph; this maps its ink bounds onto EA18's full shield bounds.
     private static readonly Matrix DisabledVoiceProtectionIconTransform = new(2d, 0d, 0d, 2d, -14.875d, -14d);
@@ -34,7 +33,6 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<NetworkProviderOption> _networkProviders = new();
     private readonly Dictionary<string, VoicePresenceEntry> _voicePresence = new(StringComparer.OrdinalIgnoreCase);
     private readonly DispatcherTimer _uiTimer = new() { Interval = TimeSpan.FromSeconds(2) };
-    private readonly DispatcherTimer _secretTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly DispatcherTimer _networkRefreshTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly TransferRateTracker _transferRate = new();
@@ -47,7 +45,6 @@ public partial class MainWindow : Window
     private Logger? _logger;
     private VirtualNetworkService? _network;
     private PeerRouteResolver? _peerRoutes;
-    private NetworkToolSetupService? _networkToolSetup;
     private PackHashService? _packHash;
     private WorldMetadataService? _worldMetadata;
     private WorldPlayerProfileService? _worldPlayerProfiles;
@@ -82,10 +79,8 @@ public partial class MainWindow : Window
     private DateTimeOffset _pendingOpenToLanSince;
     private DateTimeOffset? _openToLanListenerMissingSince;
     private bool _openToLanCloseObserved;
-    private bool _networkToolInstalled;
     private bool _networkRefreshInProgress;
     private bool _networkChangeSubscribed;
-    private bool _networkToolInstallBusy;
     private bool _busy;
     private bool _voiceBusy;
     private bool _suppressTextPersistence;
@@ -102,7 +97,6 @@ public partial class MainWindow : Window
     private long _transferBytesTotal;
     private double _lastTransferSpeedBytesPerSecond;
     private bool _transferActive;
-    private DateTimeOffset? _secretLoadingStartedAt;
     private bool _hostRttScanInProgress;
     private bool _updateBusy;
     private bool _isEditingPlayerName;
@@ -138,7 +132,6 @@ public partial class MainWindow : Window
             RefreshLanAdvertisementState();
             RefreshUi();
         };
-        _secretTimer.Tick += (_, _) => RefreshSecretLoadingProgress();
         _networkRefreshTimer.Tick += NetworkRefreshTimer_Tick;
     }
 
@@ -156,7 +149,6 @@ public partial class MainWindow : Window
             _logger.LineWritten += line => Dispatcher.Invoke(() => AppendLog(line));
             _network = new VirtualNetworkService(_logger);
             _peerRoutes = new PeerRouteResolver();
-            _networkToolSetup = new NetworkToolSetupService(_paths, _logger);
             NetworkChange.NetworkAddressChanged += NetworkAddressChanged;
             _networkChangeSubscribed = true;
             _packHash = new PackHashService(_paths);
@@ -212,17 +204,11 @@ public partial class MainWindow : Window
             LoadSettingsIntoUi();
             RefreshVoiceDevices();
             RefreshBuilds();
-            RefreshNetworkToolSetupStatus();
-            if (_settings.NetworkToolAutoLaunch)
-            {
-                await AutoLaunchInstalledNetworkToolAsync();
-            }
             CaptureNetworkProviders();
             RefreshNetworkEnvironment();
             RefreshHostPeers();
             RefreshMemoryText(saveIfChanged: true);
             RefreshWorlds();
-            StartSecretLoading();
             InitializeUpdateUi();
             InitializeRuntimeProgressUi();
             _ = CheckForUpdatesAsync(_lifetimeCts.Token);
@@ -256,7 +242,6 @@ public partial class MainWindow : Window
         await Dispatcher.Yield(DispatcherPriority.Background);
 
         _uiTimer.Stop();
-        _secretTimer.Stop();
         _networkRefreshTimer.Stop();
         if (_networkChangeSubscribed)
         {
@@ -317,8 +302,6 @@ public partial class MainWindow : Window
         try
         {
             PlayerNameTextBox.Text = RequireSettings().PlayerName;
-            RefreshNetworkCredentialsText();
-            NetworkToolAutoLaunchCheckBox.IsChecked = settings.NetworkToolAutoLaunch;
             VoiceMasterVolumeSlider.Value = settings.VoiceOutputVolume;
             VoiceMuteButton.Content = "Микрофон";
             VoiceDeafenButton.Content = "Звук";
@@ -424,7 +407,6 @@ public partial class MainWindow : Window
                 await StartNetworkingAsync();
             }
 
-            RefreshNetworkToolSetupStatus();
             RefreshVoicePeers();
             RefreshLanAdvertisementState();
             RefreshUi();
@@ -2232,80 +2214,6 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private async void InstallNetworkToolButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (_networkToolInstallBusy) return;
-        _networkToolInstallBusy = true;
-        RefreshUi();
-        try
-        {
-            var setup = RequireNetworkToolSetup();
-            if (setup.GetInstallInfo().IsInstalled)
-            {
-                RefreshNetworkToolSetupStatus();
-                SetState($"{setup.DisplayName} installed");
-                return;
-            }
-
-            var progress = new Progress<string>(message =>
-            {
-                SetState(message);
-                RequireLogger().Info(message);
-            });
-            var installer = await setup.DownloadInstallerAsync(progress, _lifetimeCts.Token);
-            await setup.InstallAndCleanupAsync(installer, progress, _lifetimeCts.Token);
-            RefreshNetworkToolSetupStatus();
-            await RefreshNetworkAdaptersAsync(forceRestart: true);
-        }
-        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            RequireLogger().Warn(ex.Message);
-            MessageBox.Show(ex.Message, "Minecraft", MessageBoxButton.OK, MessageBoxImage.Warning);
-        }
-        finally
-        {
-            _networkToolInstallBusy = false;
-            RefreshUi();
-        }
-    }
-
-    private async void GenerateNetworkCredentialsButton_Click(object sender, RoutedEventArgs e)
-    {
-        await RunUiActionAsync(() =>
-        {
-            var credentials = GenerateAndFillNetworkCredentials();
-            RequireLogger().Info($"Generated network name: {credentials.NetworkName}");
-            SetState("Network credentials generated");
-            return Task.CompletedTask;
-        });
-    }
-
-    private void CopyNetworkNameButton_Click(object sender, RoutedEventArgs e)
-    {
-        CopyTextIfPossible(RequireSettings().NetworkName);
-        SetState("Network name copied");
-    }
-
-    private void CopyNetworkPasswordButton_Click(object sender, RoutedEventArgs e)
-    {
-        CopyTextIfPossible(RequireSettings().NetworkPassword);
-        SetState("Network password copied");
-    }
-
-    private void NetworkToolAutoLaunchCheckBox_Changed(object sender, RoutedEventArgs e)
-    {
-        if (_suppressTextPersistence || _settings is null || _settingsService is null)
-        {
-            return;
-        }
-
-        _settings.NetworkToolAutoLaunch = NetworkToolAutoLaunchCheckBox.IsChecked == true;
-        _settingsService.Save(_settings);
-    }
-
     private void TransferSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         RefreshUi();
@@ -2413,53 +2321,6 @@ public partial class MainWindow : Window
         if (bytes >= mb) return $"{bytes / (double)mb:0.##} МБ";
         if (bytes >= kb) return $"{bytes / (double)kb:0.##} КБ";
         return $"{bytes} Б";
-    }
-
-    private void StartSecretLoading()
-    {
-        SecretProgressBar.Maximum = 100;
-        SecretProgressBar.Value = 0;
-        SetProgressActivity(SecretProgressBar, active: false);
-        SecretExtendedProgressBar.Maximum = SecretLoadingDuration.TotalSeconds;
-        SecretExtendedProgressBar.Value = 0;
-        SecretExtendedProgressBar.Visibility = Visibility.Visible;
-        SecretProgressText.Text = "Загрузка";
-        SecretOpenButton.IsEnabled = false;
-        _secretLoadingStartedAt = DateTimeOffset.Now;
-        _secretTimer.Start();
-        RefreshSecretLoadingProgress();
-    }
-
-    private void RefreshSecretLoadingProgress()
-    {
-        if (_secretLoadingStartedAt is null) return;
-
-        var elapsedSeconds = (DateTimeOffset.Now - _secretLoadingStartedAt.Value).TotalSeconds;
-        SecretExtendedProgressBar.Value = Math.Clamp(elapsedSeconds, 0, SecretExtendedProgressBar.Maximum);
-        if (SecretExtendedProgressBar.Value >= SecretExtendedProgressBar.Maximum)
-        {
-            _secretTimer.Stop();
-            SecretExtendedProgressBar.Visibility = Visibility.Collapsed;
-            SecretExtendedProgressBar.Value = 0;
-            SecretProgressBar.Value = SecretProgressBar.Maximum;
-            SetProgressActivity(SecretProgressBar, active: false);
-            SecretProgressText.Text = "Загрузка завершена";
-        }
-        else
-        {
-            SecretProgressText.Text = "Загрузка";
-        }
-
-        RefreshUi();
-    }
-
-    private void SecretOpenButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (SecretExtendedProgressBar.Visibility == Visibility.Visible ||
-            SecretProgressBar.Value < SecretProgressBar.Maximum) return;
-
-        var window = new SecretMessageWindow(GetCurrentUiScale()) { Owner = this };
-        window.ShowDialog();
     }
 
     private static string BuildVersionText()
@@ -2849,71 +2710,6 @@ public partial class MainWindow : Window
         SetVoicePeerVolume(peer, e.NewValue);
     }
 
-    private async Task AutoLaunchInstalledNetworkToolAsync()
-    {
-        try
-        {
-            var setup = RequireNetworkToolSetup();
-            if (setup.Launch())
-            {
-                await RequireNetwork().WaitForProviderAsync(
-                    setup.ToolId,
-                    TimeSpan.FromSeconds(5),
-                    _lifetimeCts.Token);
-            }
-        }
-        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            RequireLogger().Warn($"Network tool auto-launch failed: {ex.Message}");
-        }
-    }
-
-    private NetworkCredentials GenerateAndFillNetworkCredentials()
-    {
-        var settings = RequireSettings();
-        var playerName = GetPlayerDisplayName();
-        var credentials = RequireNetworkToolSetup().GenerateCredentials(playerName);
-        settings.NetworkName = credentials.NetworkName;
-        settings.NetworkPassword = credentials.Password;
-        RequireSettingsService().Save(settings);
-
-        _suppressTextPersistence = true;
-        try
-        {
-            RefreshNetworkCredentialsText();
-        }
-        finally
-        {
-            _suppressTextPersistence = false;
-        }
-
-        return credentials;
-    }
-
-    private void RefreshNetworkCredentialsText()
-    {
-        if (_settings is null)
-        {
-            return;
-        }
-
-        NetworkNameTextBox.Text = _settings.NetworkName?.Trim() ?? string.Empty;
-        NetworkPasswordTextBox.Text = _settings.NetworkPassword?.Trim() ?? string.Empty;
-    }
-
-    private void RefreshNetworkToolSetupStatus()
-    {
-        if (_networkToolSetup is null) return;
-        var installInfo = _networkToolSetup.GetInstallInfo();
-        _networkToolInstalled = installInfo.IsInstalled;
-        SetState(installInfo.IsInstalled
-            ? $"{_networkToolSetup.DisplayName} installed"
-            : $"{_networkToolSetup.DisplayName} not installed");
-    }
-
     private void ApplyMemoryText()
     {
         if (int.TryParse(MemoryTextBox.Text.Trim(), out var memoryGb))
@@ -2971,19 +2767,6 @@ public partial class MainWindow : Window
         finally
         {
             _suppressMemoryTextChanged = false;
-        }
-    }
-
-    private static void CopyTextIfPossible(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return;
-
-        try
-        {
-            Clipboard.SetText(text);
-        }
-        catch
-        {
         }
     }
 
@@ -3064,15 +2847,11 @@ public partial class MainWindow : Window
         ChangePlayerNameButton.IsEnabled = configurationEnabled;
         ChangePlayerNameButton.Content = _isEditingPlayerName ? "Сохранить" : "Изменить";
         BuildComboBox.IsEnabled = configurationEnabled && _builds.Count > 0;
+        BuildPlaceholderText.Visibility = _builds.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         HostComboBox.IsEnabled = configurationEnabled && _hostPeers.Count > 0;
         PlayButton.Content = "Играть";
         PlayButton.IsEnabled = configurationEnabled && hasBuild && !_isEditingPlayerName;
         SkinButton.IsEnabled = !_minecraftRunning;
-        InstallNetworkToolButton.IsEnabled = !_networkToolInstallBusy && !_networkToolInstalled;
-        GenerateNetworkCredentialsButton.IsEnabled = interactiveEnabled;
-        CopyNetworkNameButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkName);
-        CopyNetworkPasswordButton.IsEnabled = interactiveEnabled && !string.IsNullOrWhiteSpace(_settings.NetworkPassword);
-        NetworkToolAutoLaunchCheckBox.IsEnabled = interactiveEnabled;
         NetworkProviderComboBox.IsEnabled = !_transferActive && _networkProviders.Count > 0;
         WorldComboBox.IsEnabled = interactiveEnabled && !_minecraftPreparing && _worlds.Count > 0;
         OnlinePlayerComboBox.IsEnabled = interactiveEnabled && !_minecraftPreparing && _peers.Count > 0;
@@ -3085,9 +2864,6 @@ public partial class MainWindow : Window
                                    !selectedRecipient.IsMinecraftPreparing;
         MemoryTextBox.IsEnabled = configurationEnabled;
         UpdateButton.IsEnabled = interactiveEnabled && !_updateBusy && _preparedUpdate is not null;
-        SecretOpenButton.IsEnabled = interactiveEnabled &&
-                                     SecretExtendedProgressBar.Visibility != Visibility.Visible &&
-                                     SecretProgressBar.Value >= SecretProgressBar.Maximum;
 
         VoiceJoinButton.IsEnabled = !_voiceBusy && _voiceChannel is not null;
         VoiceSettingsButton.IsEnabled = voiceEnabled;
@@ -3146,7 +2922,6 @@ public partial class MainWindow : Window
     private SettingsService RequireSettingsService() => _settingsService ?? throw new InvalidOperationException("Settings service is not initialized.");
     private Logger RequireLogger() => _logger ?? throw new InvalidOperationException("Logger is not initialized.");
     private VirtualNetworkService RequireNetwork() => _network ?? throw new InvalidOperationException("Network service is not initialized.");
-    private NetworkToolSetupService RequireNetworkToolSetup() => _networkToolSetup ?? throw new InvalidOperationException("Network tool setup service is not initialized.");
     private PackHashService RequirePackHash() => _packHash ?? throw new InvalidOperationException("Pack hash service is not initialized.");
     private WorldMetadataService RequireWorldMetadata() => _worldMetadata ?? throw new InvalidOperationException("World metadata service is not initialized.");
     private LocalIdentityService RequireIdentityService() => _identityService ?? throw new InvalidOperationException("Identity service is not initialized.");

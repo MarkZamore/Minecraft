@@ -22,7 +22,6 @@
 # Local binaries/installers and archives
 *.exe
 *.msi
-!/Program/Hamachi.msi
 *.7z
 *.zip
 

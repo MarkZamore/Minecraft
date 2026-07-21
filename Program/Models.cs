@@ -25,9 +25,6 @@ public sealed class AppSettings
     public long MaxArchiveBytes { get; set; } = 10L * 1024 * 1024 * 1024;
 
     public string ClientRelativePath { get; set; } = "";
-    public string NetworkName { get; set; } = "";
-    public string NetworkPassword { get; set; } = "";
-    public bool NetworkToolAutoLaunch { get; set; } = true;
     public string SkinPath { get; set; } = "";
     public string SelectedWorldRelativePath { get; set; } = "";
     public string VoiceInputDeviceId { get; set; } = "";
