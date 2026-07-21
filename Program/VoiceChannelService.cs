@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Channels;
 
 namespace Minecraft;
 
@@ -16,6 +17,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     private static readonly TimeSpan SpeakingHold = TimeSpan.FromMilliseconds(250);
     private readonly Logger _logger;
     private readonly VoiceNetworkCoordinator _networkCoordinator;
+    private readonly VirtualNetworkService _virtualNetwork;
     private readonly PeerRouteResolver? _peerRoutes;
     private readonly VoiceRuntimeOptions _runtimeOptions;
     private readonly VoiceDeviceManager _deviceManager = new();
@@ -33,6 +35,10 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     private VoicePlayback? _playback;
     private CancellationTokenSource? _heartbeatCts;
     private Task? _heartbeatTask;
+    private Channel<AudioSendItem>? _audioSendQueue;
+    private Task? _audioSendTask;
+    private Channel<bool>? _protectionSyncQueue;
+    private Task? _protectionSyncTask;
     private Timer? _speakingTimer;
     private string _selfPeerId = "";
     private string _inputDeviceId = "";
@@ -66,9 +72,10 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         _logger = logger;
         _networkCoordinator = networkCoordinator ?? new VoiceNetworkCoordinator();
         _peerRoutes = routes;
+        _virtualNetwork = network ?? new VirtualNetworkService(logger);
         _runtimeOptions = runtimeOptions ?? new VoiceRuntimeOptions();
         _runtimeOptions.Validate();
-        _transport = new VoiceTransport(logger, network ?? new VirtualNetworkService(logger));
+        _transport = new VoiceTransport(logger, _virtualNetwork);
         _receiver = new VoiceReceiver(VoiceEncoder.FrameSamples);
     }
 
@@ -107,14 +114,6 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
     {
         _inputDeviceId = inputDeviceId?.Trim() ?? "";
         _outputDeviceId = outputDeviceId?.Trim() ?? "";
-    }
-
-    public IReadOnlyCollection<string> KnownPeers
-    {
-        get
-        {
-            lock (_stateLock) return _routes.Keys.ToArray();
-        }
     }
 
     public void SetPeerVolume(string peerId, double volume)
@@ -187,7 +186,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
 
         _networkCoordinator.SetTrafficProtectionEnabled(enabled);
         TrafficProtectionChanged?.Invoke(enabled);
-        _ = BroadcastProtectionStateAsync();
+        _protectionSyncQueue?.Writer.TryWrite(true);
         return enabled;
     }
 
@@ -201,16 +200,22 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                            !string.Equals(peer.PeerId, _selfPeerId, StringComparison.OrdinalIgnoreCase) &&
                            IPAddress.TryParse(peer.Address, out _))
             .GroupBy(peer => peer.PeerId, StringComparer.OrdinalIgnoreCase)
-                    .ToDictionary(
-                group => group.Key,
-                    group => group.Select(peer => new VoiceRouteTarget(
-                        new IPEndPoint(IPAddress.Parse(peer.Address), _runtimeOptions.Port),
-                        peer.ProviderId?.Trim() ?? "",
-                        peer.InterfaceId?.Trim() ?? ""))
+            .Select(group => new
+            {
+                group.Key,
+                Targets = group.Select(CreateVoiceRouteTarget)
+                    .Where(target => target is not null)
+                    .Select(target => target!)
                     .Distinct()
-                    .ToArray(),
+                    .ToArray()
+            })
+            .Where(group => group.Targets.Length > 0)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Targets,
                 StringComparer.OrdinalIgnoreCase);
 
+        var removedPresence = new List<string>();
         lock (_stateLock)
         {
             var now = DateTimeOffset.UtcNow;
@@ -218,7 +223,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             {
                 var route = _routes[removedPeer];
                 if (now - route.LastDiscoverySeenUtc < TimeSpan.FromSeconds(30)) continue;
-                RemovePeerLocked(removedPeer, explicitLeave: false);
+                if (RemovePeerLocked(removedPeer)) removedPresence.Add(removedPeer);
             }
 
             foreach (var pair in incoming)
@@ -236,6 +241,21 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                 _playback?.SetPeerVolume(pair.Key, _peerVolumes[pair.Key]);
             }
         }
+        foreach (var peerId in removedPresence) PeerPresenceChanged?.Invoke(peerId, false, false);
+    }
+
+    private VoiceRouteTarget? CreateVoiceRouteTarget(VoicePeerCandidate peer)
+    {
+        var remoteAddress = IPAddress.Parse(peer.Address);
+        var providerId = peer.ProviderId?.Trim() ?? "";
+        var local = _virtualNetwork.SelectLocalEndpoint(remoteAddress, providerId);
+        if (local is null) return null;
+        return new VoiceRouteTarget(
+            new IPEndPoint(remoteAddress, _runtimeOptions.Port),
+            providerId,
+            peer.InterfaceId?.Trim() ?? "",
+            local?.NetworkAddress ?? "",
+            local?.InterfaceId ?? "");
     }
 
     public void Join()
@@ -283,6 +303,22 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _networkCoordinator.SetTrafficProtectionEnabled(true);
             _heartbeatCts = new CancellationTokenSource();
             _heartbeatTask = HeartbeatLoopAsync(_heartbeatCts.Token);
+            _audioSendQueue = Channel.CreateBounded<AudioSendItem>(new BoundedChannelOptions(4)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.DropOldest
+            });
+            _audioSendTask = AudioSendLoopAsync(_audioSendQueue.Reader, _heartbeatCts.Token);
+            _protectionSyncQueue = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.DropOldest
+            });
+            _protectionSyncTask = ProtectionSyncLoopAsync(
+                _protectionSyncQueue.Reader,
+                _heartbeatCts.Token);
             _speakingTimer = new Timer(CheckLocalSpeakingTimeout, null, 100, 100);
         }
         TrafficProtectionChanged?.Invoke(true);
@@ -319,6 +355,10 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         }
         CancellationTokenSource? heartbeatCts;
         Task? heartbeatTask;
+        Channel<AudioSendItem>? audioSendQueue;
+        Task? audioSendTask;
+        Channel<bool>? protectionSyncQueue;
+        Task? protectionSyncTask;
         VoicePlayback? playback;
         Timer? speakingTimer;
         VoiceDecoder[] decoders;
@@ -337,6 +377,14 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             heartbeatTask = _heartbeatTask;
             _heartbeatCts = null;
             _heartbeatTask = null;
+            audioSendQueue = _audioSendQueue;
+            audioSendTask = _audioSendTask;
+            _audioSendQueue = null;
+            _audioSendTask = null;
+            protectionSyncQueue = _protectionSyncQueue;
+            protectionSyncTask = _protectionSyncTask;
+            _protectionSyncQueue = null;
+            _protectionSyncTask = null;
             speakingTimer = _speakingTimer;
             _speakingTimer = null;
             playback = _playback;
@@ -347,10 +395,18 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _peerVolumes.Clear();
         }
 
+        audioSendQueue?.Writer.TryComplete();
+        protectionSyncQueue?.Writer.TryComplete();
         heartbeatCts?.Cancel();
-        if (heartbeatTask is not null)
+        if (heartbeatTask is not null || audioSendTask is not null || protectionSyncTask is not null)
         {
-            try { await heartbeatTask.ConfigureAwait(false); }
+            try
+            {
+                await Task.WhenAll(
+                    heartbeatTask ?? Task.CompletedTask,
+                    audioSendTask ?? Task.CompletedTask,
+                    protectionSyncTask ?? Task.CompletedTask).ConfigureAwait(false);
+            }
             catch (OperationCanceledException) { }
         }
         heartbeatCts?.Dispose();
@@ -374,6 +430,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         {
             List<(string PeerId, VoiceRouteTarget[] Targets, int Nonce)> sends;
             List<(string PeerId, VoiceRouteTarget Target)> unhealthyRoutes = [];
+            List<string> expiredPresence = [];
             var now = DateTimeOffset.UtcNow;
             lock (_stateLock)
             {
@@ -398,10 +455,11 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                     if (pair.Value.PresenceAnnounced && now - pair.Value.LastPacketUtc >= TimeSpan.FromSeconds(30))
                     {
                         pair.Value.PresenceAnnounced = false;
-                        PeerPresenceChanged?.Invoke(pair.Key, false, false);
+                        expiredPresence.Add(pair.Key);
                     }
                 }
             }
+            foreach (var peerId in expiredPresence) PeerPresenceChanged?.Invoke(peerId, false, false);
             foreach (var unhealthy in unhealthyRoutes)
             {
                 _peerRoutes?.MarkEndpointUnhealthy(
@@ -508,7 +566,25 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             _selfPeerId,
             Interlocked.Increment(ref _nextAudioSequence),
             payload);
-        _ = _transport.SendAsync(targets, packet, CancellationToken.None);
+        _audioSendQueue?.Writer.TryWrite(new AudioSendItem(targets, packet));
+    }
+
+    private async Task AudioSendLoopAsync(ChannelReader<AudioSendItem> reader, CancellationToken token)
+    {
+        try
+        {
+            await foreach (var item in reader.ReadAllAsync(token).ConfigureAwait(false))
+            {
+                await _transport.SendAsync(item.Targets, item.Packet, token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            WarnPacketError("Voice audio send loop failed: " + ex.Message);
+        }
     }
 
     private async Task OnVoicePacketAsync(
@@ -538,7 +614,11 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
                     receivingProviderId,
                     receivingInterfaceId);
                 if (matchedCandidate is null) return;
-                if (_peerRoutes is not null && !_peerRoutes.IsKnownEndpoint(peerId, remote.Address)) return;
+                if (_peerRoutes is not null && !_peerRoutes.IsKnownEndpoint(
+                        peerId,
+                        remote.Address,
+                        matchedCandidate.ProviderId,
+                        matchedCandidate.InterfaceId)) return;
                 var now = DateTimeOffset.UtcNow;
                 confirmedTarget = matchedCandidate with
                 {
@@ -692,7 +772,8 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
 
     private void ResetPeerDecoderAfterFailure(byte[] packet)
     {
-        if (!TryParsePacket(packet, out _, out var peerId, out var sequence, out _)) return;
+        if (!TryParsePacket(packet, out var type, out var peerId, out var sequence, out _) ||
+            type != VoicePacketType.Audio) return;
         VoiceDecoder? decoder;
         lock (_stateLock)
         {
@@ -726,9 +807,9 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         return route.Candidates.FirstOrDefault(candidate =>
             candidate.EndPoint.Address.Equals(remote.Address) &&
             string.Equals(candidate.ProviderId, receivingProviderId, StringComparison.OrdinalIgnoreCase) &&
-            (string.IsNullOrWhiteSpace(candidate.InterfaceId) ||
-             string.IsNullOrWhiteSpace(receivingInterfaceId) ||
-             string.Equals(candidate.InterfaceId, receivingInterfaceId, StringComparison.OrdinalIgnoreCase)));
+            (string.IsNullOrWhiteSpace(candidate.LocalInterfaceId) ||
+              string.IsNullOrWhiteSpace(receivingInterfaceId) ||
+              string.Equals(candidate.LocalInterfaceId, receivingInterfaceId, StringComparison.OrdinalIgnoreCase)));
     }
 
     private void CheckLocalSpeakingTimeout(object? state)
@@ -765,16 +846,13 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         }
     }
 
-    private void RemovePeerLocked(string peerId, bool explicitLeave)
+    private bool RemovePeerLocked(string peerId)
     {
-        if (!_routes.Remove(peerId, out var route)) return;
+        if (!_routes.Remove(peerId, out var route)) return false;
         _peerVolumes.Remove(peerId);
         if (_decoders.Remove(peerId, out var decoder)) decoder.Dispose();
         _receiver.RemovePeer(peerId);
-        if (route.PresenceAnnounced)
-        {
-            PeerPresenceChanged?.Invoke(peerId, false, explicitLeave);
-        }
+        return route.PresenceAnnounced;
     }
 
     private void SetLocalSpeaking(bool speaking)
@@ -797,7 +875,25 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         _logger.Warn(message);
     }
 
-    private async Task BroadcastProtectionStateAsync()
+    private async Task ProtectionSyncLoopAsync(ChannelReader<bool> reader, CancellationToken token)
+    {
+        try
+        {
+            await foreach (var signal in reader.ReadAllAsync(token).ConfigureAwait(false))
+            {
+                _ = signal;
+                while (reader.TryRead(out _))
+                {
+                }
+                await BroadcastProtectionStateAsync(token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+    }
+
+    private async Task BroadcastProtectionStateAsync(CancellationToken token)
     {
         try
         {
@@ -819,7 +915,7 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
             foreach (var send in sends)
             {
                 var packet = BuildPacket(VoicePacketType.Hello, _selfPeerId, send.Nonce, payload);
-                await _transport.SendAsync(send.Targets, packet, CancellationToken.None).ConfigureAwait(false);
+                await _transport.SendAsync(send.Targets, packet, token).ConfigureAwait(false);
             }
         }
         catch (Exception ex)
@@ -989,6 +1085,8 @@ public sealed class VoiceChannelService : IDisposable, IAsyncDisposable
         public bool PresenceAnnounced { get; set; }
         public DateTimeOffset LastPresenceNotificationUtc { get; set; }
     }
+
+    private sealed record AudioSendItem(VoiceRouteTarget[] Targets, byte[] Packet);
 
     private enum VoicePacketType : byte
     {

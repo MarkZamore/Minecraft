@@ -230,21 +230,6 @@ public sealed class WaypointSyncService : IAsyncDisposable
             .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
             .Distinct()
             .ToArray();
-        if (addresses.Length == 0)
-        {
-            addresses = (announcement.NetworkEndpoints ?? [])
-                .Select(endpoint => new WaypointRouteEndpoint(
-                    endpoint.Address,
-                    endpoint.ProviderId,
-                    endpoint.InterfaceId))
-                .Append(new WaypointRouteEndpoint(
-                    announcement.NetworkAddress,
-                    announcement.NetworkProviderId,
-                    announcement.NetworkInterfaceId))
-                .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
-                .Distinct()
-                .ToArray();
-        }
         if (addresses.Length == 0) return;
 
         var providers = (announcement.WaypointProviders ?? []).Select(item => new WaypointProviderAnnouncement

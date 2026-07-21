@@ -9,10 +9,14 @@ public sealed class VirtualNetworkService
     private const SocketOptionName UnicastInterfaceOption = (SocketOptionName)31;
     private readonly NetworkProviderCatalog _providers;
     private readonly object _sessionGate = new();
+    private readonly object _snapshotGate = new();
     private Dictionary<string, DateTimeOffset> _sessionProviders =
         new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
     private string _selectedProviderId = "";
     private bool _sessionCaptured;
+    private NetworkEnvironmentSnapshot? _cachedSnapshot;
+    private readonly Dictionary<string, NetworkEndpointInfo?> _routeCache =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public VirtualNetworkService(Logger logger)
     {
@@ -55,19 +59,23 @@ public sealed class VirtualNetworkService
             _selectedProviderId = available.FirstOrDefault()?.Id ?? "";
             _sessionCaptured = true;
         }
+        InvalidateSnapshot();
         return available;
     }
 
     public bool SelectProvider(string providerId)
     {
         providerId = providerId?.Trim() ?? "";
+        var changed = false;
         lock (_sessionGate)
         {
             if (!_sessionCaptured || !_sessionProviders.ContainsKey(providerId)) return false;
             if (string.Equals(_selectedProviderId, providerId, StringComparison.OrdinalIgnoreCase)) return false;
             _selectedProviderId = providerId;
-            return true;
+            changed = true;
         }
+        if (changed) InvalidateSnapshot();
+        return changed;
     }
 
     public async Task<bool> WaitForProviderAsync(
@@ -92,6 +100,11 @@ public sealed class VirtualNetworkService
 
     public NetworkEnvironmentSnapshot GetSnapshot()
     {
+        lock (_snapshotGate)
+        {
+            if (_cachedSnapshot is not null) return _cachedSnapshot;
+        }
+
         string selectedProviderId;
         lock (_sessionGate) selectedProviderId = _selectedProviderId;
         var endpoints = EnumerateEndpoints(selectedProviderId)
@@ -109,12 +122,26 @@ public sealed class VirtualNetworkService
             .ThenBy(endpoint => endpoint.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
             .ThenBy(endpoint => endpoint.NetworkAddress, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        return new NetworkEnvironmentSnapshot
+        var snapshot = new NetworkEnvironmentSnapshot
         {
             CapturedAtUtc = DateTimeOffset.UtcNow,
             Endpoints = ordered,
             PrimaryEndpoint = primary
         };
+        lock (_snapshotGate)
+        {
+            _cachedSnapshot ??= snapshot;
+            return _cachedSnapshot;
+        }
+    }
+
+    public void InvalidateSnapshot()
+    {
+        lock (_snapshotGate)
+        {
+            _cachedSnapshot = null;
+            _routeCache.Clear();
+        }
     }
 
     public NetworkEndpointInfo? SelectLocalEndpoint(
@@ -126,10 +153,19 @@ public sealed class VirtualNetworkService
 
         providerId = providerId?.Trim() ?? "";
         var snapshot = GetSnapshot();
+        var cacheKey = $"{snapshot.Fingerprint}|{providerId}|{remoteAddress}";
+        lock (_snapshotGate)
+        {
+            if (_routeCache.TryGetValue(cacheKey, out var cached)) return cached;
+        }
+
         var candidates = snapshot.Endpoints
             .Where(endpoint => endpoint.AddressFamily == remoteAddress.AddressFamily)
             .ToArray();
-        if (candidates.Length == 0) return null;
+        if (candidates.Length == 0) return CacheRoute(cacheKey, null);
+
+        var routedLocalAddress = ResolveRouteLocalAddress(remoteAddress);
+        if (routedLocalAddress is null) return CacheRoute(cacheKey, null);
 
         if (!string.IsNullOrWhiteSpace(providerId))
         {
@@ -138,32 +174,31 @@ public sealed class VirtualNetworkService
                     endpoint.ProviderId,
                     providerId,
                     StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(endpoint => IsInSameNetwork(remoteAddress, endpoint))
-                .ThenByDescending(endpoint => RouteUsesEndpoint(remoteAddress, endpoint))
-                .ThenByDescending(endpoint => endpoint.IsPreferredNetwork)
+                .Where(endpoint => AddressMatches(endpoint, routedLocalAddress))
+                .OrderByDescending(endpoint => endpoint.IsPreferredNetwork)
                 .ThenBy(endpoint => endpoint.SortPriority)
                 .FirstOrDefault();
-            if (providerEndpoint is not null &&
-                (IsInSameNetwork(remoteAddress, providerEndpoint) || RouteUsesEndpoint(remoteAddress, providerEndpoint)))
-            {
-                return providerEndpoint;
-            }
+            return CacheRoute(cacheKey, providerEndpoint);
         }
 
-        var sameNetwork = candidates
-            .Where(endpoint => IsInSameNetwork(remoteAddress, endpoint))
-            .Where(endpoint => string.IsNullOrWhiteSpace(providerId) || endpoint.IsPhysical)
+        var routed = candidates
+            .Where(endpoint => endpoint.IsPhysical)
+            .Where(endpoint => AddressMatches(endpoint, routedLocalAddress))
             .OrderByDescending(endpoint => endpoint.IsPreferredNetwork)
             .ThenBy(endpoint => endpoint.SortPriority)
             .FirstOrDefault();
-        if (sameNetwork is not null) return sameNetwork;
+        return CacheRoute(cacheKey, routed);
+    }
 
-        return candidates
-            .Where(endpoint => string.IsNullOrWhiteSpace(providerId) || endpoint.IsPhysical)
-            .Where(endpoint => RouteUsesEndpoint(remoteAddress, endpoint))
-            .OrderByDescending(endpoint => endpoint.IsPreferredNetwork)
-            .ThenBy(endpoint => endpoint.SortPriority)
-            .FirstOrDefault();
+    public bool CanRoute(IPAddress target, NetworkEndpointInfo endpoint)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentNullException.ThrowIfNull(endpoint);
+        if (target.AddressFamily != endpoint.AddressFamily) return false;
+        var selected = SelectLocalEndpoint(target, endpoint.ProviderId);
+        return selected is not null &&
+               string.Equals(selected.InterfaceId, endpoint.InterfaceId, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(selected.NetworkAddress, endpoint.NetworkAddress, StringComparison.OrdinalIgnoreCase);
     }
 
     public TcpClient CreateBoundTcpClient(
@@ -332,32 +367,27 @@ public sealed class VirtualNetworkService
         };
     }
 
-    public static bool IsInSameNetwork(IPAddress address, NetworkEndpointInfo endpoint)
+    private NetworkEndpointInfo? CacheRoute(string key, NetworkEndpointInfo? endpoint)
     {
-        if (!IPAddress.TryParse(endpoint.NetworkAddress, out var adapterAddress) ||
-            address.AddressFamily != adapterAddress.AddressFamily)
-        {
-            return false;
-        }
-        return PrefixMatches(address, adapterAddress, endpoint.PrefixLength);
+        lock (_snapshotGate) _routeCache[key] = endpoint;
+        return endpoint;
     }
 
-    private static bool RouteUsesEndpoint(IPAddress target, NetworkEndpointInfo endpoint)
+    private static bool AddressMatches(NetworkEndpointInfo endpoint, IPAddress? address) =>
+        address is not null &&
+        string.Equals(endpoint.NetworkAddress, address.ToString(), StringComparison.OrdinalIgnoreCase);
+
+    private static IPAddress? ResolveRouteLocalAddress(IPAddress target)
     {
-        if (target.AddressFamily != endpoint.AddressFamily ||
-            !IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress))
-        {
-            return false;
-        }
         try
         {
             using var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
             socket.Connect(new IPEndPoint(target, 9));
-            return socket.LocalEndPoint is IPEndPoint local && local.Address.Equals(localAddress);
+            return (socket.LocalEndPoint as IPEndPoint)?.Address;
         }
         catch (SocketException)
         {
-            return false;
+            return null;
         }
     }
 
@@ -445,24 +475,6 @@ public sealed class VirtualNetworkService
         value.Contains("Tunnel", StringComparison.OrdinalIgnoreCase) ||
         value.Contains("TAP", StringComparison.OrdinalIgnoreCase) ||
         value.Contains("TUN", StringComparison.OrdinalIgnoreCase);
-
-    private static bool PrefixMatches(IPAddress left, IPAddress right, int prefixLength)
-    {
-        var leftBytes = left.GetAddressBytes();
-        var rightBytes = right.GetAddressBytes();
-        if (leftBytes.Length != rightBytes.Length) return false;
-        var maxBits = leftBytes.Length * 8;
-        var bits = Math.Clamp(prefixLength, 0, maxBits);
-        var wholeBytes = bits / 8;
-        var remainingBits = bits % 8;
-        for (var index = 0; index < wholeBytes; index++)
-        {
-            if (leftBytes[index] != rightBytes[index]) return false;
-        }
-        if (remainingBits == 0) return true;
-        var mask = (byte)(0xFF << (8 - remainingBits));
-        return (leftBytes[wholeBytes] & mask) == (rightBytes[wholeBytes] & mask);
-    }
 
     private static IPAddress PrefixToMask(int prefixLength)
     {

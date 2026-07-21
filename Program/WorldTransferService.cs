@@ -638,20 +638,6 @@ public sealed class WorldTransferService : IAsyncDisposable
             .ToArray();
         if (candidateEndpoints.Length == 0)
         {
-            candidateEndpoints = peer.GetCandidateEndpoints(preferredProviderId: _network.SelectedProviderId)
-                .Where(endpoint => IPAddress.TryParse(endpoint.Address, out _))
-                .Select(endpoint => new PeerCandidateEndpoint
-                {
-                    Address = endpoint.Address,
-                    ProviderId = endpoint.ProviderId,
-                    InterfaceId = endpoint.InterfaceId,
-                    AddressFamily = endpoint.AddressFamily,
-                    NetworkType = endpoint.NetworkType
-                })
-                .ToArray();
-        }
-        if (candidateEndpoints.Length == 0)
-        {
             throw new InvalidOperationException("Selected player does not have a valid network IP address.");
         }
 

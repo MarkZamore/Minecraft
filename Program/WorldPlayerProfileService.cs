@@ -613,6 +613,11 @@ internal sealed class NbtCompoundTag : NbtTag
         return _tags.FirstOrDefault(tag => string.Equals(tag.Name, name, StringComparison.Ordinal))?.Tag as NbtCompoundTag;
     }
 
+    public string? GetString(string name)
+    {
+        return (_tags.FirstOrDefault(tag => string.Equals(tag.Name, name, StringComparison.Ordinal))?.Tag as NbtStringTag)?.Value;
+    }
+
     public Guid? GetUuid()
     {
         var uuidTag = _tags.FirstOrDefault(tag => string.Equals(tag.Name, "UUID", StringComparison.Ordinal))?.Tag as NbtIntArrayTag;

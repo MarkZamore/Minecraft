@@ -74,8 +74,14 @@ public partial class MainWindow : Window
     private string _state = "Starting";
     private int? _openToLanPort;
     private string _openToLanSessionId = "";
+    private string _openToLanWorldName = "";
     private long _openToLanLogPosition;
-    private int? _cachedOpenToLanPort;
+    private int? _pendingOpenToLanPort;
+    private long _pendingOpenToLanGeneration;
+    private long _activeOpenToLanGeneration;
+    private DateTimeOffset _pendingOpenToLanSince;
+    private DateTimeOffset? _openToLanListenerMissingSince;
+    private bool _openToLanCloseObserved;
     private bool _networkToolInstalled;
     private bool _networkRefreshInProgress;
     private bool _networkChangeSubscribed;
@@ -409,6 +415,7 @@ public partial class MainWindow : Window
         try
         {
             var previousFingerprint = _networkSnapshot.Fingerprint;
+            RequireNetwork().InvalidateSnapshot();
             RefreshNetworkEnvironment();
             var currentFingerprint = _networkSnapshot.Fingerprint;
             if (_startupComplete &&
@@ -879,53 +886,6 @@ public partial class MainWindow : Window
             .Select(entry => entry.Peer)
             .ToList();
 
-        var discoveredVoicePeers = _peers
-            .Where(peer =>
-                peer.IsInVoiceChannel &&
-                DateTimeOffset.UtcNow - peer.LastSeen < TimeSpan.FromSeconds(30))
-            .OrderByDescending(peer => peer.LastSeen)
-            .ThenBy(peer => peer.PlayerName, StringComparer.CurrentCultureIgnoreCase)
-            .ToArray();
-        var existingIds = peers
-            .Select(ResolveVoicePeerId)
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var peer in discoveredVoicePeers)
-        {
-            var id = ResolveVoicePeerId(peer);
-            if (!existingIds.Contains(id))
-            {
-                peers.Add(peer);
-                existingIds.Add(id);
-            }
-        }
-
-        if (_voiceChannel is not null)
-        {
-            var transportPeers = _voiceChannel.KnownPeers
-                .Where(peerId => !string.IsNullOrWhiteSpace(peerId))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            foreach (var peerId in transportPeers)
-            {
-                if (existingIds.Contains(peerId))
-                {
-                    continue;
-                }
-
-                var transportPeer = _peers.FirstOrDefault(peer =>
-                    string.Equals(ResolveVoicePeerId(peer), peerId, StringComparison.OrdinalIgnoreCase));
-                if (transportPeer is null)
-                {
-                    var placeholder = CreateUnknownVoicePeer(peerId);
-                    transportPeer = placeholder;
-                }
-
-                peers.Add(transportPeer);
-                existingIds.Add(peerId);
-            }
-        }
-
         peers.Sort((left, right) =>
         {
             if (ReferenceEquals(left, right))
@@ -998,7 +958,8 @@ public partial class MainWindow : Window
 
         var peers = _voicePresence
             .Where(pair => pair.Value.LastSeenUtc >= DateTimeOffset.UtcNow - TimeSpan.FromSeconds(30))
-            .SelectMany(pair => pair.Value.Endpoints.Select(endpoint =>
+            .SelectMany(pair => (_peerRoutes?.GetSendCandidates(pair.Key, _primaryEndpoint?.ProviderId) ?? [])
+                .Select(endpoint =>
                 new VoicePeerCandidate(
                     pair.Key,
                     endpoint.Address,
@@ -1007,24 +968,9 @@ public partial class MainWindow : Window
             .Where(peer => !string.IsNullOrWhiteSpace(peer.PeerId))
             .Distinct()
             .ToArray();
-        var discoveredVoicePeers = _peers
-            .Where(peer =>
-                peer.IsInVoiceChannel &&
-                DateTimeOffset.UtcNow - peer.LastSeen < TimeSpan.FromSeconds(30))
-            .SelectMany(peer => GetVoiceFallbackEndpoints(peer).Select(endpoint =>
-                new VoicePeerCandidate(
-                    ResolveVoicePeerId(peer),
-                    endpoint.Address,
-                    endpoint.ProviderId,
-                    endpoint.InterfaceId)))
-            .Where(peer => !string.IsNullOrWhiteSpace(peer.PeerId) && !string.IsNullOrWhiteSpace(peer.Address))
-            .ToArray();
-        peers = peers.Concat(discoveredVoicePeers)
-            .Distinct()
-            .ToArray();
 
         var signature = string.Join("|", peers.Select(peer =>
-            $"{peer.PeerId}@{peer.Address}:{peer.ProviderId}"));
+            $"{peer.PeerId}@{peer.Address}:{peer.ProviderId}:{peer.InterfaceId}"));
         if (string.Equals(signature, _lastVoiceTransportPeerSignature, StringComparison.Ordinal))
         {
             return;
@@ -1041,12 +987,9 @@ public partial class MainWindow : Window
             return "";
         }
 
-        if (!string.IsNullOrWhiteSpace(peer.IdentityId))
-        {
-            return peer.IdentityId;
-        }
-
-        return peer.NetworkAddress;
+        return Guid.TryParse(peer.IdentityId, out var identity)
+            ? identity.ToString("D")
+            : "";
     }
 
     private string GetVoicePeerSignature(PeerViewModel peer)
@@ -1054,18 +997,11 @@ public partial class MainWindow : Window
         var peerId = ResolveVoicePeerId(peer);
         var addresses = (_peerRoutes?.GetSendCandidates(peer.IdentityId, _primaryEndpoint?.ProviderId) ?? [])
             .Where(endpoint => !string.IsNullOrWhiteSpace(endpoint.Address))
-            .Select(endpoint => $"{endpoint.Address}|{endpoint.ProviderId}")
+            .Select(endpoint => $"{endpoint.Address}|{endpoint.ProviderId}|{endpoint.InterfaceId}")
             .Where(address => !string.IsNullOrWhiteSpace(address))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(address => address, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (addresses.Length == 0)
-        {
-            addresses = peer.NetworkAddress.Length > 0
-                ? [peer.NetworkAddress]
-                : Array.Empty<string>();
-        }
-
         return $"{peerId}=>{string.Join(",", addresses)}";
     }
 
@@ -1076,12 +1012,9 @@ public partial class MainWindow : Window
             return "";
         }
 
-        if (!string.IsNullOrWhiteSpace(peer.IdentityId))
-        {
-            return peer.IdentityId;
-        }
-
-        return peer.NetworkAddress;
+        return Guid.TryParse(peer.IdentityId, out var identity)
+            ? identity.ToString("D")
+            : "";
     }
 
     private static string[] GetSelectedPeerAddresses(PeerViewModel? peer)
@@ -1134,90 +1067,6 @@ public partial class MainWindow : Window
         return peers.FirstOrDefault(peer =>
             !string.IsNullOrWhiteSpace(peer.NetworkAddress) &&
             selectedSet.Contains(peer.NetworkAddress));
-    }
-
-    private PeerEndpointInfo[] GetVoiceFallbackEndpoints(PeerViewModel peer)
-    {
-        var resolved = _peerRoutes?
-            .GetSendCandidates(peer.IdentityId, _primaryEndpoint?.ProviderId)
-            .Where(endpoint => TryParsePeerAddress(endpoint.Address, out _))
-            .Select(endpoint => new PeerEndpointInfo
-            {
-                Address = endpoint.Address,
-                ProviderId = endpoint.ProviderId,
-                InterfaceId = endpoint.InterfaceId,
-                AddressFamily = endpoint.AddressFamily,
-                NetworkType = endpoint.NetworkType,
-                LastSeen = endpoint.LastSeenUtc,
-                IsHost = peer.IsHost
-            })
-            .ToArray() ?? Array.Empty<PeerEndpointInfo>();
-        if (resolved.Length > 0) return resolved;
-
-        var endpoints = peer.GetCandidateEndpoints(preferredProviderId: _primaryEndpoint?.ProviderId)
-            .Where(endpoint => TryParsePeerAddress(endpoint.Address, out _))
-            .ToArray();
-        if (endpoints.Length > 0)
-        {
-            return endpoints;
-        }
-
-        var networkEndpoint = peer.NetworkEndpoints
-            .FirstOrDefault(endpoint => TryParsePeerAddress(endpoint.Address, out _));
-        if (networkEndpoint is not null)
-        {
-            return [new PeerEndpointInfo
-            {
-                Address = networkEndpoint.Address,
-                ProviderId = networkEndpoint.ProviderId,
-                InterfaceId = networkEndpoint.InterfaceId,
-                AddressFamily = networkEndpoint.AddressFamily,
-                NetworkType = networkEndpoint.NetworkType,
-                LastSeen = peer.LastSeen,
-                IsHost = networkEndpoint.IsHost,
-            }];
-        }
-
-        return Array.Empty<PeerEndpointInfo>();
-    }
-
-    private static bool TryParsePeerAddress(string? value, out IPAddress address)
-    {
-        if (!IPAddress.TryParse(value, out address!))
-        {
-            return false;
-        }
-
-        return !address.Equals(IPAddress.Any) &&
-               !address.Equals(IPAddress.IPv6Any) &&
-               !address.IsIPv6Multicast &&
-               !address.IsIPv6LinkLocal;
-    }
-
-    private static string? NormalizeUnknownPeerLabel(string peerId)
-    {
-        if (string.IsNullOrWhiteSpace(peerId))
-        {
-            return null;
-        }
-
-        return peerId.Length <= 24
-            ? peerId
-            : $"{peerId[..10]}…{peerId[^8..]}";
-    }
-
-    private PeerViewModel CreateUnknownVoicePeer(string peerId)
-    {
-        var label = NormalizeUnknownPeerLabel(peerId) ?? "Unknown";
-        return new PeerViewModel
-        {
-            PlayerName = $"Игрок {label}",
-            IdentityName = peerId,
-            IdentityId = peerId,
-            IsInVoiceChannel = true,
-            IsVoiceMuted = false,
-            LastSeen = DateTimeOffset.Now
-        };
     }
 
     private WorldMetadataContext? CreateWorldMetadataContext()
@@ -1339,7 +1188,7 @@ public partial class MainWindow : Window
             PackHash = _localPackHash,
             ServerPort = openToLanPort ?? 0,
             LanSessionId = _openToLanSessionId,
-            State = openToLanPort.HasValue ? "LAN open" : "Minecraft",
+            LanWorldName = _openToLanWorldName,
             IsVoiceChannelActive = _voiceChannel?.IsJoined == true,
             IsVoiceMuted = _voiceChannel?.IsMuted == true,
             IsMinecraftRunning = _minecraftRunning,
@@ -1384,15 +1233,10 @@ public partial class MainWindow : Window
                 {
                     var peer = _peers.FirstOrDefault(candidate =>
                         string.Equals(ResolveVoicePeerId(candidate), peerId, StringComparison.OrdinalIgnoreCase));
-                    if (peer is null)
-                    {
-                        peer = CreateUnknownVoicePeer(peerId);
-                    }
                     if (peer is not null)
                     {
                         _voicePresence[peerId] = new VoicePresenceEntry(
                             peer,
-                            GetVoiceFallbackEndpoints(peer).ToArray(),
                             DateTimeOffset.UtcNow);
                     }
                 }
@@ -1450,15 +1294,8 @@ public partial class MainWindow : Window
 
         RequireWaypointSync().ObservePeer(announcement);
 
-        var announcementAddresses = (announcement.NetworkEndpoints ?? [])
-            .Select(endpoint => endpoint.Address)
-            .Where(address => !string.IsNullOrWhiteSpace(address))
-            .Concat(string.IsNullOrWhiteSpace(announcement.NetworkAddress)
-                ? Array.Empty<string>()
-                : [announcement.NetworkAddress])
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var peer = FindMatchingPeer(_peers, announcement.IdentityId, announcementAddresses);
+        var peer = _peers.FirstOrDefault(candidate =>
+            string.Equals(candidate.IdentityId, announcement.IdentityId, StringComparison.OrdinalIgnoreCase));
         if (peer is null)
         {
             peer = new PeerViewModel();
@@ -1475,7 +1312,6 @@ public partial class MainWindow : Window
             {
                 _voicePresence[voicePeerId] = new VoicePresenceEntry(
                     peer,
-                    GetVoiceFallbackEndpoints(peer).ToArray(),
                     DateTimeOffset.UtcNow);
             }
             else
@@ -1526,11 +1362,11 @@ public partial class MainWindow : Window
     private void RefreshLanAdvertisementState()
     {
         if (_lanAdvertisement is null || _settings is null) return;
-        var identity = ResolveActiveLocalIdentity();
         _lanAdvertisement.Update(
             _openToLanPort,
             _openToLanSessionId,
-            string.IsNullOrWhiteSpace(identity.name) ? "Minecraft LAN" : identity.name,
+            string.IsNullOrWhiteSpace(_openToLanWorldName) ? "Minecraft LAN" : _openToLanWorldName,
+            string.IsNullOrWhiteSpace(_settings.PlayerName) ? "Minecraft" : _settings.PlayerName,
             _networkEndpoints,
             _peers);
     }
@@ -1592,25 +1428,40 @@ public partial class MainWindow : Window
 
     private void RefreshOpenToLanState()
     {
-        var port = TryDetectOpenToLanPort();
+        var detection = DetectOpenToLanPort();
+        var port = detection.Port;
 
-        if (_openToLanPort == port) return;
+        if (_openToLanPort == port &&
+            (!port.HasValue || _activeOpenToLanGeneration == detection.Generation))
+        {
+            if (port.HasValue && string.IsNullOrWhiteSpace(_openToLanWorldName))
+            {
+                _openToLanWorldName = LanWorldInfoService.FindActiveWorldName(_paths?.Worlds);
+            }
+            return;
+        }
 
         var previousPort = _openToLanPort;
         _openToLanPort = port;
         if (port.HasValue)
         {
-            if (!previousPort.HasValue || previousPort.Value != port.Value)
+            if (!previousPort.HasValue || previousPort.Value != port.Value ||
+                _activeOpenToLanGeneration != detection.Generation)
             {
                 _openToLanSessionId = Guid.NewGuid().ToString("N");
+                _activeOpenToLanGeneration = detection.Generation;
+                _openToLanWorldName = LanWorldInfoService.FindActiveWorldName(_paths?.Worlds);
             }
             RequireLogger().Info(
-                $"Minecraft Open to LAN session {_openToLanSessionId} detected on port {port.Value}.");
+                $"Minecraft Open to LAN session {_openToLanSessionId} detected on port {port.Value} " +
+                $"for world '{_openToLanWorldName}'.");
             SetState($"LAN open: {port.Value}");
         }
         else
         {
             _openToLanSessionId = "";
+            _openToLanWorldName = "";
+            _activeOpenToLanGeneration = 0;
             if (_state.StartsWith("LAN open:", StringComparison.OrdinalIgnoreCase))
             {
                 SetState("Minecraft");
@@ -1619,74 +1470,105 @@ public partial class MainWindow : Window
         }
     }
 
-    private int? TryDetectOpenToLanPort()
+    private LanPortDetection DetectOpenToLanPort()
     {
-        if (_paths is null || _settings is null) return null;
+        if (_paths is null || _settings is null) return LanPortDetection.None;
         if (!_minecraftRunning)
         {
-            _cachedOpenToLanPort = null;
-            return null;
+            ResetPendingLanDetection();
+            return LanPortDetection.None;
         }
 
         var logPath = Path.Combine(_paths.CombineUnderInstances(_settings.ClientRelativePath), "logs", "latest.log");
-        if (!File.Exists(logPath)) return null;
-
-        var cachedPort = _cachedOpenToLanPort;
-        try
+        if (File.Exists(logPath))
         {
-            using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            if (stream.Length < _openToLanLogPosition)
+            try
             {
-                _openToLanLogPosition = 0;
-            }
-
-            stream.Seek(_openToLanLogPosition, SeekOrigin.Begin);
-            using var reader = new StreamReader(stream);
-            while (!reader.EndOfStream)
-            {
-                var line = reader.ReadLine();
-                if (line is null) continue;
-                if (TryParseOpenToLanPort(line, out var parsedPort))
+                using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                if (stream.Length < _openToLanLogPosition)
                 {
-                    cachedPort = parsedPort;
-                    continue;
+                    _openToLanLogPosition = 0;
                 }
 
-                if (cachedPort is not null && LanClosedRegex().IsMatch(line))
+                stream.Seek(_openToLanLogPosition, SeekOrigin.Begin);
+                using var reader = new StreamReader(stream);
+                while (!reader.EndOfStream)
                 {
-                    cachedPort = null;
+                    var line = reader.ReadLine();
+                    if (line is null) continue;
+                    if (TryParseOpenToLanPort(line, out var parsedPort))
+                    {
+                        _pendingOpenToLanPort = parsedPort;
+                        _pendingOpenToLanSince = DateTimeOffset.UtcNow;
+                        _pendingOpenToLanGeneration++;
+                        _openToLanCloseObserved = false;
+                        continue;
+                    }
+
+                    if (LanClosedRegex().IsMatch(line))
+                    {
+                        _openToLanCloseObserved = true;
+                        _pendingOpenToLanPort = null;
+                        _openToLanListenerMissingSince = null;
+                    }
                 }
+
+                _openToLanLogPosition = stream.Position;
             }
-
-            _openToLanLogPosition = stream.Position;
-        }
-        catch
-        {
-            return _openToLanPort;
-        }
-
-        if (cachedPort is null)
-        {
-            _cachedOpenToLanPort = null;
-            _openToLanPort = null;
-            return null;
+            catch (IOException)
+            {
+                return new LanPortDetection(_openToLanPort, _activeOpenToLanGeneration);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return new LanPortDetection(_openToLanPort, _activeOpenToLanGeneration);
+            }
         }
 
-        var activePort = cachedPort.Value;
-        if (_minecraft?.OwnsTcpListener(activePort) != true)
+        if (_openToLanCloseObserved)
         {
-            RequireLogger().Info($"Detected stale LAN port {activePort}; the active Minecraft process does not own it.");
-            _cachedOpenToLanPort = null;
-            _openToLanPort = null;
-            return null;
+            _openToLanCloseObserved = false;
+            return LanPortDetection.None;
         }
 
-        if (_cachedOpenToLanPort != cachedPort)
+        var candidatePort = _pendingOpenToLanPort ?? _openToLanPort;
+        var candidateGeneration = _pendingOpenToLanPort.HasValue
+            ? _pendingOpenToLanGeneration
+            : _activeOpenToLanGeneration;
+        if (!candidatePort.HasValue) return LanPortDetection.None;
+
+        if (_minecraft?.OwnsTcpListener(candidatePort.Value) == true)
         {
-            _cachedOpenToLanPort = activePort;
-            RequireLogger().Info($"Minecraft Open to LAN detected on port {activePort}.");
+            _pendingOpenToLanPort = candidatePort;
+            _openToLanListenerMissingSince = null;
+            return new LanPortDetection(candidatePort, candidateGeneration);
         }
-        return activePort;
+
+        var now = DateTimeOffset.UtcNow;
+        if (_pendingOpenToLanPort.HasValue && now - _pendingOpenToLanSince < TimeSpan.FromSeconds(5))
+        {
+            return new LanPortDetection(_openToLanPort, _activeOpenToLanGeneration);
+        }
+
+        _openToLanListenerMissingSince ??= now;
+        if (_openToLanPort.HasValue && now - _openToLanListenerMissingSince < TimeSpan.FromSeconds(3))
+        {
+            return new LanPortDetection(_openToLanPort, _activeOpenToLanGeneration);
+        }
+
+        RequireLogger().Info(
+            $"Detected stale LAN port {candidatePort.Value}; the active Minecraft process does not own it.");
+        _pendingOpenToLanPort = null;
+        _openToLanListenerMissingSince = null;
+        return LanPortDetection.None;
+    }
+
+    private void ResetPendingLanDetection()
+    {
+        _pendingOpenToLanPort = null;
+        _pendingOpenToLanSince = default;
+        _openToLanListenerMissingSince = null;
+        _openToLanCloseObserved = false;
     }
 
     private static bool TryParseOpenToLanPort(string line, out int port)
@@ -1727,6 +1609,11 @@ public partial class MainWindow : Window
 
     [GeneratedRegex("Stopping (?:singleplayer )?server", RegexOptions.IgnoreCase)]
     private static partial Regex LanClosedRegex();
+
+    private readonly record struct LanPortDetection(int? Port, long Generation)
+    {
+        public static LanPortDetection None { get; } = new(null, 0);
+    }
 
     private void OnMinecraftClientRunningChanged(bool isRunning)
     {
@@ -1871,12 +1758,6 @@ public partial class MainWindow : Window
         if (!peer.IsHost)
         {
             SetState($"Player {peer.PlayerName} is not marked as host.");
-            return null;
-        }
-
-        if (!peer.State.Contains("LAN open", StringComparison.OrdinalIgnoreCase))
-        {
-            SetState($"Player {peer.PlayerName} is not advertising an open LAN session.");
             return null;
         }
 
@@ -3280,16 +3161,13 @@ public partial class MainWindow : Window
     {
         public VoicePresenceEntry(
             PeerViewModel peer,
-            IReadOnlyList<PeerEndpointInfo> endpoints,
             DateTimeOffset lastSeenUtc)
         {
             Peer = peer;
-            Endpoints = endpoints;
             LastSeenUtc = lastSeenUtc;
         }
 
         public PeerViewModel Peer { get; }
-        public IReadOnlyList<PeerEndpointInfo> Endpoints { get; set; }
         public DateTimeOffset LastSeenUtc { get; set; }
     }
     private UpdateService RequireUpdateService() => _updateService ?? throw new InvalidOperationException("Update service is not initialized.");

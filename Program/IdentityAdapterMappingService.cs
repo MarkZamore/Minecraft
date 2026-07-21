@@ -14,6 +14,9 @@ internal sealed class IdentityAdapterMappingService
     private const string Component = "net/minecraft/network/chat/Component";
     private const string PlayerInfo = "net/minecraft/client/multiplayer/PlayerInfo";
     private const string PlayerSkin = "net/minecraft/client/resources/PlayerSkin";
+    private const string LanServerEntry =
+        "net/minecraft/client/gui/screens/multiplayer/ServerSelectionList$NetworkServerEntry";
+    private const string LanServer = "net/minecraft/client/server/LanServer";
     private const string TextureUrlChecker = "com/mojang/authlib/yggdrasil/TextureUrlChecker";
 
     public IdentityAdapterConfiguration Build(PreparedRuntime runtime)
@@ -33,6 +36,8 @@ internal sealed class IdentityAdapterMappingService
         var component = mappings.RequireClass(Component);
         var playerInfo = mappings.RequireClass(PlayerInfo);
         var playerSkin = mappings.RequireClass(PlayerSkin);
+        var lanServerEntry = mappings.RequireClass(LanServerEntry);
+        var lanServer = mappings.RequireClass(LanServer);
 
         var hello = listener.RequireMethod("handleHello", descriptor => descriptor.Contains($"L{packet.LeftName};", StringComparison.Ordinal));
         var verify = listener.RequireMethod("verifyLoginAndFinishConnectionSetup", descriptor => descriptor.Contains("Lcom/mojang/authlib/GameProfile;", StringComparison.Ordinal));
@@ -42,6 +47,9 @@ internal sealed class IdentityAdapterMappingService
         var skinSelection = playerInfo.RequireMethod(
             "lambda$createSkinLookup$2",
             descriptor => descriptor.StartsWith("(Ljava/util/concurrent/CompletableFuture;", StringComparison.Ordinal));
+        var lanRender = lanServerEntry.RequireMethod(
+            "render",
+            descriptor => descriptor.EndsWith(")V", StringComparison.Ordinal));
         var properties = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["loginClasses"] = JoinAliases(LoginListener, listener.LeftName),
@@ -82,6 +90,17 @@ internal sealed class IdentityAdapterMappingService
             ["skinSecureMethods"] = JoinAliases(
                 "secure",
                 playerSkin.RequireMethod("secure", descriptor => descriptor == "()Z").LeftName),
+            ["lanEntryClasses"] = JoinAliases(LanServerEntry, lanServerEntry.LeftName),
+            ["lanRenderMethods"] = JoinAliases("render", lanRender.LeftName),
+            ["lanRenderDescriptors"] = JoinAliases(
+                "(Lnet/minecraft/client/gui/GuiGraphics;IIIIIIIZF)V",
+                lanRender.LeftDescriptor),
+            ["lanServerFields"] = JoinAliases("serverData", lanServerEntry.RequireField("serverData")),
+            ["lanHeaderFields"] = JoinAliases("LAN_SERVER_HEADER", lanServerEntry.RequireField("LAN_SERVER_HEADER")),
+            ["lanServerClasses"] = JoinAliases(LanServer, lanServer.LeftName),
+            ["lanMotdMethods"] = JoinAliases(
+                "getMotd",
+                lanServer.RequireMethod("getMotd", descriptor => descriptor == "()Ljava/lang/String;").LeftName),
             ["textureUrlCheckerClasses"] = TextureUrlChecker,
             ["textureUrlCheckerMethods"] = "isAllowedTextureDomain",
             ["textureUrlCheckerDescriptors"] = "(Ljava/lang/String;)Z"
@@ -93,6 +112,8 @@ internal sealed class IdentityAdapterMappingService
             listener.LeftName,
             PlayerInfo,
             playerInfo.LeftName,
+            LanServerEntry,
+            lanServerEntry.LeftName,
             TextureUrlChecker
         };
         var targets = FindRuntimeTargets(runtime, requiredTargets);
@@ -199,7 +220,9 @@ internal sealed class IdentityAdapterMappingService
                 PlayerList,
                 Component,
                 PlayerInfo,
-                PlayerSkin
+                PlayerSkin,
+                LanServerEntry,
+                LanServer
             };
             var classes = new Dictionary<string, Tsrg2Class>(StringComparer.Ordinal);
             Tsrg2Class? current = null;

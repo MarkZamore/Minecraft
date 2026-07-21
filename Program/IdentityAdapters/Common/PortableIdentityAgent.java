@@ -25,6 +25,7 @@ public final class PortableIdentityAgent {
         }
 
         instrumentation.addTransformer(new PortableIdentityTransformer(), false);
+        instrumentation.addTransformer(new PortableLanTitleTransformer(), false);
         System.out.println("[PortableIdentity] Stable UUID adapter enabled.");
     }
 }

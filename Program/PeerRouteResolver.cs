@@ -10,7 +10,12 @@ public interface IPeerRouteResolver
         string? preferredProviderId = null,
         AddressFamily? addressFamily = null);
 
-    bool IsKnownEndpoint(string? identityId, IPAddress address);
+    bool IsKnownEndpoint(
+        string? identityId,
+        IPAddress address,
+        string? providerId,
+        string? interfaceId);
+
     void MarkEndpointHealthy(string identityId, PeerCandidateEndpoint endpoint);
     void MarkEndpointUnhealthy(string identityId, PeerCandidateEndpoint endpoint);
 }
@@ -27,10 +32,6 @@ public sealed class PeerCandidateEndpoint : IEquatable<PeerCandidateEndpoint>
     public bool IsObserved { get; set; }
     public bool IsConfirmed { get; set; }
     public int FailureScore { get; set; }
-    public long Revision { get; set; }
-
-    public bool IsReachable => FailureScore < 3;
-    public string State => IsConfirmed ? "Healthy" : FailureScore > 0 ? "Unhealthy" : "Candidate";
 
     public PeerCandidateEndpoint Copy() => new()
     {
@@ -43,8 +44,7 @@ public sealed class PeerCandidateEndpoint : IEquatable<PeerCandidateEndpoint>
         LastSuccessUtc = LastSuccessUtc,
         IsObserved = IsObserved,
         IsConfirmed = IsConfirmed,
-        FailureScore = FailureScore,
-        Revision = Revision
+        FailureScore = FailureScore
     };
 
     public bool Equals(PeerCandidateEndpoint? other) =>
@@ -61,20 +61,30 @@ public sealed class PeerCandidateEndpoint : IEquatable<PeerCandidateEndpoint>
         InterfaceId.Trim().ToLowerInvariant());
 }
 
+public sealed record PeerDiscoveryCandidate(string IdentityId, PeerCandidateEndpoint Endpoint);
+
+public sealed record PeerDiscoveryBatch(
+    IReadOnlyList<PeerDiscoveryCandidate> Candidates,
+    int NextCursor);
+
 public sealed class PeerRouteResolver : IPeerRouteResolver
 {
-    private static readonly TimeSpan PeerTtl = TimeSpan.FromDays(30);
-    private static readonly TimeSpan EndpointTtl = TimeSpan.FromDays(30);
+    private static readonly TimeSpan ConfirmedEndpointTtl = TimeSpan.FromDays(30);
+    private static readonly TimeSpan ObservedEndpointTtl = TimeSpan.FromHours(24);
+    private static readonly TimeSpan CandidateEndpointTtl = TimeSpan.FromMinutes(15);
     private readonly Dictionary<string, PeerRouteState> _peers = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, HashSet<string>> _endpointIndex = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _gate = new();
+    private PeerDiscoveryCandidate[] _discoverySnapshot = [];
+    private bool _discoverySnapshotDirty = true;
 
     public void UpsertFromAnnouncement(PeerAnnouncement announcement, IPAddress? observedAddress = null)
     {
         ArgumentNullException.ThrowIfNull(announcement);
+        if (!Guid.TryParse(announcement.IdentityId, out var identity)) return;
+
+        var identityId = identity.ToString("D");
         var now = DateTimeOffset.UtcNow;
         observedAddress ??= ParseAddress(announcement.NetworkAddress);
-
         var advertised = new List<(IPAddress Address, PeerAdvertisedEndpoint Metadata, bool Observed)>();
         foreach (var item in announcement.NetworkEndpoints ?? [])
         {
@@ -95,16 +105,8 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
             }, true));
         }
 
-        var identityId = NormalizeIdentity(announcement.IdentityId);
         lock (_gate)
         {
-            if (string.IsNullOrWhiteSpace(identityId))
-            {
-                identityId = ResolveLegacyIdentityLocked(advertised.Select(item => item.Address)) ??
-                             (advertised.Count > 0 ? $"legacy:{advertised[0].Address}" : "");
-            }
-            if (string.IsNullOrWhiteSpace(identityId)) return;
-
             if (!_peers.TryGetValue(identityId, out var peer))
             {
                 peer = new PeerRouteState(identityId);
@@ -114,32 +116,38 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
             peer.PlayerName = announcement.PlayerName?.Trim() ?? "";
             peer.LastSeenUtc = now;
 
-            foreach (var group in advertised.GroupBy(item => item.Address.ToString(), StringComparer.OrdinalIgnoreCase))
+            foreach (var item in advertised
+                         .GroupBy(candidate => BuildEndpointKey(
+                                 candidate.Address,
+                                 candidate.Metadata.ProviderId,
+                                 candidate.Metadata.InterfaceId),
+                             StringComparer.OrdinalIgnoreCase)
+                         .Select(group => group.OrderByDescending(candidate => candidate.Observed).First()))
             {
-                var item = group.OrderByDescending(candidate => candidate.Observed).First();
-                var key = item.Address.ToString();
+                var providerId = FirstNonEmpty(item.Metadata.ProviderId, announcement.NetworkProviderId);
+                var interfaceId = FirstNonEmpty(item.Metadata.InterfaceId, announcement.NetworkInterfaceId);
+                var key = BuildEndpointKey(item.Address, providerId, interfaceId);
                 if (!peer.Endpoints.TryGetValue(key, out var endpoint))
                 {
-                    endpoint = new PeerCandidateEndpoint { Address = key };
+                    endpoint = new PeerCandidateEndpoint { Address = item.Address.ToString() };
                     peer.Endpoints.Add(key, endpoint);
                 }
 
-                endpoint.ProviderId = FirstNonEmpty(item.Metadata.ProviderId, announcement.NetworkProviderId);
-                endpoint.InterfaceId = FirstNonEmpty(item.Metadata.InterfaceId, announcement.NetworkInterfaceId);
+                endpoint.ProviderId = providerId;
+                endpoint.InterfaceId = interfaceId;
                 endpoint.AddressFamily = item.Address.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4";
                 endpoint.NetworkType = VirtualNetworkService.NormalizeNetworkType(
                     FirstNonEmpty(item.Metadata.NetworkType, announcement.NetworkType));
                 endpoint.LastSeenUtc = now;
                 endpoint.IsObserved |= item.Observed;
-                endpoint.Revision = NextRevision(endpoint.Revision);
                 if (item.Observed)
                 {
                     endpoint.IsConfirmed = true;
                     endpoint.FailureScore = 0;
                 }
-                AddEndpointIndexLocked(key, identityId);
             }
 
+            _discoverySnapshotDirty = true;
             PruneLocked(now);
         }
     }
@@ -156,9 +164,9 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
         lock (_gate)
         {
             if (!_peers.TryGetValue(identityId, out var peer)) return Array.Empty<PeerCandidateEndpoint>();
-
+            var now = DateTimeOffset.UtcNow;
             return peer.Endpoints.Values
-                .Where(endpoint => DateTimeOffset.UtcNow - endpoint.LastSeenUtc <= EndpointTtl)
+                .Where(endpoint => !IsExpired(endpoint, now))
                 .Where(endpoint => addressFamily is null || GetAddressFamily(endpoint) == addressFamily)
                 .Where(endpoint => IsAllowedProvider(endpoint, preferredProviderId))
                 .OrderByDescending(endpoint =>
@@ -176,28 +184,54 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
         }
     }
 
-    public bool IsKnownEndpoint(string? identityId, IPAddress address)
+    public PeerDiscoveryBatch GetDiscoveryBatch(
+        NetworkEndpointInfo localEndpoint,
+        int cursor,
+        int maxCount)
+    {
+        ArgumentNullException.ThrowIfNull(localEndpoint);
+        maxCount = Math.Max(0, maxCount);
+        if (maxCount == 0) return new PeerDiscoveryBatch([], Math.Max(0, cursor));
+
+        lock (_gate)
+        {
+            PruneLocked(DateTimeOffset.UtcNow);
+            EnsureDiscoverySnapshotLocked();
+            if (_discoverySnapshot.Length == 0) return new PeerDiscoveryBatch([], 0);
+
+            var normalizedCursor = (cursor & int.MaxValue) % _discoverySnapshot.Length;
+            var result = new List<PeerDiscoveryCandidate>(Math.Min(maxCount, _discoverySnapshot.Length));
+            var visited = 0;
+            while (visited < _discoverySnapshot.Length && result.Count < maxCount)
+            {
+                var candidate = _discoverySnapshot[(normalizedCursor + visited) % _discoverySnapshot.Length];
+                if (MatchesLocalEndpoint(candidate.Endpoint, localEndpoint))
+                {
+                    result.Add(new PeerDiscoveryCandidate(candidate.IdentityId, candidate.Endpoint.Copy()));
+                }
+                visited++;
+            }
+
+            return new PeerDiscoveryBatch(
+                result,
+                (normalizedCursor + Math.Max(1, visited)) % _discoverySnapshot.Length);
+        }
+    }
+
+    public bool IsKnownEndpoint(
+        string? identityId,
+        IPAddress address,
+        string? providerId,
+        string? interfaceId)
     {
         identityId = NormalizeIdentity(identityId);
         if (string.IsNullOrWhiteSpace(identityId) || !IsUsableAddress(address)) return false;
         lock (_gate)
         {
-            return _peers.TryGetValue(identityId, out var peer) && peer.Endpoints.ContainsKey(address.ToString());
+            if (!_peers.TryGetValue(identityId, out var peer)) return false;
+            var key = BuildEndpointKey(address, providerId, interfaceId);
+            return peer.Endpoints.ContainsKey(key);
         }
-    }
-
-    public bool TryGetIdentity(IPAddress address, out string identityId)
-    {
-        lock (_gate)
-        {
-            if (_endpointIndex.TryGetValue(address.ToString(), out var identities) && identities.Count == 1)
-            {
-                identityId = identities.First();
-                return true;
-            }
-        }
-        identityId = "";
-        return false;
     }
 
     public void MarkEndpointHealthy(string identityId, PeerCandidateEndpoint endpoint)
@@ -206,12 +240,12 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
         if (string.IsNullOrWhiteSpace(identityId)) return;
         lock (_gate)
         {
-            if (!TryGetEndpointLocked(identityId, endpoint.Address, out var existing)) return;
+            if (!TryGetEndpointLocked(identityId, endpoint, out var existing)) return;
             existing.FailureScore = 0;
             existing.IsConfirmed = true;
             existing.LastSeenUtc = DateTimeOffset.UtcNow;
             existing.LastSuccessUtc = existing.LastSeenUtc;
-            existing.Revision = NextRevision(existing.Revision);
+            _discoverySnapshotDirty = true;
         }
     }
 
@@ -221,10 +255,10 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
         if (string.IsNullOrWhiteSpace(identityId)) return;
         lock (_gate)
         {
-            if (!TryGetEndpointLocked(identityId, endpoint.Address, out var existing)) return;
+            if (!TryGetEndpointLocked(identityId, endpoint, out var existing)) return;
             existing.FailureScore = Math.Min(9, existing.FailureScore + 1);
             existing.IsConfirmed = false;
-            existing.Revision = NextRevision(existing.Revision);
+            _discoverySnapshotDirty = true;
         }
     }
 
@@ -232,15 +266,14 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
     {
         lock (_gate)
         {
+            PruneLocked(DateTimeOffset.UtcNow);
             return new KnownPeerCache
             {
                 Peers = _peers.Values
                     .OrderByDescending(peer => peer.LastSeenUtc)
                     .Select(peer => new KnownPeerIdentityRecord
                     {
-                        IdentityId = peer.IdentityId.StartsWith("legacy:", StringComparison.OrdinalIgnoreCase)
-                            ? ""
-                            : peer.IdentityId,
+                        IdentityId = peer.IdentityId,
                         PlayerName = peer.PlayerName,
                         Endpoints = peer.Endpoints.Values.Select(endpoint => new KnownPeerEndpointRecord
                         {
@@ -252,8 +285,7 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
                             LastSuccessUtc = endpoint.LastSuccessUtc,
                             IsObserved = endpoint.IsObserved,
                             IsConfirmed = endpoint.IsConfirmed,
-                            FailureScore = endpoint.FailureScore,
-                            Revision = endpoint.Revision
+                            FailureScore = endpoint.FailureScore
                         }).ToList()
                     }).ToList()
             };
@@ -262,50 +294,44 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
 
     public void Load(KnownPeerCache? cache)
     {
-        if (cache is null) return;
+        if (cache is null || cache.SchemaVersion != 4) return;
         lock (_gate)
         {
             _peers.Clear();
-            _endpointIndex.Clear();
             foreach (var record in cache.Peers ?? [])
             {
-                var usable = record.Endpoints
-                    .Select(endpoint => (Record: endpoint, Address: ParseAddress(
-                        string.IsNullOrWhiteSpace(endpoint.Address) ? endpoint.Ip : endpoint.Address)))
-                    .Where(item => item.Address is not null && IsUsableAddress(item.Address))
-                    .ToArray();
-                if (usable.Length == 0) continue;
-
-                var identityId = NormalizeIdentity(record.IdentityId);
-                if (string.IsNullOrWhiteSpace(identityId)) identityId = $"legacy:{usable[0].Address}";
+                if (!Guid.TryParse(record.IdentityId, out var identity)) continue;
+                var identityId = identity.ToString("D");
                 var peer = new PeerRouteState(identityId)
                 {
-                    PlayerName = record.PlayerName?.Trim() ?? "",
-                    LastSeenUtc = usable.Max(item => item.Record.LastSeenUtc)
+                    PlayerName = record.PlayerName?.Trim() ?? ""
                 };
 
-                foreach (var item in usable)
+                foreach (var stored in record.Endpoints ?? [])
                 {
-                    var address = item.Address!;
+                    var address = ParseAddress(stored.Address);
+                    if (address is null) continue;
                     var endpoint = new PeerCandidateEndpoint
                     {
                         Address = address.ToString(),
-                        ProviderId = item.Record.ProviderId?.Trim() ?? "",
-                        InterfaceId = item.Record.InterfaceId?.Trim() ?? "",
+                        ProviderId = stored.ProviderId?.Trim() ?? "",
+                        InterfaceId = stored.InterfaceId?.Trim() ?? "",
                         AddressFamily = address.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4",
-                        NetworkType = VirtualNetworkService.NormalizeNetworkType(item.Record.NetworkType),
-                        LastSeenUtc = item.Record.LastSeenUtc,
-                        LastSuccessUtc = item.Record.LastSuccessUtc,
-                        IsObserved = item.Record.IsObserved,
-                        IsConfirmed = item.Record.IsConfirmed || item.Record.LastSuccessUtc != default,
-                        FailureScore = Math.Clamp(item.Record.FailureScore, 0, 9),
-                        Revision = Math.Max(0, item.Record.Revision)
+                        NetworkType = VirtualNetworkService.NormalizeNetworkType(stored.NetworkType),
+                        LastSeenUtc = stored.LastSeenUtc,
+                        LastSuccessUtc = stored.LastSuccessUtc,
+                        IsObserved = stored.IsObserved,
+                        IsConfirmed = stored.IsConfirmed || stored.LastSuccessUtc != default,
+                        FailureScore = Math.Clamp(stored.FailureScore, 0, 9)
                     };
-                    peer.Endpoints[endpoint.Address] = endpoint;
-                    AddEndpointIndexLocked(endpoint.Address, identityId);
+                    peer.Endpoints[BuildEndpointKey(address, endpoint.ProviderId, endpoint.InterfaceId)] = endpoint;
                 }
+
+                if (peer.Endpoints.Count == 0) continue;
+                peer.LastSeenUtc = peer.Endpoints.Values.Max(endpoint => endpoint.LastSeenUtc);
                 _peers[identityId] = peer;
             }
+            _discoverySnapshotDirty = true;
             PruneLocked(DateTimeOffset.UtcNow);
         }
     }
@@ -317,17 +343,64 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
 
     private void PruneLocked(DateTimeOffset now)
     {
+        var changed = false;
         foreach (var peer in _peers.Values.ToArray())
         {
-            foreach (var endpoint in peer.Endpoints.Values
-                         .Where(endpoint => now - endpoint.LastSeenUtc > EndpointTtl)
+            foreach (var pair in peer.Endpoints
+                         .Where(pair => IsExpired(pair.Value, now))
                          .ToArray())
             {
-                peer.Endpoints.Remove(endpoint.Address);
-                RemoveEndpointIndexLocked(endpoint.Address, peer.IdentityId);
+                peer.Endpoints.Remove(pair.Key);
+                changed = true;
             }
-            if (peer.Endpoints.Count == 0 || now - peer.LastSeenUtc > PeerTtl) RemovePeerLocked(peer);
+            if (peer.Endpoints.Count == 0)
+            {
+                _peers.Remove(peer.IdentityId);
+                changed = true;
+            }
         }
+        if (changed) _discoverySnapshotDirty = true;
+    }
+
+    private void EnsureDiscoverySnapshotLocked()
+    {
+        if (!_discoverySnapshotDirty) return;
+        var now = DateTimeOffset.UtcNow;
+        _discoverySnapshot = _peers.Values
+            .SelectMany(peer => peer.Endpoints.Values
+                .Where(endpoint => !IsExpired(endpoint, now))
+                .Select(endpoint => new PeerDiscoveryCandidate(peer.IdentityId, endpoint.Copy())))
+            .OrderByDescending(candidate => candidate.Endpoint.IsConfirmed)
+            .ThenByDescending(candidate => candidate.Endpoint.LastSuccessUtc)
+            .ThenByDescending(candidate => candidate.Endpoint.LastSeenUtc)
+            .ThenBy(candidate => candidate.IdentityId, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.Endpoint.Address, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        _discoverySnapshotDirty = false;
+    }
+
+    private static bool MatchesLocalEndpoint(
+        PeerCandidateEndpoint candidate,
+        NetworkEndpointInfo localEndpoint)
+    {
+        if (GetAddressFamily(candidate) != localEndpoint.AddressFamily) return false;
+        if (!string.IsNullOrWhiteSpace(localEndpoint.ProviderId))
+        {
+            return string.Equals(candidate.ProviderId, localEndpoint.ProviderId, StringComparison.OrdinalIgnoreCase);
+        }
+        return localEndpoint.IsPhysical &&
+               (string.IsNullOrWhiteSpace(candidate.ProviderId) ||
+                string.Equals(candidate.NetworkType, "LAN", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsExpired(PeerCandidateEndpoint endpoint, DateTimeOffset now)
+    {
+        var ttl = endpoint.IsConfirmed || endpoint.LastSuccessUtc != default
+            ? ConfirmedEndpointTtl
+            : endpoint.IsObserved
+                ? ObservedEndpointTtl
+                : CandidateEndpointTtl;
+        return now - endpoint.LastSeenUtc > ttl;
     }
 
     private static bool IsAllowedProvider(PeerCandidateEndpoint endpoint, string preferredProviderId)
@@ -337,64 +410,45 @@ public sealed class PeerRouteResolver : IPeerRouteResolver
             return string.IsNullOrWhiteSpace(endpoint.ProviderId) ||
                    string.Equals(endpoint.NetworkType, "LAN", StringComparison.OrdinalIgnoreCase);
         }
-        return string.IsNullOrWhiteSpace(endpoint.ProviderId) ||
-               string.Equals(endpoint.ProviderId, preferredProviderId, StringComparison.OrdinalIgnoreCase);
+        return string.Equals(endpoint.ProviderId, preferredProviderId, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(endpoint.NetworkType, "LAN", StringComparison.OrdinalIgnoreCase);
     }
 
-    private bool TryGetEndpointLocked(string identityId, string address, out PeerCandidateEndpoint endpoint)
+    private bool TryGetEndpointLocked(
+        string identityId,
+        PeerCandidateEndpoint candidate,
+        out PeerCandidateEndpoint endpoint)
     {
         endpoint = null!;
-        return _peers.TryGetValue(identityId, out var peer) &&
-               peer.Endpoints.TryGetValue(address.Trim(), out endpoint!);
-    }
-
-    private string? ResolveLegacyIdentityLocked(IEnumerable<IPAddress> addresses)
-    {
-        foreach (var address in addresses)
+        if (!_peers.TryGetValue(identityId, out var peer) ||
+            !IPAddress.TryParse(candidate.Address, out var address))
         {
-            if (_endpointIndex.TryGetValue(address.ToString(), out var identities) && identities.Count == 1)
-            {
-                return identities.First();
-            }
+            return false;
         }
-        return null;
+
+        var key = BuildEndpointKey(address, candidate.ProviderId, candidate.InterfaceId);
+        return peer.Endpoints.TryGetValue(key, out endpoint!);
     }
 
-    private void AddEndpointIndexLocked(string address, string identityId)
-    {
-        if (!_endpointIndex.TryGetValue(address, out var identities))
-        {
-            identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            _endpointIndex.Add(address, identities);
-        }
-        identities.Add(identityId);
-    }
-
-    private void RemoveEndpointIndexLocked(string address, string identityId)
-    {
-        if (!_endpointIndex.TryGetValue(address, out var identities)) return;
-        identities.Remove(identityId);
-        if (identities.Count == 0) _endpointIndex.Remove(address);
-    }
-
-    private void RemovePeerLocked(PeerRouteState peer)
-    {
-        foreach (var endpoint in peer.Endpoints.Keys) RemoveEndpointIndexLocked(endpoint, peer.IdentityId);
-        _peers.Remove(peer.IdentityId);
-    }
+    private static string BuildEndpointKey(
+        IPAddress address,
+        string? providerId,
+        string? interfaceId) =>
+        string.Join("|",
+            providerId?.Trim().ToLowerInvariant() ?? "",
+            interfaceId?.Trim().ToLowerInvariant() ?? "",
+            address.ToString().ToLowerInvariant());
 
     private static AddressFamily GetAddressFamily(PeerCandidateEndpoint endpoint) =>
         endpoint.AddressFamily.Equals("IPv6", StringComparison.OrdinalIgnoreCase)
             ? AddressFamily.InterNetworkV6
             : AddressFamily.InterNetwork;
 
-    private static string NormalizeIdentity(string? identityId) => identityId?.Trim() ?? "";
+    private static string NormalizeIdentity(string? identityId) =>
+        Guid.TryParse(identityId, out var identity) ? identity.ToString("D") : "";
 
     private static string FirstNonEmpty(string? first, string? second) =>
         !string.IsNullOrWhiteSpace(first) ? first.Trim() : second?.Trim() ?? "";
-
-    private static long NextRevision(long current) =>
-        current >= long.MaxValue ? long.MaxValue : Math.Max(1, current + 1);
 
     private static IPAddress? ParseAddress(string? value) =>
         TryGetUsableAddress(value, out var address) ? address : null;

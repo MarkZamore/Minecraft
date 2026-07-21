@@ -1,6 +1,7 @@
 package minecraft.portable.identity;
 
 import java.io.InputStream;
+import java.lang.instrument.ClassFileTransformer;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.zip.ZipEntry;
@@ -24,7 +25,10 @@ public final class PortableIdentityPreflight {
         try (ZipFile archive = new ZipFile(jarPath.toFile())) {
             byte[] original = readClassBytes(archive, className);
 
-            byte[] transformed = new PortableIdentityTransformer().transform(
+            ClassFileTransformer transformer = isAlias("lanEntryClasses", className)
+                ? new PortableLanTitleTransformer()
+                : new PortableIdentityTransformer();
+            byte[] transformed = transformer.transform(
                 null,
                 null,
                 className,
@@ -37,6 +41,8 @@ public final class PortableIdentityPreflight {
             new ClassReader(transformed);
             if (isAlias("loginClasses", className)) {
                 verifyHookTargets(archive, className);
+            } else if (isAlias("lanEntryClasses", className)) {
+                verifyLanTitleTargets(archive, className);
             } else if (!isAlias("playerInfoClasses", className) &&
                 !isAlias("textureUrlCheckerClasses", className)) {
                 throw new IllegalStateException("Unexpected portable identity target: " + className);
@@ -69,6 +75,26 @@ public final class PortableIdentityPreflight {
 
         ClassNode component = readClass(archive, alias("componentClasses", mappingIndex).replace('.', '/'));
         requireMethod(component, "componentLiteralMethods", 1);
+    }
+
+    private static void verifyLanTitleTargets(ZipFile archive, String entryClass) throws Exception {
+        int mappingIndex = aliasIndex("lanEntryClasses", entryClass);
+        ClassNode entry = readClass(archive, entryClass);
+        requireField(entry, "lanServerFields");
+        requireField(entry, "lanHeaderFields");
+        requireMethod(entry, "lanRenderMethods", 10);
+
+        ClassNode lanServer = readClass(archive, alias("lanServerClasses", mappingIndex));
+        requireMethod(lanServer, "lanMotdMethods", 0);
+
+        ClassNode component = readClass(archive, alias("componentClasses", mappingIndex).replace('.', '/'));
+        requireMethod(component, "componentLiteralMethods", 1);
+
+        String encoded = "MinecraftPortable:VGVzdCBXb3JsZA:UGxheWVy";
+        if (!"Player".equals(PortableLanTitleHooks.resolveSubtitle(encoded)) ||
+            !"ordinary motd".equals(PortableLanTitleHooks.resolveSubtitle("ordinary motd"))) {
+            throw new IllegalStateException("Portable LAN metadata decoding failed.");
+        }
     }
 
     private static byte[] readClassBytes(ZipFile archive, String className) throws Exception {

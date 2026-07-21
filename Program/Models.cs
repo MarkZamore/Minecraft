@@ -112,7 +112,7 @@ public sealed class PeerAdvertisedEndpoint
 
 public sealed class KnownPeerCache
 {
-    public int SchemaVersion { get; set; } = 3;
+    public int SchemaVersion { get; set; } = 4;
     public List<KnownPeerIdentityRecord> Peers { get; set; } = [];
 }
 
@@ -126,7 +126,6 @@ public sealed class KnownPeerIdentityRecord
 public sealed class KnownPeerEndpointRecord
 {
     public string Address { get; set; } = "";
-    public string Ip { get; set; } = "";
     public string ProviderId { get; set; } = "";
     public string InterfaceId { get; set; } = "";
     public string NetworkType { get; set; } = "Unknown";
@@ -135,7 +134,6 @@ public sealed class KnownPeerEndpointRecord
     public bool IsObserved { get; set; }
     public bool IsConfirmed { get; set; }
     public int FailureScore { get; set; }
-    public long Revision { get; set; }
 }
 
 public sealed class PeerAnnouncement
@@ -157,7 +155,7 @@ public sealed class PeerAnnouncement
     public string PackHash { get; set; } = "";
     public int ServerPort { get; set; }
     public string LanSessionId { get; set; } = "";
-    public string State { get; set; } = "";
+    public string LanWorldName { get; set; } = "";
     public bool IsVoiceChannelActive { get; set; }
     public bool IsVoiceMuted { get; set; }
     public bool IsMinecraftRunning { get; set; }
@@ -191,6 +189,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private string _packHash = "";
     private int _serverPort;
     private string _lanSessionId = "";
+    private string _lanWorldName = "";
     private bool _isInVoiceChannel;
     private bool _isSpeaking;
     private bool _isVoiceMuted;
@@ -200,7 +199,6 @@ public sealed class PeerViewModel : INotifyPropertyChanged
     private string _skinSha256 = "";
     private string _skinModel = "classic";
     private double _voiceVolume = 1.0d;
-    private string _state = "";
     private DateTimeOffset _lastSeen;
     private string _localPackHash = "";
     private int? _lastRttMs;
@@ -379,7 +377,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
     }
     public string LanSessionId { get => _lanSessionId; set => Set(ref _lanSessionId, value ?? ""); }
-    public string State { get => _state; set => Set(ref _state, value); }
+    public string LanWorldName { get => _lanWorldName; set => Set(ref _lanWorldName, value ?? ""); }
     public DateTimeOffset LastSeen { get => _lastSeen; set { if (Set(ref _lastSeen, value)) OnPropertyChanged(nameof(LastSeenText)); } }
     public string LocalPackHash { get => _localPackHash; set { if (Set(ref _localPackHash, value)) OnPropertyChanged(nameof(PackStatus)); } }
     public int? LastRttMs
@@ -442,13 +440,6 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         }
     }
 
-    [JsonIgnore]
-    public IReadOnlyList<PeerEndpointInfo> NetworkEndpoints => _endpoints.Values
-        .OrderByDescending(endpoint => endpoint.IsHost)
-        .ThenByDescending(endpoint => endpoint.LastSeen)
-        .ThenBy(endpoint => endpoint.Address, StringComparer.OrdinalIgnoreCase)
-        .ToArray();
-
     public string HostDisplayName
     {
         get
@@ -496,7 +487,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
         WaypointProviders = announcement.WaypointProviders?.ToArray() ?? Array.Empty<WaypointProviderAnnouncement>();
         PackHash = announcement.PackHash;
         LanSessionId = announcement.LanSessionId;
-        State = announcement.State;
+        LanWorldName = announcement.LanWorldName;
         LocalPackHash = localPackHash;
         var now = DateTimeOffset.Now;
         LastSeen = now;
@@ -592,7 +583,7 @@ public sealed class PeerViewModel : INotifyPropertyChanged
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-    public IReadOnlyList<PeerEndpointInfo> GetCandidateEndpoints(
+    private PeerEndpointInfo[] GetCandidateEndpoints(
         bool requireHost = false,
         string? preferredProviderId = null)
     {

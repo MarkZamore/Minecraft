@@ -46,7 +46,8 @@ public sealed class MinecraftProcessService
 
         try
         {
-            return IsTcp4ListenerOwnedBy(port, processIds);
+            return IsTcp4ListenerOwnedBy(port, processIds) ||
+                   IsTcp6ListenerOwnedBy(port, processIds);
         }
         catch (Exception ex) when (ex is InvalidOperationException or ExternalException)
         {
@@ -341,9 +342,61 @@ public sealed class MinecraftProcessService
         }
     }
 
+    private static bool IsTcp6ListenerOwnedBy(int port, HashSet<int> processIds)
+    {
+        var size = 0;
+        var status = GetExtendedTcpTable(
+            IntPtr.Zero,
+            ref size,
+            order: false,
+            AddressFamilyInterNetworkV6,
+            TcpTableClass.OwnerPidListener,
+            0);
+        if (status is not (ErrorInsufficientBuffer or ErrorSuccess) || size <= sizeof(int))
+        {
+            throw new InvalidOperationException($"GetExtendedTcpTable IPv6 sizing failed with status {status}.");
+        }
+
+        var table = Marshal.AllocHGlobal(size);
+        try
+        {
+            status = GetExtendedTcpTable(
+                table,
+                ref size,
+                order: false,
+                AddressFamilyInterNetworkV6,
+                TcpTableClass.OwnerPidListener,
+                0);
+            if (status != ErrorSuccess)
+            {
+                throw new InvalidOperationException($"GetExtendedTcpTable IPv6 failed with status {status}.");
+            }
+
+            var count = Marshal.ReadInt32(table);
+            var rowSize = Marshal.SizeOf<MibTcp6RowOwnerPid>();
+            var rowAddress = IntPtr.Add(table, sizeof(int));
+            for (var index = 0; index < count; index++)
+            {
+                var row = Marshal.PtrToStructure<MibTcp6RowOwnerPid>(rowAddress);
+                var listenerPort = unchecked((ushort)IPAddress.NetworkToHostOrder((short)row.LocalPort));
+                if (listenerPort == port && processIds.Contains(unchecked((int)row.OwningProcessId)))
+                {
+                    return true;
+                }
+                rowAddress = IntPtr.Add(rowAddress, rowSize);
+            }
+            return false;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(table);
+        }
+    }
+
     private const uint ErrorSuccess = 0;
     private const uint ErrorInsufficientBuffer = 122;
     private const int AddressFamilyInterNetwork = 2;
+    private const int AddressFamilyInterNetworkV6 = 23;
 
     private enum TcpTableClass
     {
@@ -359,6 +412,21 @@ public sealed class MinecraftProcessService
         public readonly uint RemoteAddress;
         public readonly uint RemotePort;
         public readonly uint OwningProcessId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MibTcp6RowOwnerPid
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] LocalAddress;
+        public uint LocalScopeId;
+        public uint LocalPort;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] RemoteAddress;
+        public uint RemoteScopeId;
+        public uint RemotePort;
+        public uint State;
+        public uint OwningProcessId;
     }
 
     [DllImport("iphlpapi.dll", SetLastError = true)]

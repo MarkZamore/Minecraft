@@ -8,7 +8,7 @@ namespace Minecraft;
 
 public sealed class PeerDiscoveryService : IAsyncDisposable
 {
-    public const int ProtocolVersion = 4;
+    public const int ProtocolVersion = 5;
     private const int DiscoveryPort = 35655;
     private const int MaxFullSubnetProbeSize = 512;
     private const int KnownPeerBatchSize = 64;
@@ -268,7 +268,9 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
                 var announcement = JsonSerializer.Deserialize<PeerAnnouncement>(
                     Encoding.UTF8.GetString(result.Buffer),
                     _jsonOptions);
-                if (announcement?.App != "MinecraftPortable" || announcement.ProtocolVersion != ProtocolVersion) continue;
+                if (announcement?.App != "MinecraftPortable" ||
+                    announcement.ProtocolVersion != ProtocolVersion ||
+                    !Guid.TryParse(announcement.IdentityId, out _)) continue;
 
                 var peerAddress = ResolvePeerAddress(result.RemoteEndPoint);
                 if (peerAddress is null) continue;
@@ -390,49 +392,26 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             if (probes.Length > 0) entry.ProbeCursor = (entry.ProbeCursor + count) % probes.Length;
         }
 
-        KnownPeerTarget[] known;
         IReadOnlyList<IPAddress> neighbors;
         lock (_peerGate)
         {
-            known = _routes.Export().Peers
-                .SelectMany(peer => peer.Endpoints.Select(endpoint => new KnownPeerTarget(
-                    peer.IdentityId,
-                    string.IsNullOrWhiteSpace(endpoint.Address) ? endpoint.Ip : endpoint.Address,
-                    endpoint.ProviderId,
-                    endpoint.LastSeenUtc)))
-                .ToArray();
             neighbors = _neighborTargets.TryGetValue(entry.Endpoint.InterfaceIndex, out var values)
                 ? values
                 : Array.Empty<IPAddress>();
         }
 
-        var reachableKnown = known
-            .Select(peer => (Peer: peer, Address: ParseAddress(peer.Address)))
-            .Where(item => item.Address is not null &&
-                           item.Address.AddressFamily == entry.Endpoint.AddressFamily &&
-                           !IsLocalAddress(item.Address.ToString()) &&
-                           EndpointCanReach(
-                               item.Address,
-                               entry.Endpoint,
-                               item.Peer.ProviderId,
-                               requirePhysicalWhenProviderUnknown: true))
-            .GroupBy(item => string.IsNullOrWhiteSpace(item.Peer.IdentityId)
-                    ? item.Address!.ToString()
-                    : item.Peer.IdentityId,
-                StringComparer.OrdinalIgnoreCase)
-            .Select(group => group
-                .OrderByDescending(item => item.Peer.LastSeenUtc)
-                .First())
-            .OrderByDescending(item => item.Peer.LastSeenUtc)
-            .ToArray();
-        var knownCount = Math.Min(KnownPeerBatchSize, reachableKnown.Length);
-        for (var index = 0; index < knownCount; index++)
+        var knownBatch = _routes.GetDiscoveryBatch(
+            entry.Endpoint,
+            entry.KnownPeerCursor,
+            KnownPeerBatchSize);
+        entry.KnownPeerCursor = knownBatch.NextCursor;
+        foreach (var item in knownBatch.Candidates)
         {
-            var item = reachableKnown[(entry.KnownPeerCursor + index) % reachableKnown.Length];
-            Add(new IPEndPoint(item.Address!, DiscoveryPort), false);
+            var address = ParseAddress(item.Endpoint.Address);
+            if (address is null || IsLocalAddress(address.ToString()) ||
+                !_network.CanRoute(address, entry.Endpoint)) continue;
+            Add(new IPEndPoint(address, DiscoveryPort), false);
         }
-        if (reachableKnown.Length > 0)
-            entry.KnownPeerCursor = (entry.KnownPeerCursor + knownCount) % reachableKnown.Length;
 
         foreach (var address in neighbors
                      .Concat(_dynamicTargets)
@@ -508,9 +487,9 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         var senderCandidates = senders
             .Where(sender => sender.Endpoint.AddressFamily == peerAddress.AddressFamily)
             .Where(sender => IsSameEndpoint(sender.Endpoint, selectedEndpoint) ||
-                             RouteUsesEndpoint(peerAddress, sender.Endpoint))
+                             _network.CanRoute(peerAddress, sender.Endpoint))
             .OrderByDescending(sender => IsSameEndpoint(sender.Endpoint, selectedEndpoint))
-            .ThenByDescending(sender => RouteUsesEndpoint(peerAddress, sender.Endpoint))
+            .ThenByDescending(sender => _network.CanRoute(peerAddress, sender.Endpoint))
             .ToArray();
         if (senderCandidates.Length == 0) return;
 
@@ -548,25 +527,6 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         string.Equals(endpoint.InterfaceId, selectedEndpoint.InterfaceId, StringComparison.OrdinalIgnoreCase) &&
         string.Equals(endpoint.NetworkAddress, selectedEndpoint.NetworkAddress, StringComparison.OrdinalIgnoreCase);
 
-    private static bool RouteUsesEndpoint(IPAddress target, NetworkEndpointInfo endpoint)
-    {
-        if (target.AddressFamily != endpoint.AddressFamily ||
-            !IPAddress.TryParse(endpoint.NetworkAddress, out var localAddress))
-        {
-            return false;
-        }
-        try
-        {
-            using var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-            socket.Connect(new IPEndPoint(target, DiscoveryPort));
-            return socket.LocalEndPoint is IPEndPoint local && local.Address.Equals(localAddress);
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-    }
-
     private bool EndpointCanReach(
         IPAddress target,
         NetworkEndpointInfo endpoint,
@@ -583,7 +543,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
         {
             return false;
         }
-        return RouteUsesEndpoint(target, endpoint);
+        return _network.CanRoute(target, endpoint);
     }
 
     private static IPAddress? ResolvePeerAddress(IPEndPoint remote) =>
@@ -601,7 +561,6 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
                 ? string.IsNullOrWhiteSpace(endpoint.ProviderId)
                 : string.Equals(endpoint.ProviderId, providerId, StringComparison.OrdinalIgnoreCase))
             .Where(endpoint => CanRouteAdvertisedEndpoint(endpoint, providerId))
-            .Take(8)
             .Select(endpoint => new PeerAdvertisedEndpoint
             {
                 Address = endpoint.Address.Trim(),
@@ -614,6 +573,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             })
             .DistinctBy(endpoint => string.Join("|", endpoint.Address, endpoint.ProviderId, endpoint.InterfaceId, endpoint.AddressFamily),
                 StringComparer.OrdinalIgnoreCase)
+            .Take(8)
             .ToList();
 
         if (!IsLocalAddress(observedAddress.ToString()) &&
@@ -646,7 +606,7 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
             (string.IsNullOrWhiteSpace(providerId)
                 ? local.IsPhysical
                 : string.Equals(local.ProviderId, providerId, StringComparison.OrdinalIgnoreCase)) &&
-            RouteUsesEndpoint(address, local));
+            _network.CanRoute(address, local));
     }
 
     private static bool TryGetUsablePeerAddress(string? value, out IPAddress address)
@@ -770,9 +730,4 @@ public sealed class PeerDiscoveryService : IAsyncDisposable
 
     private sealed record DiscoveryTarget(IPEndPoint Endpoint, bool IsProbe);
 
-    private sealed record KnownPeerTarget(
-        string IdentityId,
-        string Address,
-        string ProviderId,
-        DateTimeOffset LastSeenUtc);
 }

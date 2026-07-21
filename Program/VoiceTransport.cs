@@ -221,7 +221,7 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
         }
     }
 
-    private TransportSocket? SelectTransport(
+    private static TransportSocket? SelectTransport(
         IReadOnlyList<TransportSocket> sockets,
         VoiceRouteTarget target)
     {
@@ -231,33 +231,33 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
             .ToArray();
         if (familySockets.Length == 0) return null;
 
+        if (!string.IsNullOrWhiteSpace(target.LocalAddress))
+        {
+            var exactAddress = familySockets.FirstOrDefault(socket =>
+                string.Equals(socket.LocalAddress, target.LocalAddress, StringComparison.OrdinalIgnoreCase) &&
+                (string.IsNullOrWhiteSpace(target.LocalInterfaceId) ||
+                 string.Equals(socket.InterfaceId, target.LocalInterfaceId, StringComparison.OrdinalIgnoreCase)));
+            if (exactAddress is not null) return exactAddress;
+        }
+
+        if (!string.IsNullOrWhiteSpace(target.LocalInterfaceId))
+        {
+            var exactInterface = familySockets.FirstOrDefault(socket =>
+                string.Equals(socket.InterfaceId, target.LocalInterfaceId, StringComparison.OrdinalIgnoreCase));
+            if (exactInterface is not null) return exactInterface;
+        }
+
         if (!string.IsNullOrWhiteSpace(target.ProviderId))
         {
             var providerSockets = familySockets.Where(socket =>
-                    string.Equals(socket.ProviderId, target.ProviderId, StringComparison.OrdinalIgnoreCase) &&
-                    (string.IsNullOrWhiteSpace(target.InterfaceId) ||
-                     string.Equals(socket.InterfaceId, target.InterfaceId, StringComparison.OrdinalIgnoreCase)))
+                    string.Equals(socket.ProviderId, target.ProviderId, StringComparison.OrdinalIgnoreCase))
                 .ToArray();
             if (providerSockets.Length == 0) return null;
-            var selectedProviderEndpoint = _network.SelectLocalEndpoint(target.EndPoint.Address, target.ProviderId);
-            if (selectedProviderEndpoint is not null)
-            {
-                var selectedProviderSocket = providerSockets.FirstOrDefault(socket =>
-                    string.Equals(socket.LocalAddress, selectedProviderEndpoint.NetworkAddress, StringComparison.OrdinalIgnoreCase));
-                if (selectedProviderSocket is not null) return selectedProviderSocket;
-            }
             if (providerSockets.Length == 1) return providerSockets[0];
-            return null;
+            return providerSockets.OrderBy(socket => socket.LocalAddress, StringComparer.OrdinalIgnoreCase).First();
         }
 
-        var selected = _network.SelectLocalEndpoint(target.EndPoint.Address, providerId: null);
-        if (selected is not null)
-        {
-            var selectedSocket = familySockets.FirstOrDefault(socket =>
-                string.Equals(socket.LocalAddress, selected.NetworkAddress, StringComparison.OrdinalIgnoreCase));
-            if (selectedSocket is not null) return selectedSocket;
-        }
-        return null;
+        return familySockets.Length == 1 ? familySockets[0] : null;
     }
 
     public async ValueTask StopAsync()
@@ -319,7 +319,12 @@ public sealed class VoiceTransport : IAsyncDisposable, IDisposable
         string InterfaceId);
 }
 
-public sealed record VoiceRouteTarget(IPEndPoint EndPoint, string ProviderId, string InterfaceId);
+public sealed record VoiceRouteTarget(
+    IPEndPoint EndPoint,
+    string ProviderId,
+    string InterfaceId,
+    string LocalAddress = "",
+    string LocalInterfaceId = "");
 
 public sealed record VoicePeerCandidate(
     string PeerId,

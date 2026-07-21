@@ -47,7 +47,7 @@ public sealed class LanRelayService : IAsyncDisposable
             .Distinct()
             .ToArray();
         if (targets.Length == 0) throw new ArgumentException("LAN relay has no valid peer endpoint.", nameof(endpoints));
-        var key = BuildKey(peerId, lanSessionId, remoteLanPort);
+        var key = BuildKey(peerId, lanSessionId);
         var relay = _clientRelays.GetOrAdd(
             key,
             _ => new ClientRelay(
@@ -63,13 +63,15 @@ public sealed class LanRelayService : IAsyncDisposable
         return new ClientLanRelayInfo(key, relay.LocalPort);
     }
 
-    public void RetainClientRelays(IReadOnlySet<string> activeKeys)
+    public async Task RetainClientRelaysAsync(IReadOnlySet<string> activeKeys)
     {
+        var removed = new List<ClientRelay>();
         foreach (var pair in _clientRelays.ToArray())
         {
             if (activeKeys.Contains(pair.Key) || !_clientRelays.TryRemove(pair.Key, out var relay)) continue;
-            _ = relay.DisposeAsync().AsTask();
+            removed.Add(relay);
         }
+        foreach (var relay in removed) await relay.DisposeAsync().ConfigureAwait(false);
     }
 
     public async Task HandleIncomingAsync(Stream stream, byte[] initialFrame, CancellationToken token)
@@ -79,8 +81,8 @@ public sealed class LanRelayService : IAsyncDisposable
         var hostSessionId = Volatile.Read(ref _hostSessionId);
         if (request is null || request.Protocol != ProtocolName || request.ProtocolVersion != ProtocolVersion ||
             request.ServerPort is <= 0 or > 65535 || request.ServerPort != hostPort ||
-            (!string.IsNullOrWhiteSpace(request.LanSessionId) &&
-             !string.Equals(request.LanSessionId, hostSessionId, StringComparison.Ordinal)))
+            string.IsNullOrWhiteSpace(request.LanSessionId) ||
+            !string.Equals(request.LanSessionId, hostSessionId, StringComparison.Ordinal))
         {
             await PortableProtocol.WriteJsonAsync(stream, new LanRelayReply
             {
@@ -90,11 +92,11 @@ public sealed class LanRelayService : IAsyncDisposable
             return;
         }
 
-        using var minecraft = new TcpClient(AddressFamily.InterNetwork);
+        TcpClient? minecraft = null;
         var readySent = false;
         try
         {
-            await minecraft.ConnectAsync(IPAddress.Loopback, hostPort, token).ConfigureAwait(false);
+            minecraft = await ConnectLocalMinecraftAsync(hostPort, token).ConfigureAwait(false);
             await PortableProtocol.WriteJsonAsync(stream, new LanRelayReply { Ok = true }, _jsonOptions, token).ConfigureAwait(false);
             readySent = true;
             await RelayBidirectionalAsync(stream, minecraft.GetStream(), token).ConfigureAwait(false);
@@ -117,6 +119,33 @@ public sealed class LanRelayService : IAsyncDisposable
             {
             }
         }
+        finally
+        {
+            minecraft?.Dispose();
+        }
+    }
+
+    private static async Task<TcpClient> ConnectLocalMinecraftAsync(int port, CancellationToken token)
+    {
+        Exception? lastError = null;
+        foreach (var address in new[] { IPAddress.Loopback, IPAddress.IPv6Loopback })
+        {
+            var client = new TcpClient(address.AddressFamily);
+            try
+            {
+                using var attempt = CancellationTokenSource.CreateLinkedTokenSource(token);
+                attempt.CancelAfter(TimeSpan.FromSeconds(3));
+                await client.ConnectAsync(address, port, attempt.Token).ConfigureAwait(false);
+                return client;
+            }
+            catch (Exception ex) when (ex is SocketException or OperationCanceledException)
+            {
+                client.Dispose();
+                if (token.IsCancellationRequested) throw;
+                lastError = ex;
+            }
+        }
+        throw new IOException("Could not reach the local Minecraft listener.", lastError);
     }
 
     public async ValueTask DisposeAsync()
@@ -128,9 +157,10 @@ public sealed class LanRelayService : IAsyncDisposable
 
     private static string BuildKey(
         string peerId,
-        string lanSessionId,
-        int port) =>
-        $"{peerId.Trim()}|{(string.IsNullOrWhiteSpace(lanSessionId) ? $"legacy-port-{port}" : lanSessionId.Trim())}";
+        string lanSessionId) =>
+        string.IsNullOrWhiteSpace(lanSessionId)
+            ? throw new ArgumentException("LAN relay requires a session id.", nameof(lanSessionId))
+            : $"{peerId.Trim()}|{lanSessionId.Trim()}";
 
     private static async Task RelayBidirectionalAsync(Stream first, Stream second, CancellationToken token)
     {
@@ -165,6 +195,8 @@ public sealed class LanRelayService : IAsyncDisposable
         private readonly TcpListener _listener;
         private readonly CancellationTokenSource _cts = new();
         private readonly Task _acceptTask;
+        private readonly ConcurrentDictionary<long, Task> _clientTasks = new();
+        private long _nextClientTaskId;
 
         public ClientRelay(
             string peerId,
@@ -212,7 +244,10 @@ public sealed class LanRelayService : IAsyncDisposable
                 try
                 {
                     var client = await _listener.AcceptTcpClientAsync(token).ConfigureAwait(false);
-                    _ = HandleClientAsync(client, token);
+                    var taskId = Interlocked.Increment(ref _nextClientTaskId);
+                    var task = HandleClientAsync(client, token);
+                    _clientTasks[taskId] = task;
+                    _ = ObserveClientTaskAsync(taskId, task);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested)
                 {
@@ -223,6 +258,21 @@ public sealed class LanRelayService : IAsyncDisposable
                     if (!token.IsCancellationRequested) _logger.Warn($"Local Minecraft LAN relay listener failed: {ex.Message}");
                     break;
                 }
+            }
+        }
+
+        private async Task ObserveClientTaskAsync(long taskId, Task task)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or SocketException)
+            {
+            }
+            finally
+            {
+                _clientTasks.TryRemove(taskId, out _);
             }
         }
 
@@ -295,6 +345,17 @@ public sealed class LanRelayService : IAsyncDisposable
             }
             catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException)
             {
+            }
+            var clientTasks = _clientTasks.Values.ToArray();
+            if (clientTasks.Length > 0)
+            {
+                try
+                {
+                    await Task.WhenAll(clientTasks).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or IOException or SocketException)
+                {
+                }
             }
             _cts.Dispose();
         }
